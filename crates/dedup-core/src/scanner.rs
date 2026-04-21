@@ -104,6 +104,37 @@ pub struct ScanResult {
     pub files_scanned: usize,
 }
 
+/// Callback surface for reporting scan progress.
+///
+/// The scanner calls [`ProgressSink::on_file_processed`] after it finishes
+/// tokenizing a file (binary / `.git/` / decode-skipped files are NOT
+/// reported), and [`ProgressSink::on_match_group`] once per confirmed
+/// group at the end of the scan. A silent default sink (`NoopSink`)
+/// exists so callers that don't need progress can use [`Scanner::scan`]
+/// directly.
+///
+/// Implementors are expected to be cheap — the file callback runs inline
+/// on the scanner's hot path. The trait is object-safe so the CLI can
+/// hand in an `indicatif`-backed sink via `&dyn ProgressSink` without
+/// leaking `indicatif` into `dedup-core`.
+pub trait ProgressSink {
+    /// Called once per file that actually gets tokenized. The path is
+    /// absolute (matches the walker's view, not the `Occurrence` path).
+    fn on_file_processed(&self, path: &Path);
+    /// Called once per confirmed match group, after all filtering.
+    fn on_match_group(&self, group: &MatchGroup);
+}
+
+/// No-op progress sink. Used by [`Scanner::scan`] so the default path has
+/// zero overhead.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopSink;
+
+impl ProgressSink for NoopSink {
+    fn on_file_processed(&self, _path: &Path) {}
+    fn on_match_group(&self, _group: &MatchGroup) {}
+}
+
 /// Public scanner handle. Cheap to construct; holds only configuration.
 #[derive(Debug, Clone, Default)]
 pub struct Scanner {
@@ -116,8 +147,29 @@ impl Scanner {
         Self { config }
     }
 
-    /// Walk `root` and return all Tier A match groups.
+    /// Walk `root` and return all Tier A match groups. Convenience wrapper
+    /// around [`Scanner::scan_with_progress`] with a no-op progress sink.
     pub fn scan(&self, root: &Path) -> Result<ScanResult, ScanError> {
+        self.scan_with_progress(root, &NoopSink)
+    }
+
+    /// Walk `root` and return all Tier A match groups, reporting progress
+    /// through `sink`.
+    ///
+    /// `sink` is called:
+    ///
+    /// - once per tokenized file (via `on_file_processed`), on the hot path;
+    /// - once per confirmed match group (via `on_match_group`), after
+    ///   clustering / filtering / sorting.
+    ///
+    /// Progress callbacks are advisory — the scanner does not re-enter
+    /// them and makes no guarantees about ordering beyond "files first,
+    /// groups at the end."
+    pub fn scan_with_progress(
+        &self,
+        root: &Path,
+        sink: &dyn ProgressSink,
+    ) -> Result<ScanResult, ScanError> {
         // --- 1. Walk and tokenize each candidate file. --------------------
         let mut per_file: Vec<(PathBuf, Vec<Token>)> = Vec::new();
 
@@ -151,6 +203,9 @@ impl Scanner {
 
             let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
             per_file.push((rel, tokenize(&text)));
+            // Report progress *after* the file is staged so sinks that
+            // update a spinner see work that has actually been done.
+            sink.on_file_processed(abs);
         }
 
         let files_scanned = per_file.len();
@@ -343,6 +398,14 @@ impl Scanner {
                 .then(ap.span.start_line.cmp(&bp.span.start_line))
         });
 
+        // Replay groups through the progress sink so the CLI can flush a
+        // final match-count before returning. Doing this after the sort
+        // means the sink observes groups in their final, user-visible
+        // order.
+        for g in &groups {
+            sink.on_match_group(g);
+        }
+
         Ok(ScanResult {
             groups,
             files_scanned,
@@ -418,5 +481,57 @@ mod tests {
 
         let r = Scanner::default().scan(dir.path()).unwrap();
         assert!(r.groups.is_empty());
+    }
+
+    /// A [`ProgressSink`] that just counts callback hits, protected by a
+    /// `Mutex` so the trait methods can remain `&self`.
+    #[derive(Default)]
+    struct CountingSink {
+        files: std::sync::Mutex<usize>,
+        groups: std::sync::Mutex<usize>,
+    }
+
+    impl ProgressSink for CountingSink {
+        fn on_file_processed(&self, _path: &Path) {
+            *self.files.lock().unwrap() += 1;
+        }
+        fn on_match_group(&self, _group: &MatchGroup) {
+            *self.groups.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn progress_sink_sees_every_file_and_group() {
+        // Two files with enough duplicated tokens to clear the default
+        // Tier A thresholds (≥ 6 lines, ≥ 50 tokens).
+        let body: String = (0..60)
+            .map(|i| format!("let x{i} = {i};\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), &body).unwrap();
+        fs::write(dir.path().join("b.rs"), &body).unwrap();
+
+        let sink = CountingSink::default();
+        let result = Scanner::default()
+            .scan_with_progress(dir.path(), &sink)
+            .unwrap();
+
+        assert_eq!(*sink.files.lock().unwrap(), 2);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(*sink.groups.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn noop_sink_matches_scan_convenience() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "hello world").unwrap();
+
+        let via_scan = Scanner::default().scan(dir.path()).unwrap();
+        let via_progress = Scanner::default()
+            .scan_with_progress(dir.path(), &NoopSink)
+            .unwrap();
+        assert_eq!(via_scan.files_scanned, via_progress.files_scanned);
+        assert_eq!(via_scan.groups.len(), via_progress.groups.len());
     }
 }

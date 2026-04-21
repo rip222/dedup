@@ -9,26 +9,129 @@
 //! - `show <id>`: print full detail (all occurrence spans) for one
 //!   persisted group.
 //!
-//! Exit codes:
-//! - `0` success (even when there are no duplicates / no cache hits).
-//! - `2` usage/error (no cache to list/show, unknown group id, scan I/O
-//!   failure).
+//! # Global flags
+//!
+//! Flags live on [`GlobalArgs`], flattened into the top-level [`Cli`].
+//! Subcommand handlers read them via `cli.globals`. The bulk of this
+//! issue (#13) is wiring the flag surface — the tier/lang filters apply
+//! post-scan, `--strict` controls the exit code, progress is driven
+//! through the core's `ProgressSink` trait, and verbose / color / jobs
+//! flags are stored on the config for downstream issues (`#6` Tier B,
+//! `#14` parallelism, `#16` tracing subscriber) to pick up.
+//!
+//! # Exit codes
+//!
+//! - `0` success (with or without findings; git-style default).
+//! - `1` findings present AND `--strict` was passed.
+//! - `2` config / usage / parse error (including clap parse errors —
+//!   the `main` function remaps clap's error kind to `2` before exit).
+//! - `101` Rust panic (the default `panic = "unwind"` behavior; we do
+//!   not override it here).
 
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand};
-use dedup_core::{Cache, GroupDetail, ScanConfig, ScanResult, Scanner};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use dedup_core::{Cache, GroupDetail, MatchGroup, ProgressSink, ScanConfig, Scanner};
+use indicatif::{ProgressBar, ProgressStyle};
 
+/// Root CLI parser. Subcommands live under [`Command`]; shared flags live
+/// on [`GlobalArgs`] and are flattened into this struct so every
+/// subcommand sees them uniformly.
 #[derive(Parser, Debug)]
 #[command(
     name = "dedup",
     about = "Find duplicate code across a directory tree",
-    version
+    version,
+    // Ensure clap parse / usage errors surface as exit code 2 (PRD: usage
+    // error). clap's default is 2 for UsageError but 1 for some value
+    // errors — normalizing here keeps the contract stable.
+    next_help_heading = "Global options"
 )]
 struct Cli {
+    #[command(flatten)]
+    globals: GlobalArgs,
+
     #[command(subcommand)]
     command: Command,
+}
+
+/// Flags accepted by every subcommand.
+///
+/// Some of these flags (`--no-gitignore`, `--jobs`) are deliberate
+/// stubs at this milestone — the upstream features they gate (`#5`
+/// ignore layers, `#14` parallelism) land in later PRs. They are parsed
+/// and stored so the surface is stable and downstream PRs can wire them
+/// without re-breaking the CLI.
+#[derive(Args, Debug, Clone)]
+pub struct GlobalArgs {
+    /// Disable the gitignore layer. Parsed and stored; full wiring lands
+    /// with the `ignore` crate integration in #5.
+    #[arg(long, global = true)]
+    pub no_gitignore: bool,
+
+    /// Restrict detection tier. Tier A is the language-oblivious
+    /// rolling-hash scan; Tier B is per-language tree-sitter matching.
+    /// At MVP Tier B isn't emitted yet (lands in #6), so `b` simply
+    /// filters everything out and `both` behaves like `a`.
+    #[arg(long, value_enum, default_value_t = TierFilter::Both, global = true)]
+    pub tier: TierFilter,
+
+    /// Restrict Tier B languages (comma-separated list, e.g.
+    /// `rust,ts,python`). Parsed and stored; only applied to Tier B
+    /// groups, which don't exist yet — see #6.
+    #[arg(long, value_delimiter = ',', global = true)]
+    pub lang: Vec<Language>,
+
+    /// Parallelism for the Tier A scanner. Parsed and stored; full
+    /// wiring lands with rayon integration in #14. `0` falls through to
+    /// `num_cpus`.
+    #[arg(long, global = true)]
+    pub jobs: Option<usize>,
+
+    /// Suppress the progress spinner. Exit codes / stdout content are
+    /// unaffected.
+    #[arg(long, short = 'q', global = true, conflicts_with = "verbose")]
+    pub quiet: bool,
+
+    /// Enable debug logging (`RUST_LOG=dedup=debug`). The env var is
+    /// set before any subscriber init; the subscriber itself lands in
+    /// #16.
+    #[arg(long, short = 'v', action = ArgAction::SetTrue, global = true)]
+    pub verbose: bool,
+
+    /// Control ANSI color output. `auto` (default) disables color when
+    /// stdout is not a TTY.
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto, global = true)]
+    pub color: ColorMode,
+
+    /// Exit 1 when findings are present. Default is git-style exit 0
+    /// regardless of findings.
+    #[arg(long, global = true)]
+    pub strict: bool,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierFilter {
+    A,
+    B,
+    Both,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Language {
+    Rust,
+    Ts,
+    Python,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Always,
+    Never,
+    Auto,
 }
 
 #[derive(Subcommand, Debug)]
@@ -57,24 +160,74 @@ enum Command {
     },
 }
 
+/// Program entry point.
+///
+/// clap's [`Parser::parse`] calls `exit(2)` on a parse error by default
+/// (which matches the PRD), so we don't need to remap error codes
+/// manually — any `UsageError` / parse failure bypasses this function's
+/// `ExitCode` entirely.
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // Print the usage/error text clap prepared, then exit with
+            // the PRD-mandated code. We re-map non-display errors to 2
+            // so parse errors never leak out as 1.
+            let code = match e.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    let _ = e.print();
+                    return ExitCode::SUCCESS;
+                }
+                _ => 2,
+            };
+            let _ = e.print();
+            return ExitCode::from(code);
+        }
+    };
+
+    // `-v` sets `RUST_LOG` early so the subscriber (landing in #16) can
+    // pick it up. We only set the env var if the user hasn't already
+    // overridden it — respect explicit `RUST_LOG=...` from the shell.
+    if cli.globals.verbose && std::env::var_os("RUST_LOG").is_none() {
+        // SAFETY: single-threaded at this point; nothing has spawned yet.
+        unsafe {
+            std::env::set_var("RUST_LOG", "dedup=debug");
+        }
+    }
+
     match cli.command {
-        Command::Scan { path } => run_scan(&path),
-        Command::List { path } => run_list(&path),
-        Command::Show { id, path } => run_show(id, &path),
+        Command::Scan { ref path } => run_scan(path, &cli.globals),
+        Command::List { ref path } => run_list(path, &cli.globals),
+        Command::Show { id, ref path } => run_show(id, path, &cli.globals),
     }
 }
 
-fn run_scan(path: &Path) -> ExitCode {
+fn run_scan(path: &Path, globals: &GlobalArgs) -> ExitCode {
     let scanner = Scanner::new(ScanConfig::default());
-    let result = match scanner.scan(path) {
+
+    // Build the progress sink. Spinner is suppressed when:
+    // - stdout is not a TTY (piped output), OR
+    // - `--quiet` is set.
+    // `--color never` also suppresses color on the spinner. We keep the
+    // spinner on stderr so stdout stays pipe-clean regardless.
+    let use_progress = !globals.quiet && std::io::stderr().is_terminal();
+    let sink: Box<dyn ProgressSink> = if use_progress {
+        Box::new(IndicatifSink::new(color_enabled_for_stderr(globals)))
+    } else {
+        Box::new(dedup_core::NoopSink)
+    };
+
+    let result = match scanner.scan_with_progress(path, sink.as_ref()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("dedup: scan failed: {e}");
             return ExitCode::from(2);
         }
     };
+
+    // Finalize the spinner before emitting any group text so progress
+    // output doesn't collide with stdout lines.
+    drop(sink);
 
     // Persist before printing so the cache reflects stdout exactly.
     // Failure to persist is surfaced but does NOT suppress the print:
@@ -90,14 +243,27 @@ fn run_scan(path: &Path) -> ExitCode {
         }
     }
 
-    print_scan_groups(&result, &mut std::io::stdout()).ok();
+    // Apply the tier / lang filters to produce the user-visible group
+    // slice. Tier A groups pass the lang filter unconditionally (they're
+    // language-oblivious); Tier B isn't emitted yet so the lang filter
+    // is effectively a no-op at MVP. See docs on [`GlobalArgs`].
+    let visible: Vec<&MatchGroup> = result
+        .groups
+        .iter()
+        .filter(|_g| tier_allows_a(globals))
+        .collect();
 
-    // Exit code 0 whether duplicates are found or not (git-style default,
-    // per the PRD). `--strict` lands in #13.
+    let had_findings = !visible.is_empty();
+
+    print_scan_groups(&visible, &mut std::io::stdout()).ok();
+
+    if had_findings && globals.strict {
+        return ExitCode::from(1);
+    }
     ExitCode::SUCCESS
 }
 
-fn run_list(path: &Path) -> ExitCode {
+fn run_list(path: &Path, globals: &GlobalArgs) -> ExitCode {
     let cache = match Cache::open_readonly(path) {
         Ok(Some(c)) => c,
         Ok(None) => {
@@ -118,10 +284,16 @@ fn run_list(path: &Path) -> ExitCode {
         }
     };
 
+    let allow_a = tier_allows_a(globals);
+
     // Fetch full details so we can print occurrences alongside the
     // summary header — matches `dedup scan` output exactly.
     let mut stdout = std::io::stdout();
+    let mut emitted = 0usize;
     for (ord, summary) in groups.iter().enumerate() {
+        if !allow_a {
+            continue;
+        }
         let detail = match cache.get_group(summary.id) {
             Ok(Some(d)) => d,
             Ok(None) => continue, // group vanished mid-read; skip.
@@ -134,12 +306,16 @@ fn run_list(path: &Path) -> ExitCode {
             // Broken pipe / closed stdout — treat as clean exit.
             return ExitCode::SUCCESS;
         }
+        emitted += 1;
     }
 
+    if emitted > 0 && globals.strict {
+        return ExitCode::from(1);
+    }
     ExitCode::SUCCESS
 }
 
-fn run_show(id: i64, path: &Path) -> ExitCode {
+fn run_show(id: i64, path: &Path, _globals: &GlobalArgs) -> ExitCode {
     let cache = match Cache::open_readonly(path) {
         Ok(Some(c)) => c,
         Ok(None) => {
@@ -170,9 +346,27 @@ fn run_show(id: i64, path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Print a [`ScanResult`] in the canonical dedup text format.
-fn print_scan_groups<W: std::io::Write>(result: &ScanResult, out: &mut W) -> std::io::Result<()> {
-    for (i, group) in result.groups.iter().enumerate() {
+/// Return true iff Tier A groups should be emitted given `--tier`.
+fn tier_allows_a(globals: &GlobalArgs) -> bool {
+    matches!(globals.tier, TierFilter::A | TierFilter::Both)
+}
+
+/// Compute whether ANSI color should be used on stderr. Used by the
+/// spinner style; stdout color for groups lands when we add colored
+/// output in #12.
+fn color_enabled_for_stderr(globals: &GlobalArgs) -> bool {
+    match globals.color {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => std::io::stderr().is_terminal(),
+    }
+}
+
+/// Print a slice of [`MatchGroup`] references in the canonical dedup
+/// text format. Taking `&[&MatchGroup]` rather than `&ScanResult`
+/// mirrors the post-filter path so callers can drop out groups cheaply.
+fn print_scan_groups<W: Write>(groups: &[&MatchGroup], out: &mut W) -> std::io::Result<()> {
+    for (i, group) in groups.iter().enumerate() {
         writeln!(
             out,
             "--- group {} ({} occurrences) ---",
@@ -194,7 +388,7 @@ fn print_scan_groups<W: std::io::Write>(result: &ScanResult, out: &mut W) -> std
 /// Print one cached group in the same format as `scan`, but using the
 /// given ordinal (1-based) as the `group N` header number — callers are
 /// expected to enumerate in the same order `list_groups` returned.
-fn print_cached_group_full<W: std::io::Write>(
+fn print_cached_group_full<W: Write>(
     ordinal: usize,
     detail: &GroupDetail,
     out: &mut W,
@@ -214,10 +408,7 @@ fn print_cached_group_full<W: std::io::Write>(
 /// `show` emits a single group; the header uses the persisted id so it
 /// is stable across invocations. Follows with one `path:start-end` line
 /// per occurrence, indented to match the visual weight of `list`.
-fn print_cached_group_show<W: std::io::Write>(
-    detail: &GroupDetail,
-    out: &mut W,
-) -> std::io::Result<()> {
+fn print_cached_group_show<W: Write>(detail: &GroupDetail, out: &mut W) -> std::io::Result<()> {
     writeln!(
         out,
         "--- group {} ({} occurrences) ---",
@@ -233,4 +424,163 @@ fn print_cached_group_show<W: std::io::Write>(
 /// Forward-slash a path for stable cross-platform output.
 fn path_display(p: &std::path::Path) -> String {
     p.to_string_lossy().replace('\\', "/")
+}
+
+// --- Progress sink --------------------------------------------------------
+
+/// `indicatif`-backed progress sink. Owns a `ProgressBar` and some
+/// interior-mutable counters that the scanner ticks on each callback.
+///
+/// Two counters are tracked:
+///
+/// - `files`: incremented once per `on_file_processed`.
+/// - `groups`: incremented once per `on_match_group`.
+///
+/// The message is refreshed from these counters on each callback, which
+/// is cheap (no IO happens until `indicatif` decides to redraw at its
+/// configured 10 Hz steady-tick rate).
+///
+/// Dropping the sink calls `finish_and_clear` so the spinner disappears
+/// before stdout is flushed.
+struct IndicatifSink {
+    bar: ProgressBar,
+    files: std::sync::atomic::AtomicUsize,
+    groups: std::sync::atomic::AtomicUsize,
+}
+
+impl IndicatifSink {
+    fn new(color: bool) -> Self {
+        let bar = ProgressBar::new_spinner();
+        let template = if color {
+            "{spinner:.cyan} {elapsed_precise} {msg}"
+        } else {
+            "{spinner} {elapsed_precise} {msg}"
+        };
+        bar.set_style(
+            ProgressStyle::with_template(template)
+                .expect("template")
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+        );
+        // ~10 Hz steady tick (per PRD).
+        bar.enable_steady_tick(Duration::from_millis(100));
+        bar.set_message("scanning…");
+        Self {
+            bar,
+            files: std::sync::atomic::AtomicUsize::new(0),
+            groups: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn refresh_message(&self) {
+        use std::sync::atomic::Ordering;
+        let files = self.files.load(Ordering::Relaxed);
+        let groups = self.groups.load(Ordering::Relaxed);
+        self.bar
+            .set_message(format!("{files} files · {groups} groups"));
+    }
+}
+
+impl ProgressSink for IndicatifSink {
+    fn on_file_processed(&self, _path: &Path) {
+        self.files
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_message();
+    }
+
+    fn on_match_group(&self, _group: &MatchGroup) {
+        self.groups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_message();
+    }
+}
+
+impl Drop for IndicatifSink {
+    fn drop(&mut self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_config_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn defaults_are_permissive() {
+        let cli = Cli::parse_from(["dedup", "scan"]);
+        assert!(matches!(cli.globals.tier, TierFilter::Both));
+        assert!(matches!(cli.globals.color, ColorMode::Auto));
+        assert!(!cli.globals.strict);
+        assert!(!cli.globals.quiet);
+        assert!(!cli.globals.verbose);
+        assert!(cli.globals.lang.is_empty());
+        assert_eq!(cli.globals.jobs, None);
+        assert!(!cli.globals.no_gitignore);
+    }
+
+    #[test]
+    fn tier_filter_parses() {
+        let cli = Cli::parse_from(["dedup", "--tier", "a", "scan"]);
+        assert!(matches!(cli.globals.tier, TierFilter::A));
+        let cli = Cli::parse_from(["dedup", "--tier", "b", "scan"]);
+        assert!(matches!(cli.globals.tier, TierFilter::B));
+    }
+
+    #[test]
+    fn lang_accepts_comma_separated() {
+        let cli = Cli::parse_from(["dedup", "--lang", "rust,ts,python", "scan"]);
+        assert_eq!(
+            cli.globals.lang,
+            vec![Language::Rust, Language::Ts, Language::Python]
+        );
+    }
+
+    #[test]
+    fn verbose_and_quiet_are_mutually_exclusive() {
+        let r = Cli::try_parse_from(["dedup", "-q", "-v", "scan"]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn short_flags_parse() {
+        let cli = Cli::parse_from(["dedup", "-q", "scan"]);
+        assert!(cli.globals.quiet);
+        let cli = Cli::parse_from(["dedup", "-v", "scan"]);
+        assert!(cli.globals.verbose);
+    }
+
+    #[test]
+    fn color_never_disables_stderr_color() {
+        let cli = Cli::parse_from(["dedup", "--color", "never", "scan"]);
+        assert!(!color_enabled_for_stderr(&cli.globals));
+
+        let cli = Cli::parse_from(["dedup", "--color", "always", "scan"]);
+        assert!(color_enabled_for_stderr(&cli.globals));
+    }
+
+    #[test]
+    fn tier_allows_a_matches_filter() {
+        let cli = Cli::parse_from(["dedup", "--tier", "a", "scan"]);
+        assert!(tier_allows_a(&cli.globals));
+        let cli = Cli::parse_from(["dedup", "--tier", "both", "scan"]);
+        assert!(tier_allows_a(&cli.globals));
+        let cli = Cli::parse_from(["dedup", "--tier", "b", "scan"]);
+        assert!(!tier_allows_a(&cli.globals));
+    }
+
+    #[test]
+    fn unknown_flag_errors() {
+        let r = Cli::try_parse_from(["dedup", "scan", "--not-a-flag"]);
+        assert!(r.is_err());
+        assert_ne!(
+            r.unwrap_err().kind(),
+            clap::error::ErrorKind::DisplayHelp,
+            "unknown flag should not be help"
+        );
+    }
 }
