@@ -20,15 +20,20 @@
 
 mod logging;
 
+pub mod app_state;
 pub mod empty_state;
 pub mod menubar;
+pub mod project_view;
 
+pub use app_state::{
+    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, SuppressionView, group_label,
+    load_folder,
+};
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
+pub use project_view::{ProjectView, RootHandle, register_root};
 
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
-
-use crate::empty_state::EmptyState;
 
 /// Launch the macOS GUI.
 ///
@@ -39,20 +44,28 @@ pub fn run() {
         // work even before a window is focused.
         menubar::install(cx);
 
-        let bounds = Bounds::centered(None, size(px(720.0), px(480.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Dedup".into()),
-                    appears_transparent: false,
+        let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Dedup".into()),
+                        appears_transparent: false,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|_| EmptyState::new()),
-        )
-        .expect("dedup-gui: failed to open empty-state window");
+                },
+                |_, cx| cx.new(|_| ProjectView::new()),
+            )
+            .expect("dedup-gui: failed to open project window");
+
+        // Install the `OpenFolder` handler now that the root entity
+        // exists — the handler needs to reach back into this view when
+        // the `NSOpenPanel` returns. See `register_root`.
+        if let Ok(entity) = window.entity(cx) {
+            register_root(entity, cx);
+        }
 
         // Bring the app (and its menubar) to the foreground.
         cx.activate(true);

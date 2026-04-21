@@ -45,9 +45,14 @@ path = "src/lib.rs"
 # is expected and documented in the PR body — perf tuning isn't blocking.
 # ---------------------------------------------------------------------------
 [target.'cfg(target_os = "macos")'.dependencies]
+dedup-core = { path = "../dedup-core" }
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "da25b914c25f17ba457abc8cf75b8e42d0b899e2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "da25b914c25f17ba457abc8cf75b8e42d0b899e2", features = ["font-kit"] }
 log = "0.4"
+# `rfd` is the standard Rust file-dialog crate; on macOS it wraps
+# `NSOpenPanel`. Default features pull in xdg-portal / wayland for Linux,
+# which we don't need here — the whole GUI crate is macOS-gated.
+rfd = { version = "0.15", default-features = false }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

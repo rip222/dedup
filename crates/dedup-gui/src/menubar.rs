@@ -82,11 +82,10 @@ fn register_handlers(cx: &mut App) {
     stub(cx, "About", |_: &About, _: &mut App| {});
     stub(cx, "Preferences (⌘,)", |_: &Preferences, _: &mut App| {});
     stub(cx, "Hide", |_: &Hide, _: &mut App| {});
-    stub(
-        cx,
-        "Open Folder… (⌘O) — #20",
-        |_: &OpenFolder, _: &mut App| {},
-    );
+    // `OpenFolder` is no longer a stub — `crate::project_view::register_root`
+    // installs the real NSOpenPanel-backed handler after the root view is
+    // created. Dispatching the action with no project view yet (before
+    // `register_root` runs) is a no-op, which is fine at startup.
     stub(cx, "Close Window (⌘W)", |_: &CloseWindow, _: &mut App| {});
     stub(cx, "Start Scan (⌘R) — #21", |_: &StartScan, _: &mut App| {});
     stub(cx, "Stop Scan (⌘.) — #22", |_: &StopScan, _: &mut App| {});
