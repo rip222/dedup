@@ -30,10 +30,10 @@ pub mod recent;
 pub mod tint;
 
 pub use app_state::{
-    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, Pane, RecentBanner,
-    ScanHandles, ScanState, SortKey, SummaryCounts, SuppressionView, filter_groups,
+    AppState, AppStatus, EditorBanner, FolderLoadResult, GroupView, OccurrenceView, Pane,
+    RecentBanner, ScanHandles, ScanState, SortKey, SummaryCounts, SuppressionView, filter_groups,
     format_completion_banner, format_elapsed, group_label, group_view_from_match, impact_key,
-    language_from_path, load_folder, open_in_editor, sort_groups, summary,
+    language_from_path, launch_editor, load_folder, open_in_editor, sort_groups, summary,
 };
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};

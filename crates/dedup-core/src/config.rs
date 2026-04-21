@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::editor::EditorConfig;
+
 /// The config schema version this build understands. Absent
 /// `schema_version` in a file defaults to 1.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -183,6 +185,8 @@ pub struct Config {
     pub normalization: Normalization,
     pub scan: ScanSettings,
     pub detail: DetailConfig,
+    /// Editor launcher preset + terminal handling (issue #29).
+    pub editor: EditorConfig,
 }
 
 impl Default for Config {
@@ -193,6 +197,7 @@ impl Default for Config {
             normalization: Normalization::default(),
             scan: ScanSettings::default(),
             detail: DetailConfig::default(),
+            editor: EditorConfig::default(),
         }
     }
 }
@@ -208,6 +213,16 @@ struct PartialConfig {
     normalization: Option<Normalization>,
     scan: Option<PartialScanSettings>,
     detail: Option<PartialDetailConfig>,
+    editor: Option<PartialEditorConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PartialEditorConfig {
+    preset: Option<crate::editor::EditorPreset>,
+    command: Option<String>,
+    terminal: Option<String>,
+    terminal_command: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -286,6 +301,20 @@ impl PartialConfig {
             && let Some(v) = d.context_lines
         {
             base.detail.context_lines = v;
+        }
+        if let Some(e) = self.editor {
+            if let Some(p) = e.preset {
+                base.editor.preset = p;
+            }
+            if let Some(v) = e.command {
+                base.editor.command = Some(v);
+            }
+            if let Some(v) = e.terminal {
+                base.editor.terminal = Some(v);
+            }
+            if let Some(v) = e.terminal_command {
+                base.editor.terminal_command = Some(v);
+            }
         }
     }
 }
@@ -642,6 +671,34 @@ context_lines = 7
         let root2 = tempdir().unwrap();
         let cfg2 = with_test_home(home.path(), || Config::load(Some(root2.path()))).unwrap();
         assert_eq!(cfg2.detail.context_lines, 3);
+    }
+
+    #[test]
+    fn editor_section_parses_from_toml() {
+        // Issue #29 — `[editor]` section loads preset + overrides.
+        let home = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        write_project(
+            root.path(),
+            r#"
+[editor]
+preset = "code"
+command = "code -g {file}:{line}"
+terminal = "none"
+"#,
+        );
+        let cfg = with_test_home(home.path(), || Config::load(Some(root.path()))).unwrap();
+        assert_eq!(cfg.editor.preset, crate::editor::EditorPreset::Code);
+        assert_eq!(cfg.editor.command.as_deref(), Some("code -g {file}:{line}"));
+        assert_eq!(cfg.editor.terminal.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn editor_section_defaults_to_nvim_when_absent() {
+        let home = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let cfg = with_test_home(home.path(), || Config::load(Some(root.path()))).unwrap();
+        assert_eq!(cfg.editor.preset, crate::editor::EditorPreset::Nvim);
     }
 
     #[test]

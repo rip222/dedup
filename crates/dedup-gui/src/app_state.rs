@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use dedup_core::editor::{EditorConfig, EditorError, EnvPathLookup};
 use dedup_core::{AtomicProgressSink, Cache, CacheError, Config, DetailConfig, MatchGroup, Tier};
 
 /// View-model for one duplicate group as shown in the sidebar.
@@ -360,6 +361,18 @@ pub struct AppState {
     // TODO(#30): promote to toast — #28 uses an inline banner because
     // the real toast system lands in #30.
     pub recent_banner: Option<RecentBanner>,
+    /// Inline banner surfacing editor-launch failures (issue #29). The
+    /// only variant today is "no editor found on PATH" — the message
+    /// matches the AC verbatim. Promoted to toast alongside #30.
+    pub editor_banner: Option<EditorBanner>,
+    /// The active editor config. Default is `nvim` + `auto` terminal.
+    /// Populated from `[editor]` in `config.toml` at project load time
+    /// (see [`AppState::set_editor_config`]).
+    pub editor_config: EditorConfig,
+    /// Whether the Preferences dialog is open (issue #29). The dialog
+    /// is an inline modal overlay rather than a native window — see
+    /// the PR body for the GPUI-primitives compromise.
+    pub preferences_open: bool,
 }
 
 /// Inline banner used to surface a stale Open Recent entry. The
@@ -369,6 +382,15 @@ pub struct AppState {
 pub struct RecentBanner {
     /// The missing/moved path the user clicked on.
     pub path: PathBuf,
+}
+
+/// Inline banner for editor-launch failures (issue #29). Holds the
+/// human-readable message; the banner's button dispatches
+/// `DismissEditorBanner` to close it. Not a full toast — that's issue
+/// #30.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorBanner {
+    pub message: String,
 }
 
 /// Which pane currently has logical focus.
@@ -619,16 +641,44 @@ fn total_line_count(g: &GroupView) -> i64 {
         .sum()
 }
 
-/// Placeholder editor launcher for the `o` keyboard shortcut
-/// (issue #23). Logs the paths and returns — the real launcher lands
-/// with issue #29.
-// TODO(#29): wire editor launcher.
+/// Back-compat shim for the `o` keyboard shortcut (issue #23). Opens
+/// every path at line 1 using the default editor config (nvim with
+/// `vim` fallback). Kept for callers that don't have line info handy.
+///
+/// Prefer [`launch_editor`] when the caller has `(path, line)` pairs
+/// — it routes line numbers through to the preset's template (issue
+/// #29).
 pub fn open_in_editor(paths: &[&Path]) {
-    tracing::info!(
-        count = paths.len(),
-        paths = ?paths,
-        "open_in_editor (no-op placeholder — issue #29 wires real launcher)"
-    );
+    let targets: Vec<(PathBuf, u32)> = paths.iter().map(|p| (p.to_path_buf(), 1_u32)).collect();
+    let _ = launch_editor(&EditorConfig::default(), &targets);
+}
+
+/// Real launcher entry point (issue #29). Resolves the configured
+/// preset (with `nvim → vim` fallback) and spawns the built
+/// [`dedup_core::editor::CommandSpec`]s. Errors are logged but never
+/// panic; the caller surfaces the "No editor found" banner when the
+/// returned `Result` is `Err(EditorError::NoEditor)`.
+pub fn launch_editor(cfg: &EditorConfig, targets: &[(PathBuf, u32)]) -> Result<(), EditorError> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+    match dedup_core::editor::launch(cfg, targets, &EnvPathLookup) {
+        Ok(resolved) => {
+            if resolved.fell_back {
+                tracing::info!(
+                    preset = %resolved.preset,
+                    "editor: fell back to vim (nvim not on PATH)",
+                );
+            } else {
+                tracing::debug!(preset = %resolved.preset, "editor: launched");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "editor: launch failed");
+            Err(e)
+        }
+    }
 }
 
 impl AppState {
@@ -686,6 +736,37 @@ impl AppState {
         self.persist_recents();
     }
 
+    /// Surface a banner with `message`. Replaces any existing editor
+    /// banner. Used by the editor launcher (#29) when `nvim` and
+    /// `vim` are both missing and by custom-preset config errors.
+    pub fn surface_editor_banner(&mut self, message: impl Into<String>) {
+        self.editor_banner = Some(EditorBanner {
+            message: message.into(),
+        });
+    }
+
+    /// Dismiss the editor-launch banner.
+    pub fn dismiss_editor_banner(&mut self) {
+        self.editor_banner = None;
+    }
+
+    /// Replace the stored editor config with `cfg`. Called after
+    /// loading a folder (folder's layered config) and after the
+    /// Preferences dialog saves.
+    pub fn set_editor_config(&mut self, cfg: EditorConfig) {
+        self.editor_config = cfg;
+    }
+
+    /// Open the Preferences dialog (issue #29).
+    pub fn open_preferences(&mut self) {
+        self.preferences_open = true;
+    }
+
+    /// Close the Preferences dialog.
+    pub fn close_preferences(&mut self) {
+        self.preferences_open = false;
+    }
+
     /// Attach a stale-entry banner (user clicked a moved / missing
     /// recent). Replaces any existing banner — we only ever show one
     /// stale-entry banner at a time.
@@ -717,9 +798,11 @@ impl AppState {
         // away `current_folder`. Config layering errors fall back to
         // defaults so a malformed TOML doesn't break the UI; the
         // dedicated `dedup config` subcommand already warns loudly.
-        self.detail_config = Config::load(Some(&result.folder))
-            .map(|c| c.detail)
-            .unwrap_or_default();
+        let loaded = Config::load(Some(&result.folder)).ok();
+        self.detail_config = loaded.as_ref().map(|c| c.detail).unwrap_or_default();
+        // Issue #29 — pick up `[editor]` so the launcher uses the
+        // project's preset on `o` / "Open in editor".
+        self.editor_config = loaded.map(|c| c.editor).unwrap_or_default();
         self.current_folder = Some(result.folder);
         self.selected_group = result.groups.first().map(|g| g.id);
         self.groups = result.groups;
@@ -1054,6 +1137,32 @@ impl AppState {
         self.selected_occurrence_indices
             .get(&group_id)
             .is_some_and(|s| s.contains(&occ_idx))
+    }
+
+    /// `(path, first_line)` pairs for every occurrence covered by
+    /// [`Self::copy_paths_for_group`] — i.e. checked occurrences when
+    /// any are checked, otherwise every visible occurrence. Used by
+    /// the "Open in editor" toolbar button (#29) so the launcher has
+    /// line info for presets that take `+line`.
+    pub fn open_targets_for_group(&self, group_id: i64) -> Vec<(PathBuf, u32)> {
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+            return Vec::new();
+        };
+        let occurrences = self.visible_occurrences_of(group);
+        let checked = self.selected_occurrence_indices.get(&group_id);
+        let line_of = |o: &OccurrenceView| o.start_line.max(1) as u32;
+        match checked {
+            Some(set) if !set.is_empty() => occurrences
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| set.contains(i))
+                .map(|(_, o)| (o.path.clone(), line_of(o)))
+                .collect(),
+            _ => occurrences
+                .iter()
+                .map(|o| (o.path.clone(), line_of(o)))
+                .collect(),
+        }
     }
 
     /// Paths to copy / open for `group_id` given the current checkbox

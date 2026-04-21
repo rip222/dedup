@@ -21,6 +21,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod editor;
 pub mod ignore;
 pub mod rolling_hash;
 pub mod scanner;
@@ -33,6 +34,10 @@ pub use cache::{
 pub use config::{
     Config, ConfigError, DetailConfig, Normalization, SCHEMA_VERSION as CONFIG_SCHEMA_VERSION,
     ScanSettings, Thresholds, TierAThresholds, TierBThresholds,
+};
+pub use editor::{
+    CommandSpec, EditorConfig, EditorError, EditorPreset, EnvPathLookup, PathLookup,
+    ResolvedEditor, TerminalMode, build_commands, launch, resolve_preset,
 };
 pub use ignore::{IgnoreRules, IgnoreRulesOptions};
 pub use rolling_hash::{Hash, Span};

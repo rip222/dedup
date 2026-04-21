@@ -30,13 +30,14 @@ use gpui::{
 
 use crate::app_state::{
     AppState, AppStatus, GroupView, OccurrenceView, Pane, ScanState, SortKey, SuppressionView,
-    format_completion_banner, format_elapsed, group_view_from_match, load_folder, open_in_editor,
+    format_completion_banner, format_elapsed, group_view_from_match, launch_editor, load_folder,
 };
 use crate::menubar::{
-    ActivateGroup, ClearRecents, CollapseAll, DismissCurrentGroup, DismissRecentBanner, ExpandAll,
-    FindInSidebar, FocusDetail, FocusSidebar, NextGroup, OpenFolder, OpenRecent0, OpenRecent1,
-    OpenRecent2, OpenRecent3, OpenRecent4, OpenSelectedInEditor, PrevGroup, RemoveStaleRecent,
-    StartScan, StopScan,
+    ActivateGroup, ClearRecents, ClosePreferences, CollapseAll, DismissCurrentGroup,
+    DismissEditorBanner, DismissRecentBanner, ExpandAll, FindInSidebar, FocusDetail, FocusSidebar,
+    NextGroup, OpenConfigInEditor, OpenFolder, OpenRecent0, OpenRecent1, OpenRecent2, OpenRecent3,
+    OpenRecent4, OpenSelectedInEditor, Preferences, PrevGroup, RemoveStaleRecent, StartScan,
+    StopScan,
 };
 use dedup_core::{
     Cache, Config, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, Tier,
@@ -196,6 +197,70 @@ impl ProjectView {
     /// again.
     pub fn dismiss_recent_banner(&mut self, cx: &mut Context<Self>) {
         self.state.dismiss_recent_banner();
+        cx.notify();
+    }
+
+    /// Close the editor-launch banner (issue #29).
+    pub fn dismiss_editor_banner(&mut self, cx: &mut Context<Self>) {
+        self.state.dismiss_editor_banner();
+        cx.notify();
+    }
+
+    /// Open the Preferences dialog overlay (issue #29, ⌘,). The
+    /// dialog is rendered inline over the main body — see
+    /// [`render_preferences_dialog`].
+    pub fn open_preferences(&mut self, cx: &mut Context<Self>) {
+        self.state.open_preferences();
+        cx.notify();
+    }
+
+    /// Close the Preferences dialog without saving (issue #29).
+    pub fn close_preferences(&mut self, cx: &mut Context<Self>) {
+        self.state.close_preferences();
+        cx.notify();
+    }
+
+    /// "Edit config file…" button inside the Preferences dialog.
+    /// Spawns `$EDITOR` (falling back to `$VISUAL`, then `vi`) on the
+    /// active config path — same behavior as `dedup config edit`.
+    /// Closes the dialog on success so the user can re-open
+    /// Preferences after their edit.
+    pub fn open_config_in_editor(&mut self, cx: &mut Context<Self>) {
+        let path = dedup_core::Config::global_path();
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.state.surface_editor_banner(format!(
+                "Failed to create config dir {}: {e}",
+                parent.display()
+            ));
+            cx.notify();
+            return;
+        }
+        if !path.exists()
+            && let Err(e) = std::fs::write(&path, "")
+        {
+            self.state.surface_editor_banner(format!(
+                "Failed to create config file {}: {e}",
+                path.display()
+            ));
+            cx.notify();
+            return;
+        }
+        let editor = std::env::var("EDITOR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("VISUAL").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "vi".to_string());
+        match std::process::Command::new(&editor).arg(&path).spawn() {
+            Ok(_) => {
+                self.state.close_preferences();
+            }
+            Err(e) => {
+                self.state
+                    .surface_editor_banner(format!("Failed to launch {editor}: {e}"));
+            }
+        }
         cx.notify();
     }
 
@@ -482,9 +547,10 @@ impl ProjectView {
     }
 
     /// `o` handler — launch the editor for every occurrence in the
-    /// currently-selected group. Calls the no-op placeholder today;
-    /// issue #29 wires the real launcher.
-    pub fn open_selected_in_editor(&mut self, _cx: &mut Context<Self>) {
+    /// currently-selected group. Wired to the real launcher (#29) with
+    /// the `(path, first_line)` pairs so presets like `nvim +N` land
+    /// on the right row.
+    pub fn open_selected_in_editor(&mut self, cx: &mut Context<Self>) {
         if self.state.focused_pane != Pane::Sidebar {
             return;
         }
@@ -492,9 +558,11 @@ impl ProjectView {
         if occurrences.is_empty() {
             return;
         }
-        let paths: Vec<&Path> = occurrences.iter().map(|o| o.path.as_path()).collect();
-        // TODO(#29): wire editor launcher.
-        open_in_editor(&paths);
+        let targets: Vec<(PathBuf, u32)> = occurrences
+            .iter()
+            .map(|o| (o.path.clone(), o.start_line.max(1) as u32))
+            .collect();
+        self.launch_editor_with_banner(&targets, cx);
     }
 
     /// Update the sidebar search query. Invoked from the search input's
@@ -599,16 +667,30 @@ impl ProjectView {
     }
 
     /// Toolbar "Open in editor" — respect checkboxes, fall back to
-    /// every visible path when none are checked. Real launcher lands
-    /// in #29; today we call the `open_in_editor` placeholder.
-    pub fn open_group_in_editor(&mut self, group_id: i64, _cx: &mut Context<Self>) {
-        let paths = self.state.copy_paths_for_group(group_id);
-        if paths.is_empty() {
+    /// every visible path when none are checked. Wired to the real
+    /// launcher (#29); each target carries the first line number of
+    /// the matching occurrence so the editor lands on the right row.
+    pub fn open_group_in_editor(&mut self, group_id: i64, cx: &mut Context<Self>) {
+        let targets = self.state.open_targets_for_group(group_id);
+        if targets.is_empty() {
             return;
         }
-        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
-        // TODO(#29): wire editor launcher.
-        open_in_editor(&refs);
+        self.launch_editor_with_banner(&targets, cx);
+    }
+
+    /// Shared launcher path for the `o` shortcut and the toolbar
+    /// button. Delegates to [`launch_editor`] and surfaces the
+    /// "No editor found" banner on `Err(NoEditor)`.
+    fn launch_editor_with_banner(&mut self, targets: &[(PathBuf, u32)], cx: &mut Context<Self>) {
+        let cfg = self.state.editor_config.clone();
+        if let Err(e) = launch_editor(&cfg, targets) {
+            // All errors surface the same banner; the error message
+            // already matches the AC ("No editor found — run dedup
+            // config edit to pick one.") for `NoEditor`, and is
+            // self-descriptive for the other variants.
+            self.state.surface_editor_banner(e.to_string());
+            cx.notify();
+        }
     }
 
     /// Toolbar "Collapse all".
@@ -871,6 +953,28 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
             entity.update(cx, |view, cx| view.dismiss_recent_banner(cx));
         }
     });
+
+    // Issue #29 — editor banner + preferences dialog.
+    cx.on_action(|_: &DismissEditorBanner, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.dismiss_editor_banner(cx));
+        }
+    });
+    cx.on_action(|_: &Preferences, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.open_preferences(cx));
+        }
+    });
+    cx.on_action(|_: &ClosePreferences, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.close_preferences(cx));
+        }
+    });
+    cx.on_action(|_: &OpenConfigInEditor, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.open_config_in_editor(cx));
+        }
+    });
 }
 
 /// Shared body for the five `OpenRecentN` action handlers. Pulled out
@@ -923,6 +1027,14 @@ impl Render for ProjectView {
             .as_ref()
             .map(render_stale_recent_banner);
 
+        // Issue #29 — editor launcher banner + Preferences dialog.
+        let editor_banner = self.state.editor_banner.as_ref().map(render_editor_banner);
+        let prefs = if self.state.preferences_open {
+            Some(render_preferences_dialog(&self.state))
+        } else {
+            None
+        };
+
         div()
             .size_full()
             .flex()
@@ -930,8 +1042,10 @@ impl Render for ProjectView {
             .bg(rgb(BG))
             .text_color(white())
             .children(stale)
+            .children(editor_banner)
             .children(overlay)
             .child(body)
+            .children(prefs)
     }
 }
 
@@ -1003,6 +1117,195 @@ fn render_stale_recent_banner(banner: &crate::app_state::RecentBanner) -> gpui::
                             window.dispatch_action(Box::new(DismissRecentBanner), cx);
                         })
                         .child("Dismiss"),
+                ),
+        )
+}
+
+/// Render the inline "No editor found" / editor-launch-failure banner
+/// (issue #29). Same palette family as [`render_stale_recent_banner`]
+/// but with a single `[Dismiss]` button — the fix lives in
+/// `dedup config edit`, not in a one-click banner action.
+///
+/// TODO(#30): promote to toast.
+fn render_editor_banner(banner: &crate::app_state::EditorBanner) -> gpui::Div {
+    let msg = banner.message.clone();
+    div()
+        .w_full()
+        .bg(rgb(0x7f1d1d))
+        .px(px(12.0))
+        .py(px(8.0))
+        .border_b_1()
+        .border_color(black())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(0xfee2e2))
+                .child(msg),
+        )
+        .child(
+            div()
+                .px(px(10.0))
+                .py(px(4.0))
+                .bg(rgb(0x450a0a))
+                .text_color(white())
+                .text_size(px(12.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.dispatch_action(Box::new(DismissEditorBanner), cx);
+                })
+                .child("Dismiss"),
+        )
+}
+
+/// Render the Preferences dialog (issue #29).
+///
+/// ## GPUI compromise
+///
+/// GPUI's text-input primitives at the pinned revision
+/// (da25b914c25f17ba457abc8cf75b8e42d0b899e2, Zed v0.232.3) do not
+/// expose a simple `TextInput` widget outside Zed's own workspace
+/// crates, which we deliberately don't depend on to keep the tree size
+/// bounded (see #19 / #23 notes about GPUI text input). A full modal
+/// with editable `command` / `terminal` / `terminal_command`
+/// textboxes would require vendoring Zed's `ui` crate — overkill for
+/// this milestone.
+///
+/// Instead, the dialog surfaces:
+/// - The current preset + terminal mode as read-only text.
+/// - An `[Edit config file…]` button that opens the active
+///   `config.toml` in `$EDITOR` (same behavior as `dedup config
+///   edit`). The user hand-edits the `[editor]` section there and
+///   re-launches the app to pick up changes.
+/// - A `[Close]` button that dismisses the dialog.
+///
+/// Richer preferences UX lands alongside #30's toast / modal system.
+fn render_preferences_dialog(state: &AppState) -> gpui::Div {
+    let cfg = &state.editor_config;
+    let preset = cfg.preset.as_str().to_string();
+    let terminal = cfg
+        .terminal
+        .clone()
+        .unwrap_or_else(|| cfg.preset.default_terminal().as_str().to_string());
+    let command = cfg
+        .command
+        .clone()
+        .unwrap_or_else(|| "(preset default)".to_string());
+    let terminal_command = cfg
+        .terminal_command
+        .clone()
+        .unwrap_or_else(|| "(unset)".to_string());
+    let config_path = dedup_core::Config::global_path().display().to_string();
+
+    let row = |label: &str, value: String| {
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .w(px(140.0))
+                    .text_size(px(12.0))
+                    .text_color(rgb(ROW_TEXT_DIM))
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(ROW_TEXT))
+                    .child(value),
+            )
+    };
+
+    // The overlay is a full-size scrim with a centered card. The scrim
+    // click dismisses the dialog; the card catches clicks so hits
+    // inside don't propagate to the scrim.
+    div()
+        .absolute()
+        .inset_0()
+        .bg(rgb(0x00000099))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.dispatch_action(Box::new(ClosePreferences), cx);
+        })
+        .child(
+            div()
+                .id("preferences-dialog")
+                .w(px(520.0))
+                .bg(rgb(0x24242a))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(0x3b3b48))
+                .p(px(20.0))
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                // Eat clicks on the card itself so they don't reach
+                // the scrim's on_mouse_down dismiss handler.
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .text_color(white())
+                        .child("Preferences \u{2014} Editor"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(ROW_TEXT_DIM))
+                        .child(
+                            "Choose your editor preset in \
+                             config.toml. Changes take effect on next \
+                             open.",
+                        ),
+                )
+                .child(row("Preset", preset))
+                .child(row("Terminal", terminal))
+                .child(row("Command", command))
+                .child(row("Terminal command", terminal_command))
+                .child(row("Config file", config_path))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .justify_end()
+                        .child(
+                            div()
+                                .id("preferences-close")
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .bg(rgb(ACCENT_DIM))
+                                .text_color(white())
+                                .text_size(px(12.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.dispatch_action(Box::new(ClosePreferences), cx);
+                                })
+                                .child("Close"),
+                        )
+                        .child(
+                            div()
+                                .id("preferences-edit")
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .bg(rgb(ACCENT))
+                                .text_color(white())
+                                .text_size(px(12.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.dispatch_action(Box::new(OpenConfigInEditor), cx);
+                                })
+                                .child("Edit config file\u{2026}"),
+                        ),
                 ),
         )
 }

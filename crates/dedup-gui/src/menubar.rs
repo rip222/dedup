@@ -117,6 +117,18 @@ actions!(
         /// touching the MRU. The user can still remove the entry later
         /// via a fresh click. Issue #28.
         DismissRecentBanner,
+        /// Inline banner dismiss for the editor-launch banner (issue
+        /// #29). Dispatched by the "Dismiss" button on the banner.
+        DismissEditorBanner,
+        /// Preferences dialog — "Edit config file…" shortcut (issue
+        /// #29). Opens the active config TOML in `$EDITOR` so the user
+        /// can pick their editor preset. GPUI's text-input primitives
+        /// aren't rich enough in this revision for a full modal with
+        /// textboxes, so the dialog surfaces this single action instead
+        /// (see `project_view::render_preferences_dialog`).
+        OpenConfigInEditor,
+        /// Close the Preferences dialog without saving (issue #29).
+        ClosePreferences,
     ]
 );
 
@@ -155,7 +167,9 @@ fn register_handlers(cx: &mut App) {
     // them gives a visible signal during manual testing / demos without
     // committing to half-baked behaviour.
     stub(cx, "About", |_: &About, _: &mut App| {});
-    stub(cx, "Preferences (⌘,)", |_: &Preferences, _: &mut App| {});
+    // `Preferences` is no longer a stub — `crate::project_view::register_root`
+    // wires it to the inline Preferences dialog once the root view exists.
+    // Firing it before then is a safe no-op.
     stub(cx, "Hide", |_: &Hide, _: &mut App| {});
     // `OpenFolder` is no longer a stub — `crate::project_view::register_root`
     // installs the real NSOpenPanel-backed handler after the root view is
