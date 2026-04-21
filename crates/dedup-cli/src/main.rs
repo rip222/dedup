@@ -375,6 +375,8 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     let mut scan_cfg = ScanConfig::from(&config);
     scan_cfg.no_gitignore = globals.no_gitignore;
     scan_cfg.ignore_all = globals.all;
+    scan_cfg.jobs = globals.jobs;
+    scan_cfg.cache_root = Some(path.to_path_buf());
     let scanner = Scanner::new(scan_cfg);
 
     // Build the progress sink. Spinner is suppressed when:

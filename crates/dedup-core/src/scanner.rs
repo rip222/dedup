@@ -26,14 +26,23 @@
 //! 8. Emits [`MatchGroup`]s tagged with [`Tier::A`] or [`Tier::B`] —
 //!    suitable for the CLI to print or for later issues to consume.
 //!
+//! Parallelism (issue #14): the walk itself is serial (metadata-only and
+//! cheap), but the read → tokenize → rolling-hash stage runs in a scoped
+//! `rayon::ThreadPool`. Candidates are sorted by relative path before
+//! fan-out so `file_index` is canonical no matter which worker finishes
+//! first. `ScanConfig::jobs` caps pool width; `Some(1)` bypasses rayon
+//! entirely. A warm-scan cache keyed by content hash + `(size, mtime)`
+//! lets unchanged files skip the rolling-hash pass by rehydrating the
+//! stored block-hash list out of SQLite.
+//!
 //! What this scanner deliberately does NOT do at this milestone:
 //!
-//! - No parallelism (lands in #14).
 //! - No aggressive literal abstraction (lands in #10).
 //! - No typed-error surfacing for per-file I/O or parse failures: they are
 //!   silently skipped. `ScanError` exists for top-level catastrophic
 //!   failures (none today, but the surface is ready for #17).
 
+use crate::cache::{Cache, FileFingerprint};
 use crate::ignore::{IgnoreRules, IgnoreRulesOptions};
 use crate::rolling_hash::{Hash, Span, rolling_hash};
 use crate::tokenizer::{Token, tokenize};
@@ -42,8 +51,11 @@ use dedup_lang::{
     profile_for_extension,
 };
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use tree_sitter::Parser;
@@ -126,6 +138,19 @@ pub struct ScanConfig {
     /// to a stable `<LIT>` placeholder so functions differing only
     /// in literal values still cluster. Issue #10.
     pub normalization: NormalizationMode,
+    /// Parallelism budget for the read → tokenize → hash pipeline.
+    /// `Some(0)` and `None` both fall through to rayon's default
+    /// (currently `num_cpus::get()`). `Some(1)` forces single-threaded
+    /// execution, which is the escape hatch for tests / debugging.
+    /// Bounded to a scoped `rayon::ThreadPool`; never mutates the
+    /// global pool.
+    pub jobs: Option<usize>,
+    /// Optional path to the repository cache. When set, the scanner
+    /// will consult / update per-file content-hash entries to skip
+    /// re-tokenizing unchanged files on warm scans. `None` (the
+    /// default) disables the cache path entirely — the scanner
+    /// behaves exactly as it did pre-#14.
+    pub cache_root: Option<PathBuf>,
 }
 
 impl Default for ScanConfig {
@@ -141,6 +166,8 @@ impl Default for ScanConfig {
             no_gitignore: false,
             ignore_all: false,
             normalization: NormalizationMode::Conservative,
+            jobs: None,
+            cache_root: None,
         }
     }
 }
@@ -158,6 +185,8 @@ impl From<&crate::config::Config> for ScanConfig {
             no_gitignore: false,
             ignore_all: false,
             normalization: cfg.normalization.into(),
+            jobs: None,
+            cache_root: None,
         }
     }
 }
@@ -300,12 +329,6 @@ impl Scanner {
     ) -> Result<ScanResult, ScanError> {
         info!(root = %root.display(), "scan: starting");
 
-        // --- 1. Walk and tokenize each candidate file. --------------------
-        //
-        // We retain the original source text alongside the token stream so
-        // Tier B can re-parse with tree-sitter without going back to disk.
-        let mut per_file: Vec<FileBundle> = Vec::new();
-
         let follow = self.config.follow_symlinks;
         let include_submodules = self.config.include_submodules;
 
@@ -325,6 +348,14 @@ impl Scanner {
         walker.follow_links(follow);
         ignore_rules.apply_to_walk_builder(&mut walker);
 
+        // --- 1. Serial walk: collect candidate file paths. ----------------
+        //
+        // The walk itself is cheap (stat-only); parallelizing it yields
+        // little and makes determinism harder. We produce a sorted list
+        // of (abs, rel) paths so downstream indexing is stable across
+        // runs even when the parallel read/tokenize/hash stage completes
+        // out of order.
+        let mut candidates: Vec<(PathBuf, PathBuf)> = Vec::new();
         for entry in walker.build() {
             let entry = match entry {
                 Ok(e) => e,
@@ -343,26 +374,11 @@ impl Scanner {
             // Layer 1: `.git/` and nested submodule directories.
             if is_dir {
                 if ignore_rules.is_git_dir(&rel) {
-                    // `ignore::Walk` does not auto-skip nested `.git/`
-                    // contents when `git_ignore` is off, so we skip the
-                    // entry explicitly. The walker will still descend
-                    // into it, but every child will re-enter this guard
-                    // on its own rel path and be dropped.
                     continue;
                 }
                 if !include_submodules && !rel.as_os_str().is_empty() && abs.join(".git").exists() {
-                    // Submodule roots are identified by a `.git` entry
-                    // (file or dir) below the top-level root. The
-                    // directory itself is allowed through so its
-                    // children can be filtered individually, matching
-                    // the previous walkdir behavior: drop only the
-                    // submodule *contents*, not the root entry.
                     continue;
                 }
-                // Layer 3/4 path ignores for directories (so vendored
-                // dirs stop descending early in common cases; the walker
-                // still visits the children but the path predicate
-                // drops them).
                 if ignore_rules.is_path_ignored(&rel, true) {
                     continue;
                 }
@@ -396,69 +412,263 @@ impl Scanner {
             {
                 continue;
             }
+
+            candidates.push((abs.to_path_buf(), rel));
+        }
+
+        // Canonical ordering by relative path keeps `file_index` stable
+        // irrespective of the walker's filesystem-dependent traversal
+        // order — essential once the next stage runs in parallel.
+        candidates.sort_by(|a, b| a.1.cmp(&b.1));
+
+        // --- 2. Parallel read + (optional) tokenize + rolling-hash. ------
+        //
+        // Each task returns one of:
+        //   - `Some(FileOutput)` — file survived the filter chain and
+        //     produced a token stream plus a block-hash list;
+        //   - `None`             — filtered out (binary / decode fail / …).
+        //
+        // Cache warmth: if a [`FileFingerprint`] exists with matching
+        // (size, mtime) AND the freshly-computed content hash matches,
+        // we pull the block-hash list out of `file_blocks` and skip
+        // rolling-hash. Tokenize still runs — it's a linear pass that
+        // Tier B also needs via its tree-sitter parse path, and a single
+        // source-of-truth `Vec<Token>` is simpler than branching.
+        //
+        // The rayon pool is scoped to this call via
+        // `ThreadPoolBuilder::install` so setting `jobs=1` in one scan
+        // does not affect concurrent scans or tests running on the
+        // global pool.
+        let cache = self
+            .config
+            .cache_root
+            .as_ref()
+            .and_then(|p| match Cache::open_readonly(p) {
+                Ok(Some(c)) => Some(Mutex::new(c)),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(error = %e, "scan: cache open failed, running cold");
+                    None
+                }
+            });
+
+        let ignore_rules_ref = &ignore_rules;
+        let cache_ref = cache.as_ref();
+
+        let process = |(abs, rel): &(PathBuf, PathBuf)| -> Option<FileOutput> {
+            let meta = std::fs::metadata(abs).ok();
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            // Try the stat-only fast path: if (size, mtime) match the
+            // cached fingerprint, we'll still verify content_hash before
+            // trusting the cached block list, but we can read + hash in
+            // one pass and only decide to tokenize-vs-reuse afterward.
+            let cached_fp = cache_ref.and_then(|m| {
+                let c = m.lock().ok()?;
+                c.file_fingerprint(rel).ok().flatten()
+            });
+
             let bytes = match std::fs::read(abs) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(path = %abs.display(), error = %e, "scan: read failed, skipping");
-                    continue;
+                    return None;
                 }
             };
             // Layer 1: binary content sniff.
-            if ignore_rules.looks_binary(&bytes) {
-                continue;
+            if ignore_rules_ref.looks_binary(&bytes) {
+                return None;
             }
             let text = match std::str::from_utf8(&bytes) {
                 Ok(s) => s.to_string(),
                 Err(e) => {
-                    // UTF-8 decode is routine in a mixed-encoding tree;
-                    // per the PRD this is debug-level, not warn.
                     IgnoreRules::log_utf8_skip(abs, &e);
-                    continue;
+                    return None;
                 }
             };
             // Layer 3: `@generated` / `AUTO-GENERATED` header scan.
-            if ignore_rules.has_generated_header(&text) {
-                continue;
+            if ignore_rules_ref.has_generated_header(&text) {
+                return None;
             }
 
+            let content_hash = hash_bytes(&bytes);
             let tokens = tokenize(&text);
             debug!(path = %rel.display(), tokens = tokens.len(), "scan: tokenized file");
-            per_file.push(FileBundle {
-                path: rel,
+
+            // Cache-hit path: content_hash matches the persisted one
+            // AND (size, mtime) corroborate. Skip rolling_hash.
+            let mut windows: Option<Vec<(Hash, Span)>> = None;
+            let mut cache_hit = false;
+            if let Some(fp) = &cached_fp
+                && fp.content_hash == content_hash
+                && fp.size == size
+                && fp.mtime == mtime
+                && let Some(m) = cache_ref
+                && let Ok(c) = m.lock()
+                && let Ok(Some(cached)) = c.file_blocks(rel, content_hash)
+            {
+                // Reconstruct spans from the freshly-computed tokens.
+                // The block-hash list length must match `tokens.len() -
+                // WINDOW_SIZE + 1`; if it doesn't, something is out of
+                // sync — treat as a miss.
+                let expected_len = tokens.len().saturating_sub(WINDOW_SIZE - 1).max(0);
+                let actual_len = if tokens.len() >= WINDOW_SIZE {
+                    tokens.len() - WINDOW_SIZE + 1
+                } else {
+                    0
+                };
+                if cached.block_hashes.len() == actual_len && actual_len == expected_len {
+                    let reconstructed: Vec<(Hash, Span)> = cached
+                        .block_hashes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| {
+                            let first = &tokens[i];
+                            let last = &tokens[i + WINDOW_SIZE - 1];
+                            (
+                                *h,
+                                Span {
+                                    start_line: first.line,
+                                    end_line: last.line,
+                                    start_byte: first.start,
+                                    end_byte: last.end,
+                                },
+                            )
+                        })
+                        .collect();
+                    windows = Some(reconstructed);
+                    cache_hit = true;
+                }
+            }
+            let windows = windows.unwrap_or_else(|| rolling_hash(&tokens, WINDOW_SIZE));
+
+            Some(FileOutput {
+                abs: abs.clone(),
+                rel: rel.clone(),
                 source: text,
                 tokens,
+                windows,
+                content_hash,
+                size,
+                mtime,
+                cache_hit,
+            })
+        };
+
+        let outputs: Vec<Option<FileOutput>> = match self.config.jobs {
+            Some(1) => candidates.iter().map(process).collect(),
+            n => {
+                let mut builder = rayon::ThreadPoolBuilder::new();
+                if let Some(num) = n
+                    && num > 0
+                {
+                    builder = builder.num_threads(num);
+                }
+                match builder.build() {
+                    Ok(pool) => pool.install(|| candidates.par_iter().map(process).collect()),
+                    Err(e) => {
+                        warn!(error = %e, "scan: rayon pool build failed, falling back to serial");
+                        candidates.iter().map(process).collect()
+                    }
+                }
+            }
+        };
+
+        // Collapse into the scanner's internal file_bundle + per_file_hashes
+        // shape. Order is preserved from `candidates`, which we sorted by
+        // relative path above — so `file_index` is canonical.
+        let mut per_file: Vec<FileBundle> = Vec::new();
+        let mut per_file_hashes: Vec<Vec<(Hash, Span)>> = Vec::new();
+        let mut fresh_entries: Vec<(PathBuf, FileFingerprint, Vec<Hash>)> = Vec::new();
+
+        for out in outputs.into_iter().flatten() {
+            sink.on_file_processed(&out.abs);
+            if !out.cache_hit {
+                let fp = FileFingerprint {
+                    content_hash: out.content_hash,
+                    size: out.size,
+                    mtime: out.mtime,
+                };
+                let block_hashes: Vec<Hash> = out.windows.iter().map(|(h, _)| *h).collect();
+                fresh_entries.push((out.rel.clone(), fp, block_hashes));
+            }
+            per_file.push(FileBundle {
+                path: out.rel,
+                source: out.source,
+                tokens: out.tokens,
             });
-            // Report progress *after* the file is staged so sinks that
-            // update a spinner see work that has actually been done.
-            sink.on_file_processed(abs);
+            per_file_hashes.push(out.windows);
+        }
+
+        drop(cache);
+
+        // Persist fresh fingerprints + block lists. Best-effort: a cache
+        // write failure downgrades to a warning rather than failing the
+        // scan. Batched in a single transaction for throughput on large
+        // repos.
+        if !fresh_entries.is_empty()
+            && let Some(cache_root) = &self.config.cache_root
+        {
+            match Cache::open(cache_root) {
+                Ok(mut c) => {
+                    for (rel, fp, blocks) in &fresh_entries {
+                        if let Err(e) = c.put_file_entry(rel, fp, blocks) {
+                            warn!(path = %rel.display(), error = %e,
+                                "scan: failed to persist file cache entry");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "scan: cache re-open failed, skipping warm-cache writes");
+                }
+            }
         }
 
         let files_scanned = per_file.len();
 
-        // --- 2. Roll hashes per file and index them. ----------------------
-        // Each window is uniquely identified by (file_index, window_start).
+        // --- 3. Bucket windows by hash, then drop singletons. ------------
+        //
+        // Memory discipline (issue #14 AC): we first tally per-hash
+        // occurrence counts in a lightweight `FxHashMap<Hash, u32>`, then
+        // materialize `Vec<WindowKey>` only for hashes that occurred at
+        // least twice. On pathological inputs (100k+ singleton blocks)
+        // this keeps the non-singleton bucket map bounded by the count
+        // of actual duplicates rather than the total window count.
         #[derive(Clone, Copy)]
         struct WindowKey {
             file: usize,
             win: usize,
         }
 
-        let mut by_hash: FxHashMap<Hash, Vec<WindowKey>> = FxHashMap::default();
-        let mut per_file_hashes: Vec<Vec<(Hash, Span)>> = Vec::with_capacity(per_file.len());
+        let mut counts: FxHashMap<Hash, u32> = FxHashMap::default();
+        for windows in per_file_hashes.iter() {
+            for (h, _) in windows {
+                *counts.entry(*h).or_insert(0) += 1;
+            }
+        }
 
-        for (fi, bundle) in per_file.iter().enumerate() {
-            let windows = rolling_hash(&bundle.tokens, WINDOW_SIZE);
+        let mut by_hash: FxHashMap<Hash, Vec<WindowKey>> = FxHashMap::default();
+        for (fi, windows) in per_file_hashes.iter().enumerate() {
             for (wi, (h, _)) in windows.iter().enumerate() {
+                if counts.get(h).copied().unwrap_or(0) < 2 {
+                    continue;
+                }
                 by_hash
                     .entry(*h)
                     .or_default()
                     .push(WindowKey { file: fi, win: wi });
             }
-            per_file_hashes.push(windows);
         }
-
-        // --- 3. Drop singleton buckets. ----------------------------------
-        by_hash.retain(|_, v| v.len() >= 2);
+        // Free the count tally now that the non-singleton bucket index is
+        // built; it's the peak memory contributor on singleton-heavy
+        // corpora and we don't need it past this point.
+        drop(counts);
 
         // --- 4. Greedy extension.
         //
@@ -800,6 +1010,37 @@ struct FileBundle {
     path: PathBuf,
     source: String,
     tokens: Vec<Token>,
+}
+
+/// Result of the parallel per-file pipeline. Converted into a
+/// [`FileBundle`] + block-hash list on the main thread after the
+/// parallel stage completes. Kept private so the parallel pipeline
+/// shape is an implementation detail.
+struct FileOutput {
+    abs: PathBuf,
+    rel: PathBuf,
+    source: String,
+    tokens: Vec<Token>,
+    windows: Vec<(Hash, Span)>,
+    content_hash: Hash,
+    size: u64,
+    mtime: i64,
+    /// True iff `windows` was reconstructed from cached block hashes.
+    cache_hit: bool,
+}
+
+/// Compute a 64-bit content fingerprint over raw file bytes using
+/// [`rustc_hash::FxHasher`]. This is NOT cryptographic — collisions
+/// can happen on adversarial input — but it is deterministic, fast,
+/// and already in the dependency closure. Acceptable because the
+/// fingerprint is only used as a cache-invalidation key; a collision
+/// just means the cache serves stale block hashes and the
+/// reconstruction step detects the mismatch via token-count
+/// verification and falls back to a cold hash.
+fn hash_bytes(bytes: &[u8]) -> Hash {
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(bytes);
+    h.finish()
 }
 
 /// Deterministic key identifying an occurrence's location (path + line

@@ -22,8 +22,27 @@
 //!
 //! Out of scope here (punted to later issues per the PRD / issue #4 spec):
 //!
-//! - Content-hash-keyed warm-scan skip (→ #14).
 //! - Concurrent-writer testing and real schema bumps (→ #18).
+//!
+//! # Warm-scan cache (issue #14)
+//!
+//! The `file_hashes` table stores, per scanned path, a 64-bit content
+//! fingerprint alongside the file's size and mtime (seconds since epoch)
+//! at scan time. A companion `file_blocks` table stores the full rolling-
+//! hash block-hash list for the file as a length-prefixed sequence of
+//! little-endian `u64`s. Together they let the scanner skip the
+//! read-tokenize-hash path for unchanged files: on a warm scan, files
+//! whose `(size, mtime)` matches the cache and whose freshly-computed
+//! content hash matches the persisted one short-circuit straight into
+//! the bucket-fill pass with their cached block hashes.
+//!
+//! The `(size, mtime)` pre-check exists because recomputing the content
+//! hash still requires reading the file; `(size, mtime)` is a cheap
+//! stat-only probe that filters out the common "nothing changed" case
+//! before any I/O. When the probe matches, the content hash is still
+//! trusted as the authoritative key — the PRD says "content-hash-keyed",
+//! and `(size, mtime)` is an optimization on top of that, not a
+//! replacement for it.
 //!
 //! # Suppressions (issue #11)
 //!
@@ -128,6 +147,34 @@ pub struct Suppression {
     pub last_group_id: Option<i64>,
 }
 
+/// Per-file content-hash entry used by the warm-scan cache (#14).
+///
+/// The tuple `(size, mtime)` is a cheap stat-only probe that the scanner
+/// checks before trusting `content_hash`: if either differs, the file is
+/// re-hashed from disk; if both match, the cached `content_hash` keys a
+/// lookup into the block-hash list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFingerprint {
+    /// Stored as an 8-byte big-endian blob so it round-trips identically
+    /// to `match_groups.group_hash`.
+    pub content_hash: crate::rolling_hash::Hash,
+    /// File size in bytes at the time of the last scan.
+    pub size: u64,
+    /// File mtime in whole seconds since the Unix epoch.
+    pub mtime: i64,
+}
+
+/// A per-file block-hash list alongside the content hash it was computed
+/// under. Fetched on a warm scan so we can skip tokenize + rolling-hash
+/// work. The `block_hashes` vector preserves the order produced by the
+/// rolling-hash pass, so the scanner can rebuild its per-file bucket
+/// index without re-reading the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedBlocks {
+    pub content_hash: crate::rolling_hash::Hash,
+    pub block_hashes: Vec<crate::rolling_hash::Hash>,
+}
+
 /// Owning handle to the SQLite cache.
 ///
 /// Cheap to construct beyond the `open`-time pragmas. Holds the underlying
@@ -220,6 +267,108 @@ impl Cache {
         Ok(Some(Self { conn }))
     }
 
+    /// Read the stored [`FileFingerprint`] for `path`, if any.
+    ///
+    /// `path` must be a repository-relative path (the same POSIX-form
+    /// string the scanner writes on insert). Returns `Ok(None)` when the
+    /// cache has no row for this path — the caller treats that as a
+    /// cold entry and re-hashes the file.
+    pub fn file_fingerprint(&self, path: &Path) -> Result<Option<FileFingerprint>, CacheError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT content_hash, size, mtime FROM file_hashes WHERE path = ?1",
+                params![path_to_posix_str(path)],
+                |r| {
+                    let bytes: Vec<u8> = r.get(0)?;
+                    let size: i64 = r.get(1)?;
+                    let mtime: i64 = r.get(2)?;
+                    Ok((bytes, size, mtime))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(bytes, size, mtime)| {
+            blob_to_hash(&bytes).map(|content_hash| FileFingerprint {
+                content_hash,
+                size: size.max(0) as u64,
+                mtime,
+            })
+        }))
+    }
+
+    /// Read the stored [`CachedBlocks`] for `path`, if any.
+    ///
+    /// Returned iff (a) a `file_blocks` row exists for `path` AND
+    /// (b) its `content_hash` equals the caller-provided `expected_hash`.
+    /// The scanner always passes the freshly-confirmed content hash to
+    /// filter out stale rows where the file was edited and re-hashed but
+    /// the block list was never rewritten — the pair is the join key.
+    pub fn file_blocks(
+        &self,
+        path: &Path,
+        expected_hash: crate::rolling_hash::Hash,
+    ) -> Result<Option<CachedBlocks>, CacheError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT content_hash, block_hashes FROM file_blocks WHERE path = ?1",
+                params![path_to_posix_str(path)],
+                |r| {
+                    let ch: Vec<u8> = r.get(0)?;
+                    let bh: Vec<u8> = r.get(1)?;
+                    Ok((ch, bh))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(ch, bh)| {
+            let stored = blob_to_hash(&ch)?;
+            if stored != expected_hash {
+                return None;
+            }
+            Some(CachedBlocks {
+                content_hash: stored,
+                block_hashes: decode_block_hashes(&bh),
+            })
+        }))
+    }
+
+    /// Upsert the fingerprint + block-hash list for `path`. Used by the
+    /// scanner's warm-cache path to refresh rows for files that just got
+    /// re-hashed (cold read).
+    pub fn put_file_entry(
+        &mut self,
+        path: &Path,
+        fp: &FileFingerprint,
+        block_hashes: &[crate::rolling_hash::Hash],
+    ) -> Result<(), CacheError> {
+        let tx = self.conn.transaction()?;
+        {
+            let now = now_unix_seconds();
+            let hash_bytes = fp.content_hash.to_be_bytes();
+            tx.execute(
+                "INSERT OR REPLACE INTO file_hashes \
+                    (path, content_hash, scanned_at, size, mtime) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    path_to_posix_str(path),
+                    &hash_bytes[..],
+                    now,
+                    fp.size as i64,
+                    fp.mtime,
+                ],
+            )?;
+            let blocks_blob = encode_block_hashes(block_hashes);
+            tx.execute(
+                "INSERT OR REPLACE INTO file_blocks \
+                    (path, content_hash, block_hashes) \
+                 VALUES (?1, ?2, ?3)",
+                params![path_to_posix_str(path), &hash_bytes[..], blocks_blob],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Replace all persisted match groups with those from `result`.
     ///
     /// Runs as a single transaction. `occurrences` rows cascade-delete
@@ -238,9 +387,11 @@ impl Cache {
         );
         let tx = self.conn.transaction()?;
 
-        // Fresh state — occurrences cascade from match_groups.
+        // Fresh state — occurrences cascade from match_groups. The
+        // `file_hashes` / `file_blocks` tables are NOT truncated here:
+        // those rows are the warm-scan cache, managed per-file by
+        // `put_file_entry` during the scan itself.
         tx.execute("DELETE FROM match_groups", [])?;
-        tx.execute("DELETE FROM file_hashes", [])?;
 
         {
             let mut group_stmt = tx.prepare(
@@ -276,30 +427,6 @@ impl Cache {
                         occ.span.end_byte as i64,
                     ])?;
                 }
-            }
-        }
-
-        // Populate file_hashes with scanned paths. Real content hashes
-        // land in #14; for now we store an empty blob so the row key
-        // (path) exists for future warm-scan logic.
-        {
-            let mut file_paths: Vec<&std::path::Path> = Vec::new();
-            for group in &result.groups {
-                for occ in &group.occurrences {
-                    file_paths.push(&occ.path);
-                }
-            }
-            file_paths.sort();
-            file_paths.dedup();
-
-            let now = now_unix_seconds();
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO file_hashes \
-                    (path, content_hash, scanned_at) \
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            for p in file_paths {
-                stmt.execute(params![path_to_posix_str(p), &[][..], now])?;
             }
         }
 
@@ -576,7 +703,14 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
         "CREATE TABLE IF NOT EXISTS file_hashes (\
             path         TEXT PRIMARY KEY,\
             content_hash BLOB NOT NULL,\
-            scanned_at   INTEGER\
+            scanned_at   INTEGER,\
+            size         INTEGER NOT NULL DEFAULT 0,\
+            mtime        INTEGER NOT NULL DEFAULT 0\
+         );\
+         CREATE TABLE IF NOT EXISTS file_blocks (\
+            path         TEXT PRIMARY KEY,\
+            content_hash BLOB NOT NULL,\
+            block_hashes BLOB NOT NULL\
          );\
          CREATE TABLE IF NOT EXISTS match_groups (\
             id                INTEGER PRIMARY KEY,\
@@ -603,6 +737,34 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
             last_group_id  INTEGER\
          );",
     )?;
+    // Additive columns for v1 in-place extension (issue #14). These are
+    // ADD COLUMN IF-they-don't-exist idempotent probes: SQLite errors on
+    // a duplicate column, which we tolerate. A real migration runner
+    // lands in #18.
+    add_column_if_missing(conn, "file_hashes", "size", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "file_hashes", "mtime", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
+/// `ALTER TABLE ... ADD COLUMN` guarded against a pre-existing column.
+/// Tolerates the "duplicate column name" error so re-opening an older
+/// cache that already has the column is a no-op.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> Result<(), CacheError> {
+    // Probe for the column via PRAGMA table_info.
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<_, _>>()?;
+    if cols.iter().any(|c| c == column) {
+        return Ok(());
+    }
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+    conn.execute(&sql, [])?;
     Ok(())
 }
 
@@ -660,6 +822,28 @@ fn blob_to_hash(bytes: &[u8]) -> Option<crate::rolling_hash::Hash> {
     let mut arr = [0u8; 8];
     arr.copy_from_slice(bytes);
     Some(u64::from_be_bytes(arr))
+}
+
+/// Encode a block-hash list as a flat little-endian `u64` byte vector.
+/// Length is implicit from `bytes.len() / 8`.
+fn encode_block_hashes(hashes: &[crate::rolling_hash::Hash]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hashes.len() * 8);
+    for h in hashes {
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`encode_block_hashes`]. A trailing partial chunk (not a
+/// multiple of 8) is discarded — malformed row, treated as a cache miss.
+fn decode_block_hashes(bytes: &[u8]) -> Vec<crate::rolling_hash::Hash> {
+    let mut out = Vec::with_capacity(bytes.len() / 8);
+    for chunk in bytes.chunks_exact(8) {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(chunk);
+        out.push(u64::from_le_bytes(arr));
+    }
+    out
 }
 
 fn now_unix_seconds() -> i64 {
@@ -1006,5 +1190,113 @@ mod tests {
         };
         cache.write_scan_result(&empty).unwrap();
         assert!(cache.list_groups().unwrap().is_empty());
+    }
+
+    // --- Warm-scan cache (issue #14) -----------------------------------
+
+    #[test]
+    fn file_fingerprint_roundtrip() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let path = PathBuf::from("src/foo.rs");
+        let fp = FileFingerprint {
+            content_hash: 0xabcd_1234_abcd_1234,
+            size: 512,
+            mtime: 1_700_000_000,
+        };
+        let blocks = vec![0x11, 0x22, 0x33];
+        cache.put_file_entry(&path, &fp, &blocks).unwrap();
+
+        let loaded = cache.file_fingerprint(&path).unwrap().expect("present");
+        assert_eq!(loaded, fp);
+
+        let loaded_blocks = cache
+            .file_blocks(&path, fp.content_hash)
+            .unwrap()
+            .expect("present");
+        assert_eq!(loaded_blocks.content_hash, fp.content_hash);
+        assert_eq!(loaded_blocks.block_hashes, blocks);
+    }
+
+    #[test]
+    fn file_blocks_miss_on_hash_mismatch() {
+        // Blocks list is keyed by (path, content_hash). A query with a
+        // different content hash must miss, so the scanner never
+        // rehydrates stale blocks after a file edit.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let path = PathBuf::from("a.rs");
+        let fp = FileFingerprint {
+            content_hash: 0xaaaa,
+            size: 10,
+            mtime: 1,
+        };
+        cache.put_file_entry(&path, &fp, &[1, 2, 3]).unwrap();
+
+        // Same path, different hash → cache miss.
+        assert!(cache.file_blocks(&path, 0xbbbb).unwrap().is_none());
+        // Matching hash → hit.
+        assert!(cache.file_blocks(&path, 0xaaaa).unwrap().is_some());
+    }
+
+    #[test]
+    fn file_fingerprint_missing_returns_none() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        assert!(
+            cache
+                .file_fingerprint(&PathBuf::from("nope.rs"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn put_file_entry_replaces_on_reinsert() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let path = PathBuf::from("x.rs");
+
+        let fp1 = FileFingerprint {
+            content_hash: 0x1111,
+            size: 100,
+            mtime: 10,
+        };
+        cache.put_file_entry(&path, &fp1, &[1, 2]).unwrap();
+
+        // Simulate a file edit: different content hash + blocks.
+        let fp2 = FileFingerprint {
+            content_hash: 0x2222,
+            size: 200,
+            mtime: 20,
+        };
+        cache.put_file_entry(&path, &fp2, &[9, 8, 7]).unwrap();
+
+        let loaded = cache.file_fingerprint(&path).unwrap().expect("present");
+        assert_eq!(loaded, fp2);
+        assert!(cache.file_blocks(&path, 0x1111).unwrap().is_none());
+        let blocks = cache.file_blocks(&path, 0x2222).unwrap().expect("present");
+        assert_eq!(blocks.block_hashes, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn write_scan_result_preserves_file_cache() {
+        // Writing scan results must not clobber the warm-scan tables —
+        // that's the whole point of keeping them separate from
+        // match_groups.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let path = PathBuf::from("preserved.rs");
+        let fp = FileFingerprint {
+            content_hash: 0xdeadbeef,
+            size: 1,
+            mtime: 1,
+        };
+        cache.put_file_entry(&path, &fp, &[42]).unwrap();
+
+        cache.write_scan_result(&synthetic_result()).unwrap();
+
+        // Row still present after the scan write.
+        assert!(cache.file_fingerprint(&path).unwrap().is_some());
     }
 }

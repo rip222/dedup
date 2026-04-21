@@ -43,6 +43,8 @@ fn tuned_scan_config(mode: NormalizationMode) -> ScanConfig {
         no_gitignore: false,
         ignore_all: false,
         normalization: mode,
+        jobs: None,
+        cache_root: None,
     }
 }
 

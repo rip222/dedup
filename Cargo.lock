@@ -1380,6 +1380,7 @@ dependencies = [
  "ignore",
  "insta",
  "proptest",
+ "rayon",
  "rusqlite",
  "rustc-hash 2.1.2",
  "serde",
