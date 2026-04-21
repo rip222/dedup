@@ -54,10 +54,11 @@ use ignore::WalkBuilder;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::hash::Hasher;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tree_sitter::Parser;
 
 /// The rolling-hash window size. Matches the Tier A `min_tokens` default.
@@ -100,6 +101,90 @@ impl Tier {
             Tier::A => "A",
             Tier::B => "B",
         }
+    }
+}
+
+/// Per-file issue category (issue #17). Every variant represents a file
+/// that was encountered during the walk but could not be fully processed.
+///
+/// The scanner degrades gracefully on each of these: the offending file
+/// is skipped (fully, or only for Tier B as noted) and the scan
+/// continues. The aggregated list lives on [`ScanResult::issues`] so
+/// callers can surface a summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FileIssueKind {
+    /// `std::fs::read` failed (permissions, disappearing file, ...).
+    /// Logged at `warn`; whole file is skipped.
+    ReadError,
+    /// File bytes did not decode as valid UTF-8. Logged at `debug`;
+    /// whole file is skipped silently. Matches the pre-#17 behavior.
+    Utf8,
+    /// Tier B parse path returned an error (tree-sitter parser could not
+    /// produce a tree, or the grammar ABI was incompatible). Tier A
+    /// results for this file are preserved; only Tier B is skipped.
+    /// Logged at `warn`.
+    TierBParse,
+    /// Tier B grammar work panicked. Caught via
+    /// [`std::panic::catch_unwind`] so the scan continues. Tier A
+    /// results for this file are preserved. Logged at `error`.
+    TierBPanic,
+}
+
+impl FileIssueKind {
+    /// Short camelCase label used in JSON / summary output.
+    pub fn label(self) -> &'static str {
+        match self {
+            FileIssueKind::ReadError => "read_error",
+            FileIssueKind::Utf8 => "utf8",
+            FileIssueKind::TierBParse => "tier_b_parse",
+            FileIssueKind::TierBPanic => "tier_b_panic",
+        }
+    }
+}
+
+/// One per-file issue recorded during the scan. Aggregated into
+/// [`ScanResult::issues`] so the CLI can print a post-scan summary and
+/// the JSON envelope can include a structured `issues` array.
+#[derive(Debug, Clone)]
+pub struct FileIssue {
+    /// Path, forward-slashed relative to the scan root when available.
+    /// Falls back to the absolute path for read-error cases where we
+    /// never got to compute a relative form.
+    pub path: PathBuf,
+    /// Category of failure.
+    pub kind: FileIssueKind,
+    /// Human-readable detail (e.g. the underlying I/O error string).
+    pub message: String,
+}
+
+/// Aggregate counts over a slice of [`FileIssue`]s. Cheap to compute;
+/// the CLI uses it to print the post-scan summary line.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FileIssueCounts {
+    pub read_error: usize,
+    pub utf8: usize,
+    pub tier_b_parse: usize,
+    pub tier_b_panic: usize,
+}
+
+impl FileIssueCounts {
+    /// Tally issues by kind.
+    pub fn from_issues(issues: &[FileIssue]) -> Self {
+        let mut c = Self::default();
+        for i in issues {
+            match i.kind {
+                FileIssueKind::ReadError => c.read_error += 1,
+                FileIssueKind::Utf8 => c.utf8 += 1,
+                FileIssueKind::TierBParse => c.tier_b_parse += 1,
+                FileIssueKind::TierBPanic => c.tier_b_panic += 1,
+            }
+        }
+        c
+    }
+
+    /// Total across all kinds.
+    pub fn total(&self) -> usize {
+        self.read_error + self.utf8 + self.tier_b_parse + self.tier_b_panic
     }
 }
 
@@ -223,6 +308,11 @@ pub struct ScanResult {
     /// Count of files that were actually tokenized (binary + `.git/` skipped
     /// files do not count).
     pub files_scanned: usize,
+    /// Per-file issues encountered during the scan (issue #17). Gathered
+    /// across every parallel task. Sorted by path + kind for stable
+    /// output. Not persisted — in-memory-only; the PRD does not require
+    /// persistence.
+    pub issues: Vec<FileIssue>,
 }
 
 /// Callback surface for reporting scan progress.
@@ -455,7 +545,25 @@ impl Scanner {
         let ignore_rules_ref = &ignore_rules;
         let cache_ref = cache.as_ref();
 
-        let process = |(abs, rel): &(PathBuf, PathBuf)| -> Option<FileOutput> {
+        // Stage 1 per-file pipeline (read → tokenize → Tier A block hashes).
+        //
+        // Returns:
+        //   - `Ok(Some(FileOutput))` — file was tokenized and hashed.
+        //   - `Ok(None)`              — file filtered out cleanly
+        //                               (binary sniff / generated header);
+        //                               these are not failures and do not
+        //                               contribute a [`FileIssue`].
+        //   - `Err(FileIssue)`        — read I/O failed or UTF-8 decode
+        //                               failed; logged per PRD and the
+        //                               issue is surfaced on the final
+        //                               [`ScanResult`].
+        //
+        // Tier B per-file work (parse + unit extraction) happens later in
+        // [`run_tier_b`] and is wrapped in `catch_unwind` there so a
+        // panicking grammar does not abort the scan. Wrapping that narrowly
+        // (just the Tier B grammar work) keeps the blast radius tight — the
+        // PRD-specified contract per issue #17.
+        let process = |(abs, rel): &(PathBuf, PathBuf)| -> Result<Option<FileOutput>, FileIssue> {
             let meta = std::fs::metadata(abs).ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let mtime = meta
@@ -478,23 +586,31 @@ impl Scanner {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(path = %abs.display(), error = %e, "scan: read failed, skipping");
-                    return None;
+                    return Err(FileIssue {
+                        path: rel.clone(),
+                        kind: FileIssueKind::ReadError,
+                        message: e.to_string(),
+                    });
                 }
             };
             // Layer 1: binary content sniff.
             if ignore_rules_ref.looks_binary(&bytes) {
-                return None;
+                return Ok(None);
             }
             let text = match std::str::from_utf8(&bytes) {
                 Ok(s) => s.to_string(),
                 Err(e) => {
                     IgnoreRules::log_utf8_skip(abs, &e);
-                    return None;
+                    return Err(FileIssue {
+                        path: rel.clone(),
+                        kind: FileIssueKind::Utf8,
+                        message: e.to_string(),
+                    });
                 }
             };
             // Layer 3: `@generated` / `AUTO-GENERATED` header scan.
             if ignore_rules_ref.has_generated_header(&text) {
-                return None;
+                return Ok(None);
             }
 
             let content_hash = hash_bytes(&bytes);
@@ -548,7 +664,7 @@ impl Scanner {
             }
             let windows = windows.unwrap_or_else(|| rolling_hash(&tokens, WINDOW_SIZE));
 
-            Some(FileOutput {
+            Ok(Some(FileOutput {
                 abs: abs.clone(),
                 rel: rel.clone(),
                 source: text,
@@ -558,10 +674,10 @@ impl Scanner {
                 size,
                 mtime,
                 cache_hit,
-            })
+            }))
         };
 
-        let outputs: Vec<Option<FileOutput>> = match self.config.jobs {
+        let outputs: Vec<Result<Option<FileOutput>, FileIssue>> = match self.config.jobs {
             Some(1) => candidates.iter().map(process).collect(),
             n => {
                 let mut builder = rayon::ThreadPoolBuilder::new();
@@ -582,12 +698,23 @@ impl Scanner {
 
         // Collapse into the scanner's internal file_bundle + per_file_hashes
         // shape. Order is preserved from `candidates`, which we sorted by
-        // relative path above — so `file_index` is canonical.
+        // relative path above — so `file_index` is canonical. At the same
+        // time, collect any Stage 1 [`FileIssue`]s so they can be reported
+        // alongside the match groups on the final [`ScanResult`].
         let mut per_file: Vec<FileBundle> = Vec::new();
         let mut per_file_hashes: Vec<Vec<(Hash, Span)>> = Vec::new();
         let mut fresh_entries: Vec<(PathBuf, FileFingerprint, Vec<Hash>)> = Vec::new();
+        let mut issues: Vec<FileIssue> = Vec::new();
 
-        for out in outputs.into_iter().flatten() {
+        for result in outputs {
+            let out = match result {
+                Ok(Some(o)) => o,
+                Ok(None) => continue,
+                Err(issue) => {
+                    issues.push(issue);
+                    continue;
+                }
+            };
             sink.on_file_processed(&out.abs);
             if !out.cache_hit {
                 let fp = FileFingerprint {
@@ -828,7 +955,8 @@ impl Scanner {
             .collect();
 
         // --- 7. Tier B: tree-sitter-backed syntactic-unit matching. -----
-        let tier_b_groups = self.run_tier_b(&per_file);
+        let (tier_b_groups, tier_b_issues) = self.run_tier_b(&per_file);
+        issues.extend(tier_b_issues);
 
         // --- 8. Tier A → Tier B promotion.
         //
@@ -866,24 +994,42 @@ impl Scanner {
             sink.on_match_group(g);
         }
 
-        info!(files_scanned, groups = groups.len(), "scan: complete");
+        // Deterministic ordering for the issue list: by path, then kind
+        // label. Stable across runs so snapshot-style assertions work.
+        issues.sort_by(|a, b| a.path.cmp(&b.path).then(a.kind.cmp(&b.kind)));
+
+        info!(
+            files_scanned,
+            groups = groups.len(),
+            issues = issues.len(),
+            "scan: complete"
+        );
 
         Ok(ScanResult {
             groups,
             files_scanned,
+            issues,
         })
     }
 
     /// Execute Tier B on every file whose extension matches a registered
     /// profile.
     ///
-    /// Returns the Tier B [`MatchGroup`]s, pre-filtered by the
+    /// Returns the Tier B [`MatchGroup`]s — pre-filtered by the
     /// `tier_b_min_lines` / `tier_b_min_tokens` thresholds and with
     /// hash-collision buckets already verified via exact normalized-token
-    /// compare.
-    fn run_tier_b(&self, per_file: &[FileBundle]) -> Vec<MatchGroup> {
+    /// compare — alongside a [`FileIssue`] list for every file where
+    /// Tier B parse or grammar work failed. Tier A results for those
+    /// files are unaffected (issue #17 contract).
+    ///
+    /// The per-file grammar work (parse + unit extraction) is run inside
+    /// [`catch_unwind`] with [`AssertUnwindSafe`] so a panicking
+    /// tree-sitter grammar cannot abort the scan. The `AssertUnwindSafe`
+    /// wrapper is required because tree-sitter types aren't
+    /// `UnwindSafe`; this is the intended usage.
+    fn run_tier_b(&self, per_file: &[FileBundle]) -> (Vec<MatchGroup>, Vec<FileIssue>) {
         if self.profiles.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
 
         // Collect Tier B candidates per file.
@@ -897,38 +1043,100 @@ impl Scanner {
         }
 
         let mut candidates: Vec<Candidate> = Vec::new();
+        let mut issues: Vec<FileIssue> = Vec::new();
         for (fi, bundle) in per_file.iter().enumerate() {
             let ext = match bundle.path.extension().and_then(|s| s.to_str()) {
                 Some(e) => e,
                 None => continue,
             };
-            let profile = match profile_for_extension(ext) {
-                Some(p) => p,
-                None => continue,
-            };
-            if !self.profiles.iter().any(|p| p.name() == profile.name()) {
-                // Profile is registered globally but not on this Scanner.
-                continue;
-            }
-
-            let mut parser = Parser::new();
-            if parser
-                .set_language(&profile.tree_sitter_language())
-                .is_err()
+            // Prefer `self.profiles` — when callers hand in a custom set
+            // via [`Scanner::with_profiles`], that list is authoritative.
+            // Fall back to the global registry and then verify the match
+            // is still in `self.profiles`, so a Scanner with an empty
+            // profile slice keeps Tier B fully disabled.
+            let profile = match self
+                .profiles
+                .iter()
+                .copied()
+                .find(|p| p.extensions().contains(&ext))
             {
-                // Incompatible grammar ABI — skip rather than panic.
-                continue;
-            }
-            let tree = match parser.parse(bundle.source.as_bytes(), None) {
-                Some(t) => t,
-                None => continue,
+                Some(p) => p,
+                None => match profile_for_extension(ext) {
+                    Some(p) if self.profiles.iter().any(|q| q.name() == p.name()) => p,
+                    _ => continue,
+                },
             };
-            for unit in extract_units_with_mode(
-                &tree,
-                bundle.source.as_bytes(),
-                profile,
-                self.config.normalization,
-            ) {
+
+            // Narrow `catch_unwind` to the grammar work. Reading,
+            // tokenization, and Tier A already surfaced their failures
+            // via `Result<_, FileIssue>` from Stage 1. The closure
+            // returns a `Result<Vec<SyntacticUnit>, FileIssueKind>`:
+            // - `Ok(units)`                       — successful parse +
+            //   extraction (units may still be empty).
+            // - `Err(FileIssueKind::TierBParse)`  — grammar ABI
+            //   incompatibility or tree-sitter refused to produce a
+            //   tree.
+            //
+            // On `catch_unwind` panic, we record
+            // `FileIssueKind::TierBPanic` and keep going.
+            let bundle_ref = bundle;
+            let profile_ref = profile;
+            let mode = self.config.normalization;
+            let unit_result: std::thread::Result<Result<Vec<SyntacticUnit>, String>> =
+                catch_unwind(AssertUnwindSafe(|| {
+                    let mut parser = Parser::new();
+                    if parser
+                        .set_language(&profile_ref.tree_sitter_language())
+                        .is_err()
+                    {
+                        return Err("incompatible tree-sitter grammar ABI".to_string());
+                    }
+                    let tree = match parser.parse(bundle_ref.source.as_bytes(), None) {
+                        Some(t) => t,
+                        None => {
+                            return Err("tree-sitter failed to produce a parse tree".to_string());
+                        }
+                    };
+                    Ok(extract_units_with_mode(
+                        &tree,
+                        bundle_ref.source.as_bytes(),
+                        profile_ref,
+                        mode,
+                    ))
+                }));
+
+            let units = match unit_result {
+                Ok(Ok(units)) => units,
+                Ok(Err(msg)) => {
+                    warn!(
+                        path = %bundle.path.display(),
+                        error = %msg,
+                        "scan: tier B parse failed, skipping tier B for this file"
+                    );
+                    issues.push(FileIssue {
+                        path: bundle.path.clone(),
+                        kind: FileIssueKind::TierBParse,
+                        message: msg,
+                    });
+                    continue;
+                }
+                Err(panic_payload) => {
+                    let msg = panic_message(&panic_payload);
+                    error!(
+                        path = %bundle.path.display(),
+                        error = %msg,
+                        "scan: tier B grammar panicked, caught and skipping tier B for this file"
+                    );
+                    issues.push(FileIssue {
+                        path: bundle.path.clone(),
+                        kind: FileIssueKind::TierBPanic,
+                        message: msg,
+                    });
+                    continue;
+                }
+            };
+
+            for unit in units {
                 // Threshold filtering lives here so candidates that
                 // survive are all "big enough".
                 let lines = unit.end_line.saturating_sub(unit.start_line) + 1;
@@ -998,7 +1206,7 @@ impl Scanner {
                 });
             }
         }
-        out
+        (out, issues)
     }
 }
 
@@ -1060,6 +1268,22 @@ fn build_unit_index(groups: &[MatchGroup]) -> rustc_hash::FxHashSet<(PathBuf, us
         }
     }
     idx
+}
+
+/// Extract a human-readable message from a panic payload returned by
+/// [`std::panic::catch_unwind`]. Panic payloads are typed `Box<dyn Any +
+/// Send>`; in practice they're either a `&'static str` (from
+/// `panic!("literal")`) or a `String` (from `panic!("{fmt}", …)`).
+/// Anything else collapses to a generic label so the caller still gets
+/// something useful to log.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic payload was not a string".to_string()
+    }
 }
 
 /// Count how many tokens fall within `[start_byte, end_byte)`.
@@ -1191,5 +1415,227 @@ mod tests {
             .unwrap();
         assert_eq!(via_scan.files_scanned, via_progress.files_scanned);
         assert_eq!(via_scan.groups.len(), via_progress.groups.len());
+    }
+
+    // ---------------------------------------------------------------
+    // Issue #17 — per-file error graceful degradation.
+    //
+    // The scenarios covered here are the contract the CLI and callers
+    // rely on:
+    //
+    // - read errors (permission denied) surface as
+    //   [`FileIssueKind::ReadError`] and do NOT abort the scan;
+    // - invalid UTF-8 surfaces as [`FileIssueKind::Utf8`] and is skipped
+    //   silently (no panic, no stderr noise beyond the `debug!` line);
+    // - a panicking tree-sitter grammar is caught via
+    //   `catch_unwind` and surfaces as [`FileIssueKind::TierBPanic`],
+    //   and — crucially — Tier A results for that file are preserved;
+    // - the issue list is exposed on [`ScanResult::issues`] so the CLI
+    //   can render a post-scan summary.
+    // ---------------------------------------------------------------
+
+    /// Test-only profile that panics from `tree_sitter_language()`. The
+    /// catch_unwind around the grammar work must convert this into a
+    /// [`FileIssueKind::TierBPanic`] without tearing down the scan.
+    struct PanickingProfile;
+    impl LanguageProfile for PanickingProfile {
+        fn name(&self) -> &'static str {
+            "panicking-test"
+        }
+        fn extensions(&self) -> &[&'static str] {
+            &["panicrs"]
+        }
+        fn tree_sitter_language(&self) -> tree_sitter::Language {
+            panic!("synthetic tree-sitter grammar panic");
+        }
+        fn syntactic_units(&self) -> &[&'static str] {
+            &[]
+        }
+        fn rename_class(&self, _node_kind: &str) -> dedup_lang::RenameClass {
+            dedup_lang::RenameClass::Kept
+        }
+    }
+    static PANICKING_PROFILE: PanickingProfile = PanickingProfile;
+
+    /// Test-only profile that returns a grammar whose ABI is
+    /// incompatible with the bundled `tree-sitter` crate so
+    /// `Parser::set_language` returns `Err`. Rather than fabricate an
+    /// ABI-incompatible grammar (which is build-fragile), we panic with
+    /// a *typed* payload (non-string) to exercise the `panic_message`
+    /// fallback path alongside the `TierBPanic` arm.
+    ///
+    /// Tier B parse-path tests proper live in the integration suite at
+    /// `crates/dedup-core/tests/per_file_errors.rs` where they exercise
+    /// the real parser surface.
+    struct NonStringPanicProfile;
+    impl LanguageProfile for NonStringPanicProfile {
+        fn name(&self) -> &'static str {
+            "non-string-panic-test"
+        }
+        fn extensions(&self) -> &[&'static str] {
+            &["nspanicrs"]
+        }
+        fn tree_sitter_language(&self) -> tree_sitter::Language {
+            // Panic with a non-string payload to prove the message
+            // extractor's fallback branch is reachable.
+            std::panic::panic_any(42u32);
+        }
+        fn syntactic_units(&self) -> &[&'static str] {
+            &[]
+        }
+        fn rename_class(&self, _node_kind: &str) -> dedup_lang::RenameClass {
+            dedup_lang::RenameClass::Kept
+        }
+    }
+    static NON_STRING_PANIC_PROFILE: NonStringPanicProfile = NonStringPanicProfile;
+
+    #[cfg(unix)]
+    #[test]
+    fn read_error_surfaces_file_issue_and_scan_continues() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        // One readable file we expect to see processed, one with mode
+        // 0o000 which `fs::read` will refuse.
+        let readable = dir.path().join("readable.txt");
+        fs::write(&readable, "hello world, this is readable content\n").unwrap();
+        let locked = dir.path().join("locked.txt");
+        fs::write(&locked, "secret").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = Scanner::default().scan(dir.path()).unwrap();
+
+        // Clean up permissions so the tempdir can be deleted.
+        let _ = fs::set_permissions(&locked, fs::Permissions::from_mode(0o644));
+
+        // Exactly one ReadError issue, and the other file was scanned.
+        assert_eq!(result.files_scanned, 1);
+        let counts = FileIssueCounts::from_issues(&result.issues);
+        assert_eq!(counts.read_error, 1);
+        assert_eq!(counts.total(), 1);
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|i| i.kind == FileIssueKind::ReadError
+                    && i.path.file_name().unwrap() == "locked.txt")
+        );
+    }
+
+    #[test]
+    fn utf8_failure_surfaces_as_issue_and_is_skipped() {
+        let dir = tempdir().unwrap();
+        // `0xC3 0x28` is a valid UTF-8 lead byte followed by an invalid
+        // continuation — the classic "invalid UTF-8" sentinel. Neither
+        // byte is NUL, so the binary sniff (`any(|b| *b == 0)`) lets it
+        // through to the UTF-8 decode.
+        fs::write(dir.path().join("bad.txt"), [0xC3, 0x28, 0xC3, 0x28]).unwrap();
+        fs::write(dir.path().join("good.txt"), "abcdefgh\n").unwrap();
+
+        let result = Scanner::default().scan(dir.path()).unwrap();
+        assert_eq!(result.files_scanned, 1);
+        let counts = FileIssueCounts::from_issues(&result.issues);
+        assert_eq!(counts.utf8, 1);
+        assert_eq!(counts.total(), 1);
+    }
+
+    #[test]
+    fn tier_b_grammar_panic_is_caught_and_reported() {
+        let dir = tempdir().unwrap();
+        // Two files that claim the test profile's extension (`panicrs`).
+        // Tier A on these will run cleanly (they're plain UTF-8); Tier B
+        // will panic inside the catch_unwind and contribute two
+        // `TierBPanic` issues to the summary.
+        let body: String = (0..60)
+            .map(|i| format!("let panic_me_{i} = {i};\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        fs::write(dir.path().join("a.panicrs"), &body).unwrap();
+        fs::write(dir.path().join("b.panicrs"), &body).unwrap();
+
+        let scanner = Scanner::with_profiles(ScanConfig::default(), vec![&PANICKING_PROFILE]);
+        let result = scanner.scan(dir.path()).unwrap();
+
+        // Scan completed (no abort).
+        assert_eq!(result.files_scanned, 2);
+        let counts = FileIssueCounts::from_issues(&result.issues);
+        assert_eq!(counts.tier_b_panic, 2, "both files should record a panic");
+
+        // Tier A survived the panic: the duplicated body produces at
+        // least one Tier A group.
+        let tier_a = result.groups.iter().filter(|g| g.tier == Tier::A).count();
+        assert!(
+            tier_a >= 1,
+            "Tier A must still run for files whose Tier B panics"
+        );
+    }
+
+    #[test]
+    fn tier_b_panic_with_non_string_payload_still_reported() {
+        // Covers the `panic_message` fallback arm (payload is neither
+        // `&str` nor `String`). Without this test, the fallback branch
+        // is dead code as far as the scanner's own tests are concerned.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.nspanicrs"), "fn a() {}").unwrap();
+
+        let scanner =
+            Scanner::with_profiles(ScanConfig::default(), vec![&NON_STRING_PANIC_PROFILE]);
+        let result = scanner.scan(dir.path()).unwrap();
+
+        let counts = FileIssueCounts::from_issues(&result.issues);
+        assert_eq!(counts.tier_b_panic, 1);
+        // The message string from the fallback branch must be present
+        // and non-empty — exact wording is an implementation detail.
+        let only = result
+            .issues
+            .iter()
+            .find(|i| i.kind == FileIssueKind::TierBPanic)
+            .unwrap();
+        assert!(
+            !only.message.is_empty(),
+            "panic message must be populated for non-string payloads"
+        );
+    }
+
+    #[test]
+    fn file_issue_counts_totals_match_sum() {
+        let issues = vec![
+            FileIssue {
+                path: PathBuf::from("a"),
+                kind: FileIssueKind::ReadError,
+                message: String::new(),
+            },
+            FileIssue {
+                path: PathBuf::from("b"),
+                kind: FileIssueKind::Utf8,
+                message: String::new(),
+            },
+            FileIssue {
+                path: PathBuf::from("c"),
+                kind: FileIssueKind::TierBParse,
+                message: String::new(),
+            },
+            FileIssue {
+                path: PathBuf::from("d"),
+                kind: FileIssueKind::TierBPanic,
+                message: String::new(),
+            },
+        ];
+        let c = FileIssueCounts::from_issues(&issues);
+        assert_eq!(c.total(), 4);
+        assert_eq!(c.read_error, 1);
+        assert_eq!(c.utf8, 1);
+        assert_eq!(c.tier_b_parse, 1);
+        assert_eq!(c.tier_b_panic, 1);
+    }
+
+    #[test]
+    fn panic_message_extracts_static_str_and_string() {
+        let payload_static: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(&payload_static), "boom");
+        let payload_string: Box<dyn std::any::Any + Send> = Box::new(String::from("bang"));
+        assert_eq!(panic_message(&payload_string), "bang");
+        let payload_other: Box<dyn std::any::Any + Send> = Box::new(7u64);
+        assert!(!panic_message(&payload_other).is_empty());
     }
 }

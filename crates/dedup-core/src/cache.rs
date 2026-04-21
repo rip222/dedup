@@ -931,6 +931,7 @@ mod tests {
                 ],
             }],
             files_scanned: 2,
+            issues: Vec::new(),
         }
     }
 
@@ -1037,6 +1038,7 @@ mod tests {
                 ],
             }],
             files_scanned: 2,
+            issues: Vec::new(),
         };
         cache.write_scan_result(&second).unwrap();
 
@@ -1137,6 +1139,7 @@ mod tests {
                 ],
             }],
             files_scanned: 2,
+            issues: Vec::new(),
         };
         cache.write_scan_result(&mutated).unwrap();
 
@@ -1187,6 +1190,7 @@ mod tests {
         let empty = ScanResult {
             groups: vec![],
             files_scanned: 0,
+            issues: Vec::new(),
         };
         cache.write_scan_result(&empty).unwrap();
         assert!(cache.list_groups().unwrap().is_empty());

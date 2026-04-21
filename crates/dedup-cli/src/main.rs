@@ -51,8 +51,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use dedup_core::{
-    Cache, Config, ConfigError, GroupDetail, MatchGroup, ProgressSink, ScanConfig, Scanner, Tier,
+    Cache, Config, ConfigError, FileIssueCounts, GroupDetail, MatchGroup, ProgressSink, ScanConfig,
+    Scanner, Tier,
 };
+use human_panic::setup_panic;
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -279,6 +281,27 @@ enum ConfigAction {
 /// manually — any `UsageError` / parse failure bypasses this function's
 /// `ExitCode` entirely.
 fn main() -> ExitCode {
+    // Install `human-panic` first, before any work that might panic.
+    //
+    // The support text points at the dedup log directory
+    // (`~/.config/dedup/logs/`, matching the GUI convention from #16 —
+    // see `dedup-gui::logging`). The path is evaluated per-call so a
+    // test harness can redirect via `$XDG_CONFIG_HOME` / `$HOME`; if
+    // neither is resolvable we fall back to the default spelling so the
+    // user at least has a breadcrumb.
+    //
+    // The postmortem itself is emitted by `human-panic`'s custom panic
+    // hook — at this milestone the CLI only logs to stderr (no rolling
+    // file appender), so the "log file" we point at is the path
+    // subscribers *would* land at if enabled. This keeps the message
+    // stable for the PRD-specified acceptance criterion while matching
+    // the #16 GUI layout.
+    let log_dir = resolve_log_dir_for_panic();
+    setup_panic!(human_panic::metadata!().support(format!(
+        "- See the dedup log directory at: {log_dir}\n\
+         - Open an issue at https://github.com/rip222/dedup/issues"
+    )));
+
     let cli = match Cli::try_parse() {
         Ok(c) => c,
         Err(e) => {
@@ -457,10 +480,67 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
         }
     }
 
+    // Post-scan per-file issue summary (issue #17). Always written to
+    // stderr so machine-parseable stdout stays clean. The summary line
+    // is suppressed when there were no issues, so a clean scan remains
+    // output-free for scripts that grep stderr.
+    emit_issue_summary(result.files_scanned, &result.issues);
+
     if had_findings && globals.strict {
         return Ok(ExitCode::from(1));
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Write the post-scan per-file issue summary to stderr.
+///
+/// Shape (single line):
+/// `dedup: <N> files scanned, <M> issues (R read, U utf8, P tier-b-parse, X tier-b-panic)`
+///
+/// When `issues` is empty, nothing is emitted — a clean scan should
+/// print no extra noise on stderr beyond what `tracing` already emitted.
+fn emit_issue_summary(files_scanned: usize, issues: &[dedup_core::FileIssue]) {
+    if issues.is_empty() {
+        return;
+    }
+    let counts = FileIssueCounts::from_issues(issues);
+    eprintln!(
+        "dedup: {files_scanned} files scanned, {total} issues \
+         ({read} read, {utf8} utf8, {tbp} tier-b-parse, {tpn} tier-b-panic)",
+        total = counts.total(),
+        read = counts.read_error,
+        utf8 = counts.utf8,
+        tbp = counts.tier_b_parse,
+        tpn = counts.tier_b_panic,
+    );
+}
+
+/// Resolve the directory panic postmortems should point readers at.
+///
+/// Mirrors `dedup-gui::logging::log_dir`: prefer `$XDG_CONFIG_HOME/dedup/logs`,
+/// then `$HOME/.config/dedup/logs`, and fall back to the default
+/// spelling when neither env var is set (so the CLI still has something
+/// meaningful to say on a minimal sandbox). Returns a [`String`] so
+/// `format!` inside [`setup_panic!`] stays simple.
+fn resolve_log_dir_for_panic() -> String {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg)
+            .join("dedup")
+            .join("logs")
+            .display()
+            .to_string();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".config")
+            .join("dedup")
+            .join("logs")
+            .display()
+            .to_string();
+    }
+    "~/.config/dedup/logs/".to_string()
 }
 
 fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {

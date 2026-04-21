@@ -73,6 +73,7 @@ fn sample_result() -> ScanResult {
             },
         ],
         files_scanned: 5,
+        issues: Vec::new(),
     }
 }
 
@@ -152,6 +153,7 @@ fn second_write_replaces_first() {
             ],
         }],
         files_scanned: 2,
+        issues: Vec::new(),
     };
     cache.write_scan_result(&smaller).unwrap();
 
