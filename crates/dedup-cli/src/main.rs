@@ -51,7 +51,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use dedup_core::{
-    Cache, Config, ConfigError, GroupDetail, MatchGroup, ProgressSink, ScanConfig, Scanner,
+    Cache, Config, ConfigError, GroupDetail, MatchGroup, ProgressSink, ScanConfig, Scanner, Tier,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -336,13 +336,16 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     }
 
     // Apply the tier / lang filters to produce the user-visible group
-    // slice. Tier A groups pass the lang filter unconditionally (they're
-    // language-oblivious); Tier B isn't emitted yet so the lang filter
-    // is effectively a no-op at MVP. See docs on [`GlobalArgs`].
+    // slice. Tier A groups pass the lang filter unconditionally
+    // (they're language-oblivious); Tier B groups must additionally
+    // clear the `--lang` filter when one is specified.
     let visible: Vec<&MatchGroup> = result
         .groups
         .iter()
-        .filter(|_g| tier_allows_a(globals))
+        .filter(|g| match g.tier {
+            Tier::A => tier_allows_a(globals),
+            Tier::B => tier_allows_b(globals) && lang_allows(globals, g),
+        })
         .collect();
 
     let had_findings = !visible.is_empty();
@@ -369,13 +372,19 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     let groups = cache.list_groups().context("failed to read cache")?;
 
     let allow_a = tier_allows_a(globals);
+    let allow_b = tier_allows_b(globals);
 
     // Fetch full details so we can print occurrences alongside the
     // summary header — matches `dedup scan` output exactly.
     let mut stdout = std::io::stdout();
     let mut emitted = 0usize;
-    for (ord, summary) in groups.iter().enumerate() {
-        if !allow_a {
+    let mut ordinal = 0usize;
+    for summary in groups.iter() {
+        let tier_ok = match summary.tier {
+            Tier::A => allow_a,
+            Tier::B => allow_b,
+        };
+        if !tier_ok {
             continue;
         }
         let detail = match cache
@@ -385,7 +394,12 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
             Some(d) => d,
             None => continue, // group vanished mid-read; skip.
         };
-        if print_cached_group_full(ord + 1, &detail, &mut stdout).is_err() {
+        // `--lang` only applies to Tier B (Tier A is language-oblivious).
+        if detail.tier == Tier::B && !lang_allows_cached(globals, &detail) {
+            continue;
+        }
+        ordinal += 1;
+        if print_cached_group_full(ordinal, &detail, &mut stdout).is_err() {
             // Broken pipe / closed stdout — treat as clean exit.
             return Ok(ExitCode::SUCCESS);
         }
@@ -529,6 +543,60 @@ fn tier_allows_a(globals: &GlobalArgs) -> bool {
     matches!(globals.tier, TierFilter::A | TierFilter::Both)
 }
 
+/// Return true iff Tier B groups should be emitted given `--tier`.
+fn tier_allows_b(globals: &GlobalArgs) -> bool {
+    matches!(globals.tier, TierFilter::B | TierFilter::Both)
+}
+
+/// Return true iff a Tier B group's language passes the `--lang` filter.
+///
+/// Tier A groups are language-oblivious and always pass — this helper is
+/// only consulted for Tier B. An empty `--lang` accepts every language.
+fn lang_allows(globals: &GlobalArgs, group: &MatchGroup) -> bool {
+    if globals.lang.is_empty() {
+        return true;
+    }
+    // Infer the language from the first occurrence's extension. All
+    // occurrences in a Tier B group come from the same language profile,
+    // so inspecting one is sufficient.
+    let ext = group
+        .occurrences
+        .first()
+        .and_then(|o| o.path.extension())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    ext_matches_lang_filter(&globals.lang, ext)
+}
+
+/// Same shape as [`lang_allows`], but against a cached [`GroupDetail`].
+/// Used by `dedup list` where we read persisted rows rather than live
+/// [`MatchGroup`]s.
+fn lang_allows_cached(globals: &GlobalArgs, detail: &GroupDetail) -> bool {
+    if globals.lang.is_empty() {
+        return true;
+    }
+    let ext = detail
+        .occurrences
+        .first()
+        .and_then(|o| o.path.extension())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    ext_matches_lang_filter(&globals.lang, ext)
+}
+
+fn ext_matches_lang_filter(filter: &[Language], ext: &str) -> bool {
+    let actual = match ext {
+        "rs" => Some(Language::Rust),
+        "ts" | "tsx" => Some(Language::Ts),
+        "py" => Some(Language::Python),
+        _ => None,
+    };
+    match actual {
+        Some(lang) => filter.contains(&lang),
+        None => false,
+    }
+}
+
 /// Compute whether ANSI color should be used on stderr. Used by the
 /// spinner style; stdout color for groups lands when we add colored
 /// output in #12.
@@ -543,11 +611,16 @@ fn color_enabled_for_stderr(globals: &GlobalArgs) -> bool {
 /// Print a slice of [`MatchGroup`] references in the canonical dedup
 /// text format. Taking `&[&MatchGroup]` rather than `&ScanResult`
 /// mirrors the post-filter path so callers can drop out groups cheaply.
+///
+/// Each group header carries a `[A]` / `[B]` prefix so the tier is
+/// visible at a glance. Occurrences keep the `path:start-end` shape
+/// that downstream tools (e.g. `xargs -o nvim`) depend on.
 fn print_scan_groups<W: Write>(groups: &[&MatchGroup], out: &mut W) -> std::io::Result<()> {
     for (i, group) in groups.iter().enumerate() {
         writeln!(
             out,
-            "--- group {} ({} occurrences) ---",
+            "--- [{}] group {} ({} occurrences) ---",
+            group.tier.label(),
             i + 1,
             group.occurrences.len()
         )?;
@@ -573,8 +646,10 @@ fn print_cached_group_full<W: Write>(
 ) -> std::io::Result<()> {
     writeln!(
         out,
-        "--- group {} ({} occurrences) ---",
-        ordinal, detail.occurrence_count
+        "--- [{}] group {} ({} occurrences) ---",
+        detail.tier.label(),
+        ordinal,
+        detail.occurrence_count
     )?;
     for occ in &detail.occurrences {
         let path = path_display(&occ.path);
@@ -589,8 +664,10 @@ fn print_cached_group_full<W: Write>(
 fn print_cached_group_show<W: Write>(detail: &GroupDetail, out: &mut W) -> std::io::Result<()> {
     writeln!(
         out,
-        "--- group {} ({} occurrences) ---",
-        detail.id, detail.occurrence_count
+        "--- [{}] group {} ({} occurrences) ---",
+        detail.tier.label(),
+        detail.id,
+        detail.occurrence_count
     )?;
     for occ in &detail.occurrences {
         let path = path_display(&occ.path);

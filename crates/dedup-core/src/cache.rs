@@ -33,7 +33,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::rolling_hash::Span;
-use crate::scanner::{MatchGroup, Occurrence, ScanResult};
+use crate::scanner::{MatchGroup, Occurrence, ScanResult, Tier};
 
 /// Directory name under the repo root where the cache lives.
 pub const CACHE_DIR: &str = ".dedup";
@@ -71,6 +71,8 @@ pub struct GroupSummary {
     pub occurrence_count: i64,
     pub total_lines: i64,
     pub total_tokens: i64,
+    /// Which detection pass produced the group (Tier A or Tier B).
+    pub tier: Tier,
 }
 
 /// Detail row returned by [`Cache::get_group`] — the group plus each of
@@ -81,6 +83,8 @@ pub struct GroupDetail {
     pub occurrence_count: i64,
     pub total_lines: i64,
     pub total_tokens: i64,
+    /// Which detection pass produced the group (Tier A or Tier B).
+    pub tier: Tier,
     pub occurrences: Vec<CachedOccurrence>,
 }
 
@@ -211,8 +215,8 @@ impl Cache {
         {
             let mut group_stmt = tx.prepare(
                 "INSERT INTO match_groups \
-                    (group_hash, occurrence_count, total_tokens, total_lines) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                    (group_hash, occurrence_count, total_tokens, total_lines, tier) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             let mut occ_stmt = tx.prepare(
                 "INSERT INTO occurrences \
@@ -228,6 +232,7 @@ impl Cache {
                     group.occurrences.len() as i64,
                     total_tokens as i64,
                     total_lines as i64,
+                    tier_label(group.tier),
                 ])?;
                 let group_id = tx.last_insert_rowid();
 
@@ -272,20 +277,19 @@ impl Cache {
         Ok(())
     }
 
-    /// List all persisted group summaries, ordered by the smallest
-    /// occurrence path (path-asc, then start-line-asc) — matches the
-    /// ordering `Scanner::scan` uses so CLI output is stable.
+    /// List all persisted group summaries, ordered by tier (A first,
+    /// then B), then by the smallest occurrence path (path-asc,
+    /// start-line-asc). Mirrors the scanner's output order so CLI
+    /// output is stable.
     pub fn list_groups(&self) -> Result<Vec<GroupSummary>, CacheError> {
-        // Sort groups by (min_path, min_start_line) across their
-        // occurrences, which mirrors the scanner's output order.
         let mut stmt = self.conn.prepare(
-            "SELECT g.id, g.occurrence_count, g.total_lines, g.total_tokens, \
+            "SELECT g.id, g.occurrence_count, g.total_lines, g.total_tokens, g.tier, \
                     MIN(o.path)        AS first_path, \
                     MIN(o.start_line)  AS first_start \
              FROM match_groups g \
              LEFT JOIN occurrences o ON o.group_id = g.id \
              GROUP BY g.id \
-             ORDER BY first_path ASC, first_start ASC, g.id ASC",
+             ORDER BY g.tier ASC, first_path ASC, first_start ASC, g.id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(GroupSummary {
@@ -293,6 +297,7 @@ impl Cache {
                 occurrence_count: row.get(1)?,
                 total_lines: row.get(2)?,
                 total_tokens: row.get(3)?,
+                tier: tier_from_row(row, 4)?,
             })
         })?;
 
@@ -308,7 +313,7 @@ impl Cache {
         let group_row = self
             .conn
             .query_row(
-                "SELECT id, occurrence_count, total_lines, total_tokens \
+                "SELECT id, occurrence_count, total_lines, total_tokens, tier \
                  FROM match_groups WHERE id = ?1",
                 params![id],
                 |row| {
@@ -317,12 +322,13 @@ impl Cache {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        tier_from_row(row, 4)?,
                     ))
                 },
             )
             .optional()?;
 
-        let (id, occurrence_count, total_lines, total_tokens) = match group_row {
+        let (id, occurrence_count, total_lines, total_tokens, tier) = match group_row {
             Some(t) => t,
             None => return Ok(None),
         };
@@ -354,6 +360,7 @@ impl Cache {
             occurrence_count,
             total_lines,
             total_tokens,
+            tier,
             occurrences,
         }))
     }
@@ -432,6 +439,12 @@ fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
 }
 
 /// Create the initial v1 schema.
+///
+/// The `match_groups.tier` column was added in issue #6 as part of the
+/// Tier B rollout. Because v1 has no production deployments yet (#4
+/// just shipped), we extend the v1 schema directly rather than
+/// bumping to v2; `tier` stores `"A"` or `"B"` as TEXT and defaults to
+/// `"A"` for any row written by older code.
 fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_hashes (\
@@ -444,7 +457,8 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
             group_hash        BLOB NOT NULL,\
             occurrence_count  INTEGER,\
             total_tokens      INTEGER,\
-            total_lines       INTEGER\
+            total_lines       INTEGER,\
+            tier              TEXT NOT NULL DEFAULT 'A'\
          );\
          CREATE TABLE IF NOT EXISTS occurrences (\
             id          INTEGER PRIMARY KEY,\
@@ -511,6 +525,25 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// One-character label used to persist a [`Tier`] as SQLite TEXT.
+fn tier_label(tier: Tier) -> &'static str {
+    match tier {
+        Tier::A => "A",
+        Tier::B => "B",
+    }
+}
+
+/// Parse a persisted `tier` column back into a [`Tier`]. Unknown
+/// values default to [`Tier::A`] — this keeps rows written by a very
+/// old build (pre-#6) readable without an explicit migration.
+fn tier_from_row(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Tier> {
+    let s: String = row.get(idx)?;
+    Ok(match s.as_str() {
+        "B" => Tier::B,
+        _ => Tier::A,
+    })
+}
+
 impl From<&Occurrence> for CachedOccurrence {
     fn from(occ: &Occurrence) -> Self {
         CachedOccurrence {
@@ -547,6 +580,7 @@ mod tests {
         ScanResult {
             groups: vec![MatchGroup {
                 hash: 0xdead_beef_cafe_f00d,
+                tier: Tier::A,
                 occurrences: vec![
                     Occurrence {
                         path: PathBuf::from("a.rs"),
@@ -652,6 +686,7 @@ mod tests {
         let second = ScanResult {
             groups: vec![MatchGroup {
                 hash: 0x1111_2222_3333_4444,
+                tier: Tier::A,
                 occurrences: vec![
                     Occurrence {
                         path: PathBuf::from("x.rs"),

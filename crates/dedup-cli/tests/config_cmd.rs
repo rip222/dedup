@@ -123,12 +123,19 @@ fn scan_honors_project_config_thresholds_end_to_end() {
     copy_tree(&fixture, repo.path());
 
     // Bigger than any possible match in the fixture (files are < 50 LOC).
+    // Both tier blocks are pinned sky-high so Tier A *and* Tier B are
+    // both squelched — the fixture's `.rs` files would otherwise yield
+    // Tier B groups from the embedded function bodies.
     let dedup_dir = repo.path().join(".dedup");
     std::fs::create_dir_all(&dedup_dir).unwrap();
     std::fs::write(
         dedup_dir.join("config.toml"),
         r#"
 [thresholds.tier_a]
+min_lines = 1000
+min_tokens = 10000
+
+[thresholds.tier_b]
 min_lines = 1000
 min_tokens = 10000
 "#,
@@ -197,7 +204,7 @@ fn scan_with_future_schema_warns_and_uses_defaults() {
     // gets detected.
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.contains("--- group "),
+        stdout.contains("--- ["),
         "expected at least one group with defaults, got: {stdout:?}"
     );
 }

@@ -33,5 +33,6 @@ pub use config::{
 pub use rolling_hash::{Hash, Span};
 pub use scanner::{
     MatchGroup, NoopSink, Occurrence, ProgressSink, ScanConfig, ScanError, ScanResult, Scanner,
+    Tier,
 };
 pub use tokenizer::{Token, TokenKind};
