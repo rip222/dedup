@@ -65,9 +65,20 @@ impl LanguageProfile for RustProfile {
     ///   default).
     fn rename_class(&self, node_kind: &str) -> RenameClass {
         match node_kind {
-            // Literals.
+            // Literals. Interior kinds like `string_literal` /
+            // `raw_string_literal` never reach the classifier as
+            // leaves (their children — `"`, `string_content`, ... —
+            // do) but are listed here for completeness and for
+            // grammar variants that flatten them.
+            //
+            // `string_content` is the *inside* of a string literal;
+            // naming it Literal means aggressive mode rewrites the
+            // body to `<LIT>` while the enclosing `"` delimiter
+            // leaves stay verbatim. That's the behaviour we want:
+            // `"hi"` and `"bye"` hash the same in aggressive mode.
             "string_literal"
             | "raw_string_literal"
+            | "string_content"
             | "integer_literal"
             | "float_literal"
             | "char_literal"

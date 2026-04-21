@@ -113,14 +113,25 @@ pub struct Thresholds {
 
 /// Normalization strategy. `"conservative"` (default) keeps literals
 /// distinct. `"aggressive"` (wired in #10) abstracts string / numeric
-/// literals for broader matching. Today this key is loaded but only
-/// literally echoed back — it does not yet alter scanner behavior.
+/// literals for broader matching by rewriting every
+/// [`dedup_lang::RenameClass::Literal`] leaf to a stable placeholder
+/// (`<LIT>`) before hashing. Both modes alpha-rename locals; only the
+/// treatment of literal leaves differs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Normalization {
     #[default]
     Conservative,
     Aggressive,
+}
+
+impl From<Normalization> for dedup_lang::NormalizationMode {
+    fn from(n: Normalization) -> Self {
+        match n {
+            Normalization::Conservative => dedup_lang::NormalizationMode::Conservative,
+            Normalization::Aggressive => dedup_lang::NormalizationMode::Aggressive,
+        }
+    }
 }
 
 /// Scanner-side knobs: bytes budget per file, symlink + submodule

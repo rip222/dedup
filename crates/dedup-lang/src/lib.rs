@@ -29,7 +29,10 @@ pub mod python;
 pub mod rust;
 pub mod typescript;
 
-pub use normalize::{NormalizedToken, SyntacticUnit, extract_units, hash_tokens, normalize};
+pub use normalize::{
+    AGGRESSIVE_LITERAL_PLACEHOLDER, NormalizationMode, NormalizedToken, SyntacticUnit,
+    extract_units, extract_units_with_mode, hash_tokens, normalize, normalize_with_mode,
+};
 pub use profile::{LanguageProfile, RenameClass};
 pub use python::{PYTHON_PROFILE, PythonProfile};
 pub use rust::{RUST_PROFILE, RustProfile};

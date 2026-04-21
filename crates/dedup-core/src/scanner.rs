@@ -38,7 +38,8 @@ use crate::ignore::{IgnoreRules, IgnoreRulesOptions};
 use crate::rolling_hash::{Hash, Span, rolling_hash};
 use crate::tokenizer::{Token, tokenize};
 use dedup_lang::{
-    LanguageProfile, SyntacticUnit, all_profiles, extract_units, profile_for_extension,
+    LanguageProfile, NormalizationMode, SyntacticUnit, all_profiles, extract_units_with_mode,
+    profile_for_extension,
 };
 use ignore::WalkBuilder;
 use rustc_hash::FxHashMap;
@@ -119,6 +120,12 @@ pub struct ScanConfig {
     /// Disable layers 1–3 of the [`IgnoreRules`] stack. Layer 4
     /// (`.dedupignore`) still applies. CLI flag: `--all`.
     pub ignore_all: bool,
+    /// Normalization mode used by Tier B. See
+    /// [`dedup_lang::NormalizationMode`]: conservative (default)
+    /// leaves literals verbatim; aggressive rewrites literal leaves
+    /// to a stable `<LIT>` placeholder so functions differing only
+    /// in literal values still cluster. Issue #10.
+    pub normalization: NormalizationMode,
 }
 
 impl Default for ScanConfig {
@@ -133,6 +140,7 @@ impl Default for ScanConfig {
             include_submodules: false,
             no_gitignore: false,
             ignore_all: false,
+            normalization: NormalizationMode::Conservative,
         }
     }
 }
@@ -149,6 +157,7 @@ impl From<&crate::config::Config> for ScanConfig {
             include_submodules: cfg.scan.include_submodules,
             no_gitignore: false,
             ignore_all: false,
+            normalization: cfg.normalization.into(),
         }
     }
 }
@@ -704,7 +713,12 @@ impl Scanner {
                 Some(t) => t,
                 None => continue,
             };
-            for unit in extract_units(&tree, bundle.source.as_bytes(), profile) {
+            for unit in extract_units_with_mode(
+                &tree,
+                bundle.source.as_bytes(),
+                profile,
+                self.config.normalization,
+            ) {
                 // Threshold filtering lives here so candidates that
                 // survive are all "big enough".
                 let lines = unit.end_line.saturating_sub(unit.start_line) + 1;
