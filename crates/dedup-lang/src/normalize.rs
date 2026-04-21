@@ -75,6 +75,37 @@ pub struct SyntacticUnit {
     pub tokens: Vec<NormalizedToken>,
     /// Hash of [`Self::tokens`], computed with [`hash_tokens`].
     pub hash: u64,
+    /// Per-occurrence alpha-rename spans (issue #25).
+    ///
+    /// One entry per alpha-renamed local occurrence in the unit's source
+    /// slice. Byte ranges are **absolute** in the file that was parsed
+    /// (same frame of reference as [`Self::start_byte`] /
+    /// [`Self::end_byte`]). `placeholder_idx` is 1-based and matches the
+    /// `vN` alias emitted into [`Self::tokens`] for that identifier —
+    /// e.g. the leaf rewritten to `v1` has `placeholder_idx == 1`.
+    ///
+    /// Because unit members of the same Tier B match group share their
+    /// canonical token stream byte-for-byte, the same `placeholder_idx`
+    /// refers to the same logical local across every occurrence of a
+    /// group. The GUI uses that as the correspondence key to tint
+    /// matching identifiers the same color across files.
+    pub ident_spans: Vec<IdentSpan>,
+}
+
+/// One alpha-renamed identifier occurrence within a [`SyntacticUnit`].
+///
+/// Byte range is absolute in the parsed source. `placeholder_idx` is the
+/// 1-based index of the `vN` alias the normaliser emitted for this
+/// identifier — shared across every occurrence of the same logical
+/// local (kept + literal leaves get no entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentSpan {
+    /// Absolute byte range of the identifier leaf in the source bytes
+    /// that were passed to [`extract_units_with_mode`]. Half-open
+    /// `[start, end)`.
+    pub range: std::ops::Range<usize>,
+    /// 1-based alpha-rename placeholder index (`v1` → 1, `v2` → 2, ...).
+    pub placeholder_idx: u32,
 }
 
 /// Extract every Tier B candidate from a parsed `tree`, walking the
@@ -121,7 +152,7 @@ fn collect_units(
 ) {
     let node = cursor.node();
     if kinds.iter().any(|k| *k == node.kind()) {
-        let tokens = normalize_with_mode(node, source, profile, mode);
+        let (tokens, ident_spans) = normalize_with_spans(node, source, profile, mode);
         if !tokens.is_empty() {
             let start = node.start_position();
             let end = node.end_position();
@@ -136,6 +167,7 @@ fn collect_units(
                 end_line: end.row + 1,
                 tokens,
                 hash,
+                ident_spans,
             });
         }
     }
@@ -200,11 +232,42 @@ pub fn normalize_with_mode(
     profile: &dyn LanguageProfile,
     mode: NormalizationMode,
 ) -> Vec<NormalizedToken> {
+    normalize_with_spans(node, source, profile, mode).0
+}
+
+/// Mode-aware normaliser that also returns the per-identifier alpha-
+/// rename spans (issue #25). The `tokens` component is byte-identical to
+/// [`normalize_with_mode`]'s return value — spans are strictly an
+/// additive sidecar so existing hash buckets and snapshot assertions
+/// stay intact.
+///
+/// Byte ranges in the returned [`IdentSpan`]s are **absolute** in
+/// `source` (the full file slice the caller parsed), matching
+/// [`SyntacticUnit::start_byte`]'s frame of reference. Only
+/// [`RenameClass::Local`] leaves get an entry; kept names (fn/class
+/// identifiers, field identifiers, type identifiers) and literals are
+/// excluded so the GUI does not tint syntax that was already identical
+/// between occurrences.
+pub fn normalize_with_spans(
+    node: Node,
+    source: &[u8],
+    profile: &dyn LanguageProfile,
+    mode: NormalizationMode,
+) -> (Vec<NormalizedToken>, Vec<IdentSpan>) {
     let mut out = Vec::new();
-    let mut locals: HashMap<String, String> = HashMap::new();
+    let mut spans = Vec::new();
+    let mut locals: HashMap<String, u32> = HashMap::new();
     let mut cursor = node.walk();
-    visit(&mut cursor, source, profile, mode, &mut out, &mut locals);
-    out
+    visit(
+        &mut cursor,
+        source,
+        profile,
+        mode,
+        &mut out,
+        &mut spans,
+        &mut locals,
+    );
+    (out, spans)
 }
 
 /// Internal DFS that drains each leaf through the profile's classifier.
@@ -214,7 +277,8 @@ fn visit(
     profile: &dyn LanguageProfile,
     mode: NormalizationMode,
     out: &mut Vec<NormalizedToken>,
-    locals: &mut HashMap<String, String>,
+    spans: &mut Vec<IdentSpan>,
+    locals: &mut HashMap<String, u32>,
 ) {
     let node = cursor.node();
 
@@ -233,13 +297,23 @@ fn visit(
             let emitted = match class {
                 RenameClass::Local => {
                     let text_owned = text.to_string();
-                    if let Some(alias) = locals.get(&text_owned) {
-                        alias.clone()
+                    let idx = if let Some(&existing) = locals.get(&text_owned) {
+                        existing
                     } else {
-                        let alias = format!("v{}", locals.len() + 1);
-                        locals.insert(text_owned, alias.clone());
-                        alias
-                    }
+                        let next = (locals.len() as u32) + 1;
+                        locals.insert(text_owned, next);
+                        next
+                    };
+                    // Record the absolute byte range + placeholder idx
+                    // so the GUI can paint tint overlays later. Spans
+                    // for identical locals collapse to one entry per
+                    // occurrence (one per leaf), which is what we want
+                    // for per-occurrence highlighting.
+                    spans.push(IdentSpan {
+                        range: node.start_byte()..node.end_byte(),
+                        placeholder_idx: idx,
+                    });
+                    format!("v{idx}")
                 }
                 RenameClass::Kept => text.to_string(),
                 RenameClass::Literal => match mode {
@@ -258,7 +332,7 @@ fn visit(
     // Interior: recurse into children.
     if cursor.goto_first_child() {
         loop {
-            visit(cursor, source, profile, mode, out, locals);
+            visit(cursor, source, profile, mode, out, spans, locals);
             if !cursor.goto_next_sibling() {
                 break;
             }
@@ -526,6 +600,111 @@ mod tests {
                 .any(|t| t.kind == "field_identifier" && t.text == "field"),
             "kept field_identifier must survive aggressive mode verbatim"
         );
+    }
+
+    // --- Issue #25: alpha-rename spans -----------------------------------
+
+    #[test]
+    fn ident_spans_cover_alpha_renamed_locals_only() {
+        // Locals (`x`, `y`, `z`) get spans; kept identifiers (fn name `f`
+        // is classified Local in tree-sitter-rust — see the snapshot
+        // test; type names are Kept) should not leak through.
+        let src = "fn f(x: i32, y: i32) -> i32 { let z = x + y; z }";
+        let unit = first_unit(&RUST_PROFILE, src, NormalizationMode::Conservative);
+        assert!(!unit.ident_spans.is_empty());
+        // Every span's byte range must resolve back to the exact token
+        // text, and that text must alpha-rename to `vN` where N ==
+        // placeholder_idx.
+        for span in &unit.ident_spans {
+            let text = std::str::from_utf8(&src.as_bytes()[span.range.clone()]).unwrap();
+            assert!(
+                !text.is_empty(),
+                "span must cover a non-empty identifier leaf"
+            );
+            // Must not point at punctuation / whitespace.
+            assert!(text.chars().all(|c| c.is_alphanumeric() || c == '_'));
+            assert!(span.placeholder_idx >= 1);
+        }
+    }
+
+    #[test]
+    fn same_ident_text_shares_placeholder_index() {
+        // Repeated local occurrences must collapse to the same
+        // placeholder_idx — that's the correspondence contract the GUI
+        // relies on.
+        let src = "fn f() -> i32 { let x = 1; let y = 2; x + y + x }";
+        let unit = first_unit(&RUST_PROFILE, src, NormalizationMode::Conservative);
+        // Group spans by placeholder index → bucket of source texts.
+        let mut by_idx: std::collections::HashMap<u32, Vec<&str>> =
+            std::collections::HashMap::new();
+        for span in &unit.ident_spans {
+            let text = std::str::from_utf8(&src.as_bytes()[span.range.clone()]).unwrap();
+            by_idx.entry(span.placeholder_idx).or_default().push(text);
+        }
+        // Each placeholder must have one distinct source text.
+        for (idx, texts) in &by_idx {
+            let first = texts[0];
+            for t in texts.iter() {
+                assert_eq!(
+                    *t, first,
+                    "placeholder {idx} should only cover one source name"
+                );
+            }
+        }
+        // Different source texts must get different placeholder ids.
+        let f_idx = by_idx
+            .iter()
+            .find(|(_, v)| v.contains(&"f"))
+            .map(|(k, _)| *k);
+        let x_idx = by_idx
+            .iter()
+            .find(|(_, v)| v.contains(&"x"))
+            .map(|(k, _)| *k);
+        let y_idx = by_idx
+            .iter()
+            .find(|(_, v)| v.contains(&"y"))
+            .map(|(k, _)| *k);
+        assert!(x_idx.is_some() && y_idx.is_some());
+        assert_ne!(x_idx, y_idx);
+        if let Some(fi) = f_idx {
+            assert_ne!(Some(fi), x_idx);
+            assert_ne!(Some(fi), y_idx);
+        }
+    }
+
+    #[test]
+    fn ident_spans_are_stable_across_structurally_equal_units() {
+        // Two functions that alpha-rename to the same token stream must
+        // also produce matching placeholder-index sequences (indexed by
+        // in-stream order). That's the load-bearing property — the GUI
+        // uses `placeholder_idx` as the correspondence key across files.
+        let a = "fn f(x: i32) -> i32 { let y = x + 1; y }";
+        let b = "fn g(alpha: i32) -> i32 { let beta = alpha + 1; beta }";
+        let ua = first_unit(&RUST_PROFILE, a, NormalizationMode::Conservative);
+        let ub = first_unit(&RUST_PROFILE, b, NormalizationMode::Conservative);
+        assert_eq!(ua.tokens, ub.tokens);
+        let ids_a: Vec<u32> = ua.ident_spans.iter().map(|s| s.placeholder_idx).collect();
+        let ids_b: Vec<u32> = ub.ident_spans.iter().map(|s| s.placeholder_idx).collect();
+        assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn normalize_with_spans_tokens_match_normalize_with_mode() {
+        // Load-bearing invariant: the sidecar spans are purely additive.
+        // The token stream returned by normalize_with_spans must be
+        // byte-identical to normalize_with_mode's output so existing
+        // snapshots, caches, and hashes keep working.
+        let src = "fn f(a: i32, b: i32) -> i32 { let c = a + b; c * 2 }";
+        let tree = parse_with(&RUST_PROFILE, src);
+        let root = tree.root_node();
+        let func = root
+            .child(0)
+            .and_then(|n| (n.kind() == "function_item").then_some(n))
+            .unwrap();
+        let legacy = normalize_with_mode(func, src.as_bytes(), &RUST_PROFILE, Default::default());
+        let (tokens, _spans) =
+            normalize_with_spans(func, src.as_bytes(), &RUST_PROFILE, Default::default());
+        assert_eq!(legacy, tokens);
     }
 
     #[test]

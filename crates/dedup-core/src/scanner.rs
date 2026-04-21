@@ -345,6 +345,22 @@ pub struct Occurrence {
     pub path: PathBuf,
     /// Source region covered.
     pub span: Span,
+    /// Per-occurrence alpha-rename spans (issue #25).
+    ///
+    /// Populated only for Tier B occurrences; Tier A occurrences always
+    /// carry an empty vector. Each entry is
+    /// `(start_byte, end_byte, placeholder_idx)` where the byte offsets
+    /// are absolute in the occurrence's source file (same frame of
+    /// reference as [`Span::start_byte`] / [`Span::end_byte`]) and
+    /// `placeholder_idx` is the 1-based `vN` alias the Tier B
+    /// alpha-renamer assigned to that identifier.
+    ///
+    /// Members of the same Tier B match group share byte-identical
+    /// token streams, so the same `placeholder_idx` refers to the same
+    /// logical local across every occurrence of a group — this is the
+    /// correspondence key the GUI uses to tint matching identifiers
+    /// the same color across files.
+    pub alpha_rename_spans: Vec<(usize, usize, u32)>,
 }
 
 /// A cluster of file-local occurrences that share the same canonical
@@ -1065,6 +1081,9 @@ impl Scanner {
                 clusters.entry(key).or_default().push(Occurrence {
                     path: path.clone(),
                     span: combined,
+                    // Tier A carries no alpha-rename spans — #25 tints
+                    // only apply to Tier B, where alpha-renaming runs.
+                    alpha_rename_spans: Vec::new(),
                 });
             }
         }
@@ -1345,6 +1364,16 @@ impl Scanner {
                             start_byte: c.unit.start_byte,
                             end_byte: c.unit.end_byte,
                         },
+                        // #25: propagate the Tier B alpha-rename spans
+                        // so the GUI can paint tint overlays. Converted
+                        // from `IdentSpan` to the lightweight tuple
+                        // shape the cache layer persists.
+                        alpha_rename_spans: c
+                            .unit
+                            .ident_spans
+                            .iter()
+                            .map(|s| (s.range.start, s.range.end, s.placeholder_idx))
+                            .collect(),
                     })
                     .collect();
                 occurrences.sort_by(|a, b| {

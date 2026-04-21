@@ -28,6 +28,7 @@ fn sample_result() -> ScanResult {
                             start_byte: 80,
                             end_byte: 420,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                     Occurrence {
                         path: PathBuf::from("beta.rs"),
@@ -37,6 +38,7 @@ fn sample_result() -> ScanResult {
                             start_byte: 60,
                             end_byte: 400,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                     Occurrence {
                         path: PathBuf::from("gamma.rs"),
@@ -46,6 +48,7 @@ fn sample_result() -> ScanResult {
                             start_byte: 160,
                             end_byte: 500,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                 ],
             },
@@ -61,6 +64,7 @@ fn sample_result() -> ScanResult {
                             start_byte: 0,
                             end_byte: 60,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                     Occurrence {
                         path: PathBuf::from("y.rs"),
@@ -70,6 +74,7 @@ fn sample_result() -> ScanResult {
                             start_byte: 100,
                             end_byte: 160,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                 ],
             },
@@ -102,7 +107,7 @@ fn roundtrips_a_full_scan_result() {
 }
 
 #[test]
-fn wal_mode_and_schema_v1_on_open() {
+fn wal_mode_and_current_schema_on_open() {
     let dir = tempdir().unwrap();
     let cache = Cache::open(dir.path()).unwrap();
     assert_eq!(
@@ -110,7 +115,13 @@ fn wal_mode_and_schema_v1_on_open() {
         "wal",
         "SQLite must be opened in WAL mode"
     );
-    assert_eq!(cache.schema_version().unwrap(), 1);
+    // #25 bumped the schema to v2 (added `tier_b_alpha_spans`). We
+    // assert against the exported constant rather than a literal so
+    // future bumps only need to update one place.
+    assert_eq!(
+        cache.schema_version().unwrap() as u32,
+        dedup_core::cache::CURRENT_SCHEMA_VERSION
+    );
 }
 
 #[test]
@@ -142,6 +153,7 @@ fn second_write_replaces_first() {
                         start_byte: 0,
                         end_byte: 50,
                     },
+                    alpha_rename_spans: Vec::new(),
                 },
                 Occurrence {
                     path: PathBuf::from("only_too.rs"),
@@ -151,6 +163,7 @@ fn second_write_replaces_first() {
                         start_byte: 0,
                         end_byte: 50,
                     },
+                    alpha_rename_spans: Vec::new(),
                 },
             ],
         }],

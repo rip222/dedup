@@ -25,6 +25,7 @@ pub mod empty_state;
 pub mod highlight;
 pub mod menubar;
 pub mod project_view;
+pub mod tint;
 
 pub use app_state::{
     AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, Pane, ScanHandles, ScanState,

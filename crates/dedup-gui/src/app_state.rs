@@ -73,6 +73,14 @@ pub struct OccurrenceView {
     pub path: PathBuf,
     pub start_line: i64,
     pub end_line: i64,
+    /// Per-occurrence alpha-rename spans for Tier B tint overlay
+    /// (issue #25). Empty for Tier A occurrences; Tier B occurrences
+    /// carry one entry per alpha-renamed identifier leaf:
+    /// `(start_byte, end_byte, placeholder_idx)` in absolute file
+    /// bytes. Same `placeholder_idx` across occurrences of a group
+    /// refers to the same logical local — the GUI paints matching
+    /// indices the same color.
+    pub alpha_rename_spans: Vec<(usize, usize, u32)>,
 }
 
 impl OccurrenceView {
@@ -924,6 +932,11 @@ pub fn group_view_from_match(group: &MatchGroup, index: usize) -> GroupView {
             path: o.path.clone(),
             start_line: o.span.start_line as i64,
             end_line: o.span.end_line as i64,
+            // Streaming path: forward alpha-rename spans verbatim from
+            // the scanner's `Occurrence`. Only Tier B occurrences carry
+            // them; Tier A's vector is always empty so the tint overlay
+            // in the detail view silently stays off.
+            alpha_rename_spans: o.alpha_rename_spans.clone(),
         })
         .collect();
     let label = group_label(group.tier, None, None, occurrences.first());
@@ -1119,6 +1132,23 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
                 path: o.path.clone(),
                 start_line: o.start_line,
                 end_line: o.end_line,
+                // Alpha-rename spans come back from the cache as
+                // (i64, i64, u32). Narrow to usize for the renderer's
+                // byte-range API; negative / out-of-range rows are
+                // treated as empty (cache invariant keeps this
+                // well-behaved, but guard anyway so a corrupted row
+                // can never panic the sidebar).
+                alpha_rename_spans: o
+                    .alpha_rename_spans
+                    .iter()
+                    .filter_map(|(s, e, idx)| {
+                        if *s < 0 || *e < 0 || *e < *s {
+                            None
+                        } else {
+                            Some((*s as usize, *e as usize, *idx))
+                        }
+                    })
+                    .collect(),
             })
             .collect();
 
@@ -1182,6 +1212,7 @@ mod tests {
             path: PathBuf::from(path),
             start_line: s,
             end_line: e,
+            alpha_rename_spans: Vec::new(),
         }
     }
 

@@ -78,7 +78,11 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// v1 folds in every table/column that existed in the ad-hoc `probe-and-
 /// add` era (issues #4, #6, #11, #14, #17): no real user databases ship
 /// v0, so collapsing the history into a single-step bootstrap is safe.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (#25) adds the `tier_b_alpha_spans` table so Tier B occurrences
+/// can persist per-identifier alpha-rename byte ranges. This is additive
+/// — v1 rows survive untouched and simply carry no alpha spans.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Backwards-compatible alias for [`CURRENT_SCHEMA_VERSION`]. Kept so
 /// `pub use` consumers of this crate don't break on the #18 rename.
@@ -146,6 +150,10 @@ pub struct CachedOccurrence {
     pub end_line: i64,
     pub start_byte: i64,
     pub end_byte: i64,
+    /// Per-occurrence alpha-rename spans (issue #25). Always empty for
+    /// Tier A groups; populated for Tier B. Each entry is
+    /// `(start_byte, end_byte, placeholder_idx)` in absolute file bytes.
+    pub alpha_rename_spans: Vec<(i64, i64, u32)>,
 }
 
 /// One dismissed-group entry. Keyed by the normalized-block-hash of the
@@ -438,6 +446,11 @@ impl Cache {
                     (group_id, path, start_line, end_line, start_byte, end_byte) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
+            let mut alpha_stmt = tx.prepare(
+                "INSERT INTO tier_b_alpha_spans \
+                    (occurrence_id, start_byte, end_byte, placeholder_idx) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
 
             for group in &result.groups {
                 let (total_lines, total_tokens) = group_totals(group);
@@ -460,6 +473,13 @@ impl Cache {
                         occ.span.start_byte as i64,
                         occ.span.end_byte as i64,
                     ])?;
+                    let occ_id = tx.last_insert_rowid();
+                    // Persist alpha-rename spans verbatim. Only Tier B
+                    // occurrences carry them (#25); Tier A's slice is
+                    // always empty so this loop is a no-op there.
+                    for (s, e, idx) in &occ.alpha_rename_spans {
+                        alpha_stmt.execute(params![occ_id, *s as i64, *e as i64, *idx as i64,])?;
+                    }
                 }
             }
         }
@@ -525,25 +545,55 @@ impl Cache {
         };
 
         let mut stmt = self.conn.prepare(
-            "SELECT path, start_line, end_line, start_byte, end_byte \
+            "SELECT id, path, start_line, end_line, start_byte, end_byte \
              FROM occurrences \
              WHERE group_id = ?1 \
              ORDER BY path ASC, start_line ASC",
         )?;
         let rows = stmt.query_map(params![id], |row| {
-            let path: String = row.get(0)?;
-            Ok(CachedOccurrence {
-                path: PathBuf::from(path),
-                start_line: row.get(1)?,
-                end_line: row.get(2)?,
-                start_byte: row.get(3)?,
-                end_byte: row.get(4)?,
-            })
+            let occ_id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            Ok((
+                occ_id,
+                CachedOccurrence {
+                    path: PathBuf::from(path),
+                    start_line: row.get(2)?,
+                    end_line: row.get(3)?,
+                    start_byte: row.get(4)?,
+                    end_byte: row.get(5)?,
+                    alpha_rename_spans: Vec::new(),
+                },
+            ))
         })?;
 
-        let mut occurrences = Vec::new();
+        let mut occ_rows: Vec<(i64, CachedOccurrence)> = Vec::new();
         for r in rows {
-            occurrences.push(r?);
+            occ_rows.push(r?);
+        }
+
+        // Hydrate alpha-rename spans (#25) per occurrence. We run a
+        // single statement once and bind the occurrence id per row
+        // rather than a JOIN in the main occurrence query — keeps
+        // CachedOccurrence construction straightforward and avoids
+        // N duplicated occurrence columns across the join result.
+        let mut alpha_stmt = self.conn.prepare(
+            "SELECT start_byte, end_byte, placeholder_idx \
+             FROM tier_b_alpha_spans \
+             WHERE occurrence_id = ?1 \
+             ORDER BY start_byte ASC, end_byte ASC",
+        )?;
+        let mut occurrences: Vec<CachedOccurrence> = Vec::with_capacity(occ_rows.len());
+        for (occ_id, mut occ) in occ_rows {
+            let span_rows = alpha_stmt.query_map(params![occ_id], |row| {
+                let s: i64 = row.get(0)?;
+                let e: i64 = row.get(1)?;
+                let idx: i64 = row.get(2)?;
+                Ok((s, e, idx.max(0) as u32))
+            })?;
+            for r in span_rows {
+                occ.alpha_rename_spans.push(r?);
+            }
+            occurrences.push(occ);
         }
 
         Ok(Some(GroupDetail {
@@ -698,7 +748,7 @@ type MigrationFn = fn(&rusqlite::Transaction<'_>) -> Result<(), CacheError>;
 /// Consolidation is safe because no real user DBs exist yet; the only
 /// pre-#18 databases are dev scratchpads regenerated on every run. A
 /// future v2 entry would add a new `(1, migrate_v1_to_v2)` row.
-const MIGRATIONS: &[(u32, MigrationFn)] = &[(0, migrate_v0_to_v1)];
+const MIGRATIONS: &[(u32, MigrationFn)] = &[(0, migrate_v0_to_v1), (1, migrate_v1_to_v2)];
 
 /// Ensure the cache is at [`CURRENT_SCHEMA_VERSION`].
 ///
@@ -730,20 +780,20 @@ fn ensure_schema(conn: &mut Connection) -> Result<(), CacheError> {
     // stub runner tracked versions in a `schema_version` table and never
     // set `PRAGMA user_version`. If such a DB exists (dev-only — no real
     // users shipped it), read the stub value, stamp `user_version`
-    // accordingly, and drop the defunct table. The actual schema DDL is
-    // identical to v1 already, so the ladder below is a no-op from here.
+    // accordingly, drop the defunct table, and THEN continue the ladder
+    // so any later migrations (e.g. v1→v2 for #25) still run on it.
     let legacy = legacy_schema_version(conn)?;
+    let mut start_from = current;
     if let Some(v) = legacy
         && current == 0
-        && v >= 1
-        && v <= CURRENT_SCHEMA_VERSION
+        && (1..=CURRENT_SCHEMA_VERSION).contains(&v)
     {
         conn.execute("DROP TABLE IF EXISTS schema_version", [])?;
         conn.pragma_update(None, "user_version", v)?;
-        return Ok(());
+        start_from = v;
     }
 
-    run_migrations(conn, current, CURRENT_SCHEMA_VERSION)?;
+    run_migrations(conn, start_from, CURRENT_SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -828,6 +878,31 @@ fn migrate_v0_to_v1(tx: &rusqlite::Transaction<'_>) -> Result<(), CacheError> {
             dismissed_at   INTEGER NOT NULL,\
             last_group_id  INTEGER\
          );",
+    )?;
+    Ok(())
+}
+
+/// v1 → v2 (#25): add `tier_b_alpha_spans`, a per-occurrence sidecar
+/// table storing the alpha-rename identifier spans the Tier B normaliser
+/// emits. One row per identifier leaf; `(occurrence_id, start_byte,
+/// end_byte, placeholder_idx)`. Rows cascade-delete with their parent
+/// occurrence so `write_scan_result`'s truncate-and-rewrite loop stays
+/// a single DELETE of `match_groups`.
+///
+/// Idempotent-safe via `CREATE TABLE IF NOT EXISTS` so replaying the
+/// migration on a dev DB that somehow already has the table (unlikely —
+/// no v2 DBs exist before this commit) is a no-op.
+fn migrate_v1_to_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), CacheError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tier_b_alpha_spans (\
+            id              INTEGER PRIMARY KEY,\
+            occurrence_id   INTEGER NOT NULL REFERENCES occurrences(id) ON DELETE CASCADE,\
+            start_byte      INTEGER NOT NULL,\
+            end_byte        INTEGER NOT NULL,\
+            placeholder_idx INTEGER NOT NULL\
+         );\
+         CREATE INDEX IF NOT EXISTS tier_b_alpha_spans_occ_idx \
+            ON tier_b_alpha_spans(occurrence_id);",
     )?;
     Ok(())
 }
@@ -954,6 +1029,11 @@ impl From<&Occurrence> for CachedOccurrence {
             end_line: occ.span.end_line as i64,
             start_byte: occ.span.start_byte as i64,
             end_byte: occ.span.end_byte as i64,
+            alpha_rename_spans: occ
+                .alpha_rename_spans
+                .iter()
+                .map(|(s, e, idx)| (*s as i64, *e as i64, *idx))
+                .collect(),
         }
     }
 }
@@ -992,6 +1072,7 @@ mod tests {
                             start_byte: 0,
                             end_byte: 100,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                     Occurrence {
                         path: PathBuf::from("b.rs"),
@@ -1001,6 +1082,7 @@ mod tests {
                             start_byte: 40,
                             end_byte: 140,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                 ],
             }],
@@ -1050,10 +1132,17 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_is_one() {
+    fn schema_version_matches_current() {
+        // Fresh DB must stamp the current schema version (#25 bumped this
+        // to v2 when adding `tier_b_alpha_spans`). Asserting on the
+        // exported constant rather than a literal keeps the test honest
+        // against future bumps without extra churn.
         let dir = tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
-        assert_eq!(cache.schema_version().unwrap(), 1);
+        assert_eq!(
+            cache.schema_version().unwrap() as u32,
+            CURRENT_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -1099,6 +1188,7 @@ mod tests {
                             start_byte: 0,
                             end_byte: 50,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                     Occurrence {
                         path: PathBuf::from("y.rs"),
@@ -1108,6 +1198,7 @@ mod tests {
                             start_byte: 10,
                             end_byte: 60,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                 ],
             }],
@@ -1200,6 +1291,7 @@ mod tests {
                             start_byte: 0,
                             end_byte: 100,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                     Occurrence {
                         path: PathBuf::from("b.rs"),
@@ -1209,6 +1301,7 @@ mod tests {
                             start_byte: 40,
                             end_byte: 140,
                         },
+                        alpha_rename_spans: Vec::new(),
                     },
                 ],
             }],
@@ -1479,7 +1572,13 @@ mod tests {
         }
 
         let cache = Cache::open(dir.path()).expect("legacy DB should be promoted");
-        assert_eq!(cache.schema_version().unwrap(), 1);
+        // Legacy DB was promoted from the stub `schema_version` table to
+        // PRAGMA user_version, then the ladder carried it forward through
+        // any post-v1 migrations (v1→v2 in #25).
+        assert_eq!(
+            cache.schema_version().unwrap() as u32,
+            CURRENT_SCHEMA_VERSION
+        );
 
         // The legacy table should be gone after promotion.
         let exists: i64 = cache

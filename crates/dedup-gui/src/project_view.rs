@@ -1329,13 +1329,19 @@ fn read_occurrence_body(
 
 fn render_highlighted_body(
     body: &OccurrenceBody,
-    _occ: &crate::app_state::OccurrenceView,
+    occ: &crate::app_state::OccurrenceView,
 ) -> gpui::AnyElement {
     use crate::highlight::{highlight, theme_color};
 
     let runs = highlight(&body.source, body.lang_hint.as_deref());
     let src = &body.source;
     let slice = &body.slice;
+
+    // Sort alpha-rename spans by start byte so the overlay merge-walk
+    // below is O(n). Tier A occurrences hand us an empty slice here; the
+    // overlay pass is then a no-op (no tints to apply).
+    let mut tint_spans: Vec<(usize, usize, u32)> = occ.alpha_rename_spans.clone();
+    tint_spans.sort_unstable_by_key(|(s, _, _)| *s);
 
     // Build one line-wrapping element per rendered line. We iterate
     // through the slice's bytes and split on '\n' so a newline inside
@@ -1370,22 +1376,33 @@ fn render_highlighted_body(
         }
         let run_start = run.start.max(slice.start);
         let run_end = run.end.min(slice.end);
-        let text = &src[run_start..run_end];
-        // Split the run on newlines so each line gets its own row.
-        let mut parts = text.split('\n').peekable();
-        while let Some(part) = parts.next() {
-            if !part.is_empty() {
-                current_line_children.push(
-                    div()
+
+        // Subdivide the clipped run into (tint?, sub-range) pieces so
+        // identifiers that fall inside an alpha-rename span pick up the
+        // right background color. Each piece inherits the run's
+        // foreground highlight.
+        for piece in split_by_tints(run_start..run_end, &tint_spans) {
+            let text = &src[piece.range.clone()];
+            // Split each piece on newlines so each line gets its own
+            // row. Multi-line pieces are rare (alpha-rename spans cover
+            // single identifiers) but the pathological case still has to
+            // render sanely.
+            let mut parts = text.split('\n').peekable();
+            while let Some(part) = parts.next() {
+                if !part.is_empty() {
+                    let mut node = div()
                         .text_color(rgb(theme_color(run.kind)))
-                        .child(part.to_string())
-                        .into_any_element(),
-                );
-            }
-            if parts.peek().is_some() {
-                let taken = std::mem::take(&mut current_line_children);
-                push_line(current_line_no, taken, &mut lines);
-                current_line_no += 1;
+                        .child(part.to_string());
+                    if let Some(tint) = piece.tint {
+                        node = node.bg(rgb(tint));
+                    }
+                    current_line_children.push(node.into_any_element());
+                }
+                if parts.peek().is_some() {
+                    let taken = std::mem::take(&mut current_line_children);
+                    push_line(current_line_no, taken, &mut lines);
+                    current_line_no += 1;
+                }
             }
         }
     }
@@ -1400,4 +1417,167 @@ fn render_highlighted_body(
         .font_family("Menlo")
         .children(lines)
         .into_any_element()
+}
+
+/// One sub-piece of a syntax-highlighted run after overlaying the
+/// alpha-rename tint spans. `tint` is `Some(rgb)` if the sub-range
+/// lies inside a tint span, `None` otherwise. Pure data so the split
+/// logic can be unit-tested off the GPUI main thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunPiece {
+    range: std::ops::Range<usize>,
+    tint: Option<u32>,
+}
+
+/// Intersect the highlight run `run` with the sorted, possibly-
+/// overlapping alpha-rename tint spans. Emits contiguous non-empty
+/// pieces covering `run` exactly once, each tagged with the tint
+/// color the GUI should paint as the background (or `None` for gaps
+/// outside any span).
+///
+/// Assumes `spans` is sorted by start byte. Callers upstream sort once
+/// and pass the slice down; the function does not mutate it.
+///
+/// In the current data model spans are non-overlapping (every alpha-
+/// renamed leaf is a distinct source byte range), so the algorithm
+/// treats overlaps by picking the span whose start comes first —
+/// consistent with how the normaliser emits them.
+fn split_by_tints(run: std::ops::Range<usize>, spans: &[(usize, usize, u32)]) -> Vec<RunPiece> {
+    let mut out: Vec<RunPiece> = Vec::new();
+    if run.start >= run.end {
+        return out;
+    }
+    let mut cursor = run.start;
+    for (s, e, idx) in spans {
+        let span_start = *s;
+        let span_end = *e;
+        // Skip spans entirely before the cursor (already consumed or
+        // wholly to the left of the run).
+        if span_end <= cursor {
+            continue;
+        }
+        // Stop once we pass the run — remaining spans can't intersect.
+        if span_start >= run.end {
+            break;
+        }
+        // Gap before the tint: emit untinted.
+        let tint_lo = span_start.max(cursor);
+        if tint_lo > cursor {
+            out.push(RunPiece {
+                range: cursor..tint_lo,
+                tint: None,
+            });
+        }
+        let tint_hi = span_end.min(run.end);
+        if tint_hi > tint_lo {
+            out.push(RunPiece {
+                range: tint_lo..tint_hi,
+                tint: Some(crate::tint::tint_for_placeholder(*idx)),
+            });
+            cursor = tint_hi;
+        }
+        if cursor >= run.end {
+            break;
+        }
+    }
+    if cursor < run.end {
+        out.push(RunPiece {
+            range: cursor..run.end,
+            tint: None,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tint_overlay_tests {
+    //! Pure-data tests for the tint-overlay piece splitter (#25).
+    //!
+    //! The renderer integration runs behind GPUI, which has to be
+    //! constructed on the main thread — so we cover the logic here with
+    //! plain unit tests that don't touch any GPUI types.
+
+    use super::{RunPiece, split_by_tints};
+    use crate::app_state::OccurrenceView;
+    use std::path::PathBuf;
+
+    fn occ_with_spans(spans: Vec<(usize, usize, u32)>) -> OccurrenceView {
+        OccurrenceView {
+            path: PathBuf::from("x.rs"),
+            start_line: 1,
+            end_line: 1,
+            alpha_rename_spans: spans,
+        }
+    }
+
+    #[test]
+    fn tier_a_occurrence_has_empty_spans() {
+        // Data-path acceptance: Tier A `OccurrenceView`s must carry no
+        // alpha-rename spans. The renderer uses exactly this vector to
+        // decide whether to apply the tint overlay — so asserting it
+        // here is the inverse of "Tier A gets no tinting".
+        let occ = occ_with_spans(Vec::new());
+        assert!(occ.alpha_rename_spans.is_empty());
+        let pieces = split_by_tints(0..40, &occ.alpha_rename_spans);
+        assert_eq!(pieces.len(), 1);
+        assert!(pieces[0].tint.is_none());
+        assert_eq!(pieces[0].range, 0..40);
+    }
+
+    #[test]
+    fn tier_b_pieces_split_around_spans() {
+        // Three identifiers inside a 40-byte run; expect the splitter
+        // to produce alternating tinted / untinted pieces that cover
+        // the run exactly once.
+        let spans = vec![(4, 8, 1), (16, 20, 2), (30, 34, 1)];
+        let pieces = split_by_tints(0..40, &spans);
+
+        let mut covered = 0usize;
+        let mut last_end = 0usize;
+        for p in &pieces {
+            assert_eq!(p.range.start, last_end, "pieces must be contiguous");
+            assert!(p.range.end > p.range.start);
+            last_end = p.range.end;
+            covered += p.range.end - p.range.start;
+        }
+        assert_eq!(last_end, 40);
+        assert_eq!(covered, 40);
+
+        // Same placeholder idx must produce the same tint color across
+        // both occurrences inside this run (correspondence contract).
+        let first = pieces.iter().find(|p| p.range == (4..8)).unwrap();
+        let third = pieces.iter().find(|p| p.range == (30..34)).unwrap();
+        assert_eq!(first.tint, third.tint, "idx=1 twice must match color");
+        let middle = pieces.iter().find(|p| p.range == (16..20)).unwrap();
+        assert_ne!(middle.tint, first.tint, "idx=2 must differ from idx=1");
+    }
+
+    #[test]
+    fn spans_outside_run_are_ignored() {
+        let spans = vec![(0, 2, 1), (100, 120, 2)];
+        let pieces = split_by_tints(10..30, &spans);
+        // Both spans fall entirely outside 10..30 — result is a single
+        // untinted piece covering the whole run.
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(
+            pieces[0],
+            RunPiece {
+                range: 10..30,
+                tint: None
+            }
+        );
+    }
+
+    #[test]
+    fn spans_partially_overlap_run() {
+        // A span that straddles the run's left edge clips; same for
+        // the right edge. Coverage remains contiguous and complete.
+        let spans = vec![(5, 15, 1), (25, 35, 2)];
+        let pieces = split_by_tints(10..30, &spans);
+        assert!(!pieces.is_empty());
+        let start = pieces.first().unwrap().range.start;
+        let end = pieces.last().unwrap().range.end;
+        assert_eq!(start, 10);
+        assert_eq!(end, 30);
+    }
 }
