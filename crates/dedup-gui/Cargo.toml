@@ -53,6 +53,26 @@ log = "0.4"
 # `NSOpenPanel`. Default features pull in xdg-portal / wayland for Linux,
 # which we don't need here — the whole GUI crate is macOS-gated.
 rfd = { version = "0.15", default-features = false }
+# ---------------------------------------------------------------------------
+# Syntax highlighting deps (issue #24)
+# ---------------------------------------------------------------------------
+# `tree-sitter-highlight` is pinned to the 0.23 line to stay compatible
+# with the `tree-sitter = "0.23"` workspace grammars (`tree-sitter-rust`,
+# `-typescript`, `-python`). The per-language `HIGHLIGHTS_QUERY` constants
+# re-exported by those crates are concatenated into `HighlightConfiguration`
+# instances in `highlight.rs`.
+tree-sitter = "0.23"
+tree-sitter-highlight = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+# `syntect` is the fallback engine for anything not handled by a
+# tree-sitter profile. We disable default features (`default-onig`) to
+# avoid the C-based `onig` regex dep and pick `default-fancy`, which
+# uses `fancy-regex` (pure Rust) while still bundling the default
+# Sublime-syntax set + default themes so no runtime data files are
+# needed. See highlight.rs for the scope-name → `Highlight` mapping.
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

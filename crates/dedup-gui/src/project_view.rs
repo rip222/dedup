@@ -1223,20 +1223,181 @@ fn render_detail(state: &AppState) -> gpui::Div {
                 .child(format!("{} occurrences", occurrences.len())),
         );
         for occ in occurrences {
-            body = body.child(
-                div()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .bg(rgb(SIDEBAR_BG))
-                    .rounded(px(4.0))
-                    .text_size(px(12.0))
-                    .text_color(rgb(ROW_TEXT))
-                    .child(occ.label()),
-            );
+            body = body.child(render_occurrence_card(state, occ));
         }
-        // NOTE: no syntax highlighting / source preview — that lands in
-        // issue #24. The acceptance criteria for #20 explicitly say
-        // "path + line range", nothing more.
     }
     body.bg(rgb(BG)).flex_1()
+}
+
+/// One occurrence card: `path:Lstart–end` header plus the highlighted
+/// source slice for that line range. Issue #24.
+///
+/// `state.current_folder` is joined with the occurrence's relative path
+/// to get the absolute path on disk. Reading / highlighting happens
+/// here synchronously — source files are small by duplicate-group
+/// definition (one function's worth of lines) and the render pass is
+/// already on the main thread. If the file can't be read (deleted,
+/// permissions, moved since the scan) we render a muted "File not
+/// available" line; no panic.
+fn render_occurrence_card(state: &AppState, occ: &crate::app_state::OccurrenceView) -> gpui::Div {
+    let header = div()
+        .text_size(px(12.0))
+        .text_color(rgb(ROW_TEXT))
+        .child(occ.label());
+
+    let body_el = match read_occurrence_body(state, occ) {
+        Some(body) => render_highlighted_body(&body, occ),
+        None => div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .text_size(px(11.0))
+            .text_color(rgb(ROW_TEXT_DIM))
+            .child("(file not available)")
+            .into_any_element(),
+    };
+
+    div()
+        .px(px(12.0))
+        .py(px(8.0))
+        .bg(rgb(SIDEBAR_BG))
+        .rounded(px(4.0))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(header)
+        .child(body_el)
+}
+
+/// File contents + language hint for one occurrence, windowed to the
+/// stored line range. Returns `None` on any I/O error so the caller
+/// can show the "file not available" placeholder.
+struct OccurrenceBody {
+    /// Whole-file source — tree-sitter parses more accurately with
+    /// full context than with a windowed slice. The renderer filters
+    /// runs to the windowed range afterwards.
+    source: String,
+    /// Byte range within `source` that belongs to the occurrence's
+    /// line span (inclusive start line, inclusive end line).
+    slice: std::ops::Range<usize>,
+    /// 1-based line number of the first rendered line. Used for
+    /// line-number gutter formatting.
+    first_line: i64,
+    /// Canonical language hint (`"rust"`, `"typescript"`, ...).
+    lang_hint: Option<String>,
+}
+
+fn read_occurrence_body(
+    state: &AppState,
+    occ: &crate::app_state::OccurrenceView,
+) -> Option<OccurrenceBody> {
+    let folder = state.current_folder.as_ref()?;
+    let abs = folder.join(&occ.path);
+    let source = std::fs::read_to_string(&abs).ok()?;
+
+    // Convert 1-based inclusive line range → byte range. Clamp both
+    // ends so a stale cache (file shortened since scan) still renders
+    // whatever lines remain rather than panicking.
+    let start_line = occ.start_line.max(1) as usize;
+    let end_line = occ.end_line.max(1) as usize;
+    let mut byte_start: Option<usize> = None;
+    let mut byte_end: usize = source.len();
+    let mut line_no: usize = 1;
+    // Walk line boundaries once.
+    for (idx, ch) in source.char_indices() {
+        if line_no == start_line && byte_start.is_none() {
+            byte_start = Some(idx);
+        }
+        if ch == '\n' {
+            if line_no == end_line {
+                byte_end = idx + 1;
+                break;
+            }
+            line_no += 1;
+        }
+    }
+    let byte_start = byte_start.unwrap_or(0);
+    let byte_end = byte_end.min(source.len()).max(byte_start);
+
+    let lang_hint = crate::highlight::lang_hint_for_path(&occ.path);
+    Some(OccurrenceBody {
+        source,
+        slice: byte_start..byte_end,
+        first_line: start_line as i64,
+        lang_hint,
+    })
+}
+
+fn render_highlighted_body(
+    body: &OccurrenceBody,
+    _occ: &crate::app_state::OccurrenceView,
+) -> gpui::AnyElement {
+    use crate::highlight::{highlight, theme_color};
+
+    let runs = highlight(&body.source, body.lang_hint.as_deref());
+    let src = &body.source;
+    let slice = &body.slice;
+
+    // Build one line-wrapping element per rendered line. We iterate
+    // through the slice's bytes and split on '\n' so a newline inside
+    // a highlight run (possible for multi-line strings) becomes a
+    // paragraph break.
+    let mut lines: Vec<gpui::Div> = Vec::new();
+    let mut current_line_children: Vec<gpui::AnyElement> = Vec::new();
+    let mut current_line_no = body.first_line;
+
+    let push_line = |line_no: i64, children: Vec<gpui::AnyElement>, lines: &mut Vec<gpui::Div>| {
+        let gutter = div()
+            .w(px(40.0))
+            .text_color(rgb(ROW_TEXT_DIM))
+            .child(format!("{line_no}"));
+        lines.push(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(8.0))
+                .child(gutter)
+                .child(div().flex_1().children(children)),
+        );
+    };
+
+    for run in runs.iter() {
+        // Clip the run to the occurrence's byte window.
+        if run.end <= slice.start {
+            continue;
+        }
+        if run.start >= slice.end {
+            break;
+        }
+        let run_start = run.start.max(slice.start);
+        let run_end = run.end.min(slice.end);
+        let text = &src[run_start..run_end];
+        // Split the run on newlines so each line gets its own row.
+        let mut parts = text.split('\n').peekable();
+        while let Some(part) = parts.next() {
+            if !part.is_empty() {
+                current_line_children.push(
+                    div()
+                        .text_color(rgb(theme_color(run.kind)))
+                        .child(part.to_string())
+                        .into_any_element(),
+                );
+            }
+            if parts.peek().is_some() {
+                let taken = std::mem::take(&mut current_line_children);
+                push_line(current_line_no, taken, &mut lines);
+                current_line_no += 1;
+            }
+        }
+    }
+    if !current_line_children.is_empty() {
+        push_line(current_line_no, current_line_children, &mut lines);
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .text_size(px(12.0))
+        .font_family("Menlo")
+        .children(lines)
+        .into_any_element()
 }
