@@ -61,6 +61,18 @@ pub struct ScanConfig {
     pub tier_a_min_lines: usize,
     /// A match span must cover at least this many tokens to be reported.
     pub tier_a_min_tokens: usize,
+    /// Tier B minimum lines. Tier B detection lands in #6; today this
+    /// field is stored so the config→scanner bridge is one-shot.
+    pub tier_b_min_lines: usize,
+    /// Tier B minimum tokens.
+    pub tier_b_min_tokens: usize,
+    /// Files larger than this (in bytes) are skipped during scan.
+    pub max_file_size: u64,
+    /// If true, follow symlinks during the walk. Default false.
+    pub follow_symlinks: bool,
+    /// If true, descend into nested submodule directories (those
+    /// containing a `.git` file/dir). Default false.
+    pub include_submodules: bool,
 }
 
 impl Default for ScanConfig {
@@ -68,6 +80,25 @@ impl Default for ScanConfig {
         Self {
             tier_a_min_lines: 6,
             tier_a_min_tokens: 50,
+            tier_b_min_lines: 3,
+            tier_b_min_tokens: 15,
+            max_file_size: 1_048_576,
+            follow_symlinks: false,
+            include_submodules: false,
+        }
+    }
+}
+
+impl From<&crate::config::Config> for ScanConfig {
+    fn from(cfg: &crate::config::Config) -> Self {
+        Self {
+            tier_a_min_lines: cfg.thresholds.tier_a.min_lines,
+            tier_a_min_tokens: cfg.thresholds.tier_a.min_tokens,
+            tier_b_min_lines: cfg.thresholds.tier_b.min_lines,
+            tier_b_min_tokens: cfg.thresholds.tier_b.min_tokens,
+            max_file_size: cfg.scan.max_file_size,
+            follow_symlinks: cfg.scan.follow_symlinks,
+            include_submodules: cfg.scan.include_submodules,
         }
     }
 }
@@ -173,10 +204,32 @@ impl Scanner {
         // --- 1. Walk and tokenize each candidate file. --------------------
         let mut per_file: Vec<(PathBuf, Vec<Token>)> = Vec::new();
 
-        for entry in WalkDir::new(root).into_iter().filter_entry(|e| {
-            // Skip `.git/` directories wholesale.
-            !(e.file_type().is_dir() && e.file_name() == ".git")
-        }) {
+        let follow = self.config.follow_symlinks;
+        let include_submodules = self.config.include_submodules;
+        let max_bytes = self.config.max_file_size;
+
+        for entry in WalkDir::new(root)
+            .follow_links(follow)
+            .into_iter()
+            .filter_entry(|e| {
+                // Skip `.git/` directories wholesale.
+                if e.file_type().is_dir() && e.file_name() == ".git" {
+                    return false;
+                }
+                // Skip nested submodule directories unless explicitly
+                // asked to include them. A submodule is identified by a
+                // `.git` entry (file or dir) inside a directory *other
+                // than* the top-level root.
+                if !include_submodules
+                    && e.file_type().is_dir()
+                    && e.depth() > 0
+                    && e.path().join(".git").exists()
+                {
+                    return false;
+                }
+                true
+            })
+        {
             let entry = match entry {
                 Ok(e) => e,
                 // Tolerate per-entry walk errors (permission denied on a
@@ -189,6 +242,14 @@ impl Scanner {
             }
 
             let abs = entry.path();
+            // Honor the size cap before the full read — we still need
+            // metadata to make the decision, so a cheap `metadata()` is
+            // worth it over always loading the whole file.
+            if let Ok(meta) = entry.metadata()
+                && meta.len() > max_bytes
+            {
+                continue;
+            }
             let bytes = match std::fs::read(abs) {
                 Ok(b) => b,
                 Err(_) => continue,

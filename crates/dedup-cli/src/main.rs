@@ -8,33 +8,39 @@
 //!   the same format as `scan` — no re-scan.
 //! - `show <id>`: print full detail (all occurrence spans) for one
 //!   persisted group.
+//! - `config`: inspect (`path`) or open (`edit`) the resolved config
+//!   file(s). Never auto-creates: the only place a config file is ever
+//!   materialized is `dedup config edit`, on explicit user action.
 //!
 //! # Global flags
 //!
 //! Flags live on [`GlobalArgs`], flattened into the top-level [`Cli`].
-//! Subcommand handlers read them via `cli.globals`. The bulk of this
-//! issue (#13) is wiring the flag surface — the tier/lang filters apply
-//! post-scan, `--strict` controls the exit code, progress is driven
-//! through the core's `ProgressSink` trait, and verbose / color / jobs
-//! flags are stored on the config for downstream issues (`#6` Tier B,
-//! `#14` parallelism, `#16` tracing subscriber) to pick up.
+//! Subcommand handlers read them via `cli.globals`. The bulk of the
+//! surface (see issue #13) wires the flag shape — the tier/lang filters
+//! apply post-scan, `--strict` controls the exit code, progress is
+//! driven through the core's `ProgressSink` trait, and verbose / color /
+//! jobs flags are stored on the config for downstream issues (`#6` Tier
+//! B, `#14` parallelism, `#16` tracing subscriber) to pick up.
 //!
 //! # Exit codes
 //!
 //! - `0` success (with or without findings; git-style default).
 //! - `1` findings present AND `--strict` was passed.
-//! - `2` config / usage / parse error (including clap parse errors —
-//!   the `main` function remaps clap's error kind to `2` before exit).
+//! - `2` config / usage / parse error (including clap parse errors and
+//!   invalid config files — the `main` function remaps clap's error
+//!   kind to `2` before exit).
 //! - `101` Rust panic (the default `panic = "unwind"` behavior; we do
 //!   not override it here).
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-use dedup_core::{Cache, GroupDetail, MatchGroup, ProgressSink, ScanConfig, Scanner};
+use dedup_core::{
+    Cache, Config, ConfigError, GroupDetail, MatchGroup, ProgressSink, ScanConfig, Scanner,
+};
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Root CLI parser. Subcommands live under [`Command`]; shared flags live
@@ -158,6 +164,33 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+    /// Inspect or edit the layered dedup config.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Print the resolved config paths (global + project) with a
+    /// presence indicator for each layer.
+    Path {
+        /// Directory whose project config should be resolved. Defaults
+        /// to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Open the resolved config file in `$EDITOR` (falling back to
+    /// `$VISUAL`, then `vi`). If no config file exists, an empty one is
+    /// created at the project path — this is the one place a config
+    /// file is ever materialized.
+    Edit {
+        /// Directory whose project config should be edited. Defaults
+        /// to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 /// Program entry point.
@@ -199,11 +232,37 @@ fn main() -> ExitCode {
         Command::Scan { ref path } => run_scan(path, &cli.globals),
         Command::List { ref path } => run_list(path, &cli.globals),
         Command::Show { id, ref path } => run_show(id, path, &cli.globals),
+        Command::Config { action } => match action {
+            ConfigAction::Path { path } => run_config_path(&path),
+            ConfigAction::Edit { path } => run_config_edit(&path),
+        },
     }
 }
 
 fn run_scan(path: &Path, globals: &GlobalArgs) -> ExitCode {
-    let scanner = Scanner::new(ScanConfig::default());
+    // Load layered config before scanning. Parse errors are fatal; a
+    // newer-schema file is treated as a warning and falls back to
+    // defaults (the `.bak` migration flow is deferred — see #9 spec).
+    let config = match Config::load(Some(path)) {
+        Ok(c) => c,
+        Err(ConfigError::SchemaVersionMismatch {
+            path: p,
+            found,
+            expected,
+        }) => {
+            eprintln!(
+                "dedup: warning: config at {} declares schema_version {found} which is newer than supported version {expected}; using defaults",
+                p.display()
+            );
+            Config::default()
+        }
+        Err(e) => {
+            eprintln!("dedup: config error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let scanner = Scanner::new(ScanConfig::from(&config));
 
     // Build the progress sink. Spinner is suppressed when:
     // - stdout is not a TTY (piped output), OR
@@ -344,6 +403,104 @@ fn run_show(id: i64, path: &Path, _globals: &GlobalArgs) -> ExitCode {
     print_cached_group_show(&detail, &mut stdout).ok();
 
     ExitCode::SUCCESS
+}
+
+/// `dedup config path` — print one line per config layer with a
+/// presence indicator. Never creates files.
+fn run_config_path(path: &Path) -> ExitCode {
+    let global = Config::global_path();
+    let project = Config::project_path(path);
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "global: {} {}", global.display(), presence(&global));
+    let _ = writeln!(
+        stdout,
+        "project: {} {}",
+        project.display(),
+        presence(&project)
+    );
+    ExitCode::SUCCESS
+}
+
+/// `dedup config edit` — resolve to the preferred layer (project if the
+/// repo has a `.dedup/` directory, else global), create an empty file
+/// there if neither layer has one, then launch `$EDITOR`.
+fn run_config_edit(path: &Path) -> ExitCode {
+    let project = Config::project_path(path);
+    let global = Config::global_path();
+
+    // Prefer the project layer if the `.dedup/` directory already
+    // exists. Otherwise prefer whichever file actually exists. If
+    // neither exists, materialize an empty project-scoped file — this
+    // is the documented "one place" a config file is ever created.
+    let target = if path.join(".dedup").is_dir() || project.exists() {
+        project.clone()
+    } else if global.exists() {
+        global.clone()
+    } else {
+        project.clone()
+    };
+
+    if !target.exists() {
+        if let Some(parent) = target.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!(
+                "dedup: failed to create config dir {}: {e}",
+                parent.display()
+            );
+            return ExitCode::from(2);
+        }
+        if let Err(e) = std::fs::write(&target, "") {
+            eprintln!(
+                "dedup: failed to create config file {}: {e}",
+                target.display()
+            );
+            return ExitCode::from(2);
+        }
+    }
+
+    let editor = resolve_editor();
+    let status = ProcessCommand::new(&editor).arg(&target).status();
+    match status {
+        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(s) => {
+            eprintln!(
+                "dedup: editor {} exited with status {}",
+                editor,
+                s.code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into())
+            );
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("dedup: failed to launch editor {editor}: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Resolve the editor command: `$EDITOR`, then `$VISUAL`, then `vi`.
+fn resolve_editor() -> String {
+    if let Ok(v) = std::env::var("EDITOR")
+        && !v.is_empty()
+    {
+        return v;
+    }
+    if let Ok(v) = std::env::var("VISUAL")
+        && !v.is_empty()
+    {
+        return v;
+    }
+    "vi".to_string()
+}
+
+fn presence(p: &Path) -> &'static str {
+    if p.exists() {
+        "(present)"
+    } else {
+        "(not present)"
+    }
 }
 
 /// Return true iff Tier A groups should be emitted given `--tier`.
@@ -582,5 +739,23 @@ mod tests {
             clap::error::ErrorKind::DisplayHelp,
             "unknown flag should not be help"
         );
+    }
+
+    #[test]
+    fn config_subcommand_parses() {
+        let cli = Cli::parse_from(["dedup", "config", "path"]);
+        assert!(matches!(
+            cli.command,
+            Command::Config {
+                action: ConfigAction::Path { .. }
+            }
+        ));
+        let cli = Cli::parse_from(["dedup", "config", "edit"]);
+        assert!(matches!(
+            cli.command,
+            Command::Config {
+                action: ConfigAction::Edit { .. }
+            }
+        ));
     }
 }
