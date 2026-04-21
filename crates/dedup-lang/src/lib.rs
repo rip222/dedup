@@ -26,10 +26,12 @@
 pub mod normalize;
 pub mod profile;
 pub mod rust;
+pub mod typescript;
 
 pub use normalize::{NormalizedToken, SyntacticUnit, extract_units, hash_tokens, normalize};
 pub use profile::{LanguageProfile, RenameClass};
 pub use rust::{RUST_PROFILE, RustProfile};
+pub use typescript::{TSX_PROFILE, TYPESCRIPT_PROFILE, TsxProfile, TypeScriptProfile};
 
 /// Every profile shipped with this build. Order is stable but
 /// arbitrary; callers should not rely on it.
@@ -38,7 +40,7 @@ pub use rust::{RUST_PROFILE, RustProfile};
 /// by the caller. Adding a new profile only requires appending to this
 /// function.
 pub fn all_profiles() -> Vec<&'static dyn LanguageProfile> {
-    vec![&RUST_PROFILE]
+    vec![&RUST_PROFILE, &TYPESCRIPT_PROFILE, &TSX_PROFILE]
 }
 
 /// Look up the profile that claims `ext` (the extension without a

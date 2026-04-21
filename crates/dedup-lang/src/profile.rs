@@ -17,7 +17,7 @@
 //! Scanner in `dedup-core` takes a slice of these and runs Tier B on
 //! any file whose extension matches a registered profile.
 
-use tree_sitter::Language;
+use tree_sitter::{Language, Node};
 
 /// How an identifier / literal node should be treated when normalising
 /// a syntactic unit's token stream for hashing.
@@ -81,4 +81,16 @@ pub trait LanguageProfile: Send + Sync {
     /// — when in doubt, preserve the original text rather than
     /// risking over-aggressive matching.
     fn rename_class(&self, node_kind: &str) -> RenameClass;
+
+    /// Context-aware classification hook. Defaults to
+    /// [`Self::rename_class`] on the leaf's own kind, which is correct
+    /// for languages whose grammar uses distinct node kinds for every
+    /// position we care about (e.g. Rust). Languages whose grammar
+    /// reuses the same leaf kind across must-keep and must-rename
+    /// positions (e.g. TypeScript's plain `identifier`, which shows up
+    /// both as a local binding *and* as a JSX element name) override
+    /// this to disambiguate via the leaf's parent chain.
+    fn classify_node(&self, node: &Node<'_>) -> RenameClass {
+        self.rename_class(node.kind())
+    }
 }

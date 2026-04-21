@@ -161,7 +161,7 @@ fn visit(
                 return;
             }
             let kind = node.kind().to_string();
-            let class = profile.rename_class(&kind);
+            let class = profile.classify_node(&node);
             let emitted = match class {
                 RenameClass::Local => {
                     let text_owned = text.to_string();
