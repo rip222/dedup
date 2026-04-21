@@ -18,3 +18,4 @@ dedup-core = { path = "../dedup-core" }
 [dev-dependencies]
 assert_cmd = "2"
 insta = "1"
+tempfile = "3"

@@ -1,0 +1,8 @@
+---
+source: crates/dedup-cli/tests/list_show.rs
+expression: list_stdout
+---
+--- group 1 (3 occurrences) ---
+alpha.rs:5-23
+beta.rs:4-22
+gamma.rs:11-29

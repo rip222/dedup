@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Core detection, normalization, and persistence primitives for dedup."
 
 [dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustc-hash = "2"
 thiserror = "2"
 walkdir = "2"

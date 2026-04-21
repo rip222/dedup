@@ -19,10 +19,12 @@
 //! each testable in isolation. Later milestones add cache (#4), tree-sitter
 //! Tier B (#6), `ignore`-crate layers (#5), parallelism (#14), and so on.
 
+pub mod cache;
 pub mod rolling_hash;
 pub mod scanner;
 pub mod tokenizer;
 
+pub use cache::{Cache, CacheError, CachedOccurrence, GroupDetail, GroupSummary};
 pub use rolling_hash::{Hash, Span};
 pub use scanner::{MatchGroup, Occurrence, ScanConfig, ScanError, ScanResult, Scanner};
 pub use tokenizer::{Token, TokenKind};
