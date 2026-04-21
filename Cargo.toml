@@ -1,6 +1,15 @@
-[package]
-name = "dedup"
+[workspace]
+resolver = "2"
+members = [
+    "crates/dedup-core",
+    "crates/dedup-lang",
+    "crates/dedup-cli",
+    "crates/dedup-gui",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
+license = "MIT OR Apache-2.0"
+authors = ["Ruslan K."]
+repository = "https://github.com/rip222/dedup"

@@ -1,0 +1,10 @@
+[package]
+name = "dedup-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core detection, normalization, and persistence primitives for dedup."
+
+[dependencies]
