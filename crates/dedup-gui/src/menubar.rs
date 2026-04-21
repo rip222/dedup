@@ -90,7 +90,10 @@ fn register_handlers(cx: &mut App) {
     // `StartScan` is no longer a stub — `crate::project_view::register_root`
     // wires it to the real scan pipeline once the root view is created.
     // Firing the action before `register_root` runs is a safe no-op.
-    stub(cx, "Stop Scan (⌘.) — #22", |_: &StopScan, _: &mut App| {});
+    // `StopScan` is no longer a stub — `crate::project_view::register_root`
+    // wires it to the real cancel pipeline once the root view is created.
+    // Firing the action before `register_root` runs (or with no scan in
+    // flight) is a safe no-op.
     stub(cx, "Clear Cache…", |_: &ClearCache, _: &mut App| {});
     stub(
         cx,

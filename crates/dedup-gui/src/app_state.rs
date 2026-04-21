@@ -22,9 +22,11 @@
 //! "no re-scan required".
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use dedup_core::{AtomicProgressSink, Cache, CacheError, Tier};
+use dedup_core::{AtomicProgressSink, Cache, CacheError, MatchGroup, Tier};
 
 /// View-model for one duplicate group as shown in the sidebar.
 ///
@@ -134,10 +136,11 @@ pub enum AppStatus {
 /// are read by the project view to decide what to render at the top of
 /// the sidebar.
 ///
-/// Cancel + streaming updates are deferred to issue #22; the only
-/// transitions that exist today are:
+/// Transitions (#21 + #22):
 ///
 /// - `Idle` → `Running` — the user clicked Scan.
+/// - `Running` → `Cancelling` — user clicked Cancel.
+/// - `Cancelling` → `Idle` — worker acknowledged the cancel flag.
 /// - `Running` → `Completed` — the worker thread returned a result.
 /// - `Completed` → `Idle` — the post-scan banner auto-dismissed.
 #[derive(Debug, Clone, Default)]
@@ -154,6 +157,20 @@ pub enum ScanState {
         /// Shared counters bumped by the scanner's [`AtomicProgressSink`]
         /// and read by the GUI's 250 ms timer.
         progress: AtomicProgressSink,
+        /// Cooperative cancellation flag handed to the scanner. The GUI
+        /// sets this when the user clicks Cancel; the scanner checks it
+        /// between files and returns [`dedup_core::ScanError::Cancelled`]
+        /// at the next stage boundary (issue #22).
+        cancel: Arc<AtomicBool>,
+    },
+    /// Cancel was requested and we're waiting for the worker thread to
+    /// notice the flag and return. Takes effect within ~500 ms on
+    /// realistic workloads (cancel is checked **between files**; see
+    /// [`dedup_core::ScanConfig::cancel`]).
+    Cancelling {
+        /// Wall-clock time the user clicked Cancel. Used to decide
+        /// whether the wait is unreasonably long (cosmetic only).
+        started_at: Instant,
     },
     /// Scan finished; the completion banner is showing (auto-dismisses).
     Completed {
@@ -171,6 +188,17 @@ impl ScanState {
     /// logic — we don't want two scans in flight at once.
     pub fn is_running(&self) -> bool {
         matches!(self, ScanState::Running { .. })
+    }
+
+    /// True while the scanner is still in flight (Running or Cancelling
+    /// — both represent "worker thread alive, user cannot start a new
+    /// scan"). The Scan button uses this to decide enablement; the
+    /// Cancel button uses the stricter [`ScanState::is_running`].
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            ScanState::Running { .. } | ScanState::Cancelling { .. }
+        )
     }
 }
 
@@ -245,6 +273,12 @@ pub struct AppState {
     /// — the sidebar can be `Loaded` while a fresh scan runs to refresh
     /// it.
     pub scan_state: ScanState,
+    /// Streaming Tier A groups surfaced during an in-flight scan
+    /// (issue #22). Rendered in the sidebar while `scan_state ==
+    /// Running`; cleared on `begin_scan` and on cancel. Kept sorted by
+    /// [`impact_key`] — see [`AppState::merge_streaming_groups`] for
+    /// the binary-search insert that preserves stability.
+    pub groups_streaming: Vec<GroupView>,
 }
 
 impl AppState {
@@ -294,35 +328,92 @@ impl AppState {
     }
 
     /// Transition to [`ScanState::Running`] with a fresh
-    /// [`AtomicProgressSink`]. Returns a clone of the sink so the caller
-    /// can hand it to the worker thread.
+    /// [`AtomicProgressSink`] + cancellation flag. Returns the
+    /// [`ScanHandles`] the caller hands to the worker thread.
     ///
     /// This is a no-op (and returns `None`) when a scan is already in
-    /// flight — the Scan button is supposed to be disabled in that case,
-    /// but we guard defensively so a double-click can't fork two scans.
-    pub fn begin_scan(&mut self) -> Option<AtomicProgressSink> {
-        if self.scan_state.is_running() {
+    /// flight — the Scan button is supposed to be disabled in that
+    /// case, but we guard defensively so a double-click can't fork two
+    /// scans. Also clears [`AppState::groups_streaming`] so the new
+    /// scan starts from an empty streaming buffer.
+    pub fn begin_scan(&mut self) -> Option<ScanHandles> {
+        if self.scan_state.is_active() {
             return None;
         }
         let progress = AtomicProgressSink::new();
+        let cancel = Arc::new(AtomicBool::new(false));
         self.scan_state = ScanState::Running {
             started_at: Instant::now(),
             progress: progress.clone(),
+            cancel: cancel.clone(),
         };
-        Some(progress)
+        self.groups_streaming.clear();
+        Some(ScanHandles { progress, cancel })
+    }
+
+    /// Request cooperative cancellation of an in-flight scan.
+    ///
+    /// Flips the cancel flag, transitions state to
+    /// [`ScanState::Cancelling`], and clears the streaming sidebar
+    /// buffer (partial results are discarded per #22 AC). No-op if no
+    /// scan is running. The scanner checks the flag between files and
+    /// returns [`dedup_core::ScanError::Cancelled`] at the next stage
+    /// boundary, which the GUI polling loop interprets as "transition
+    /// back to Idle".
+    pub fn request_cancel(&mut self) {
+        if let ScanState::Running { cancel, .. } = &self.scan_state {
+            cancel.store(true, Ordering::Relaxed);
+            self.scan_state = ScanState::Cancelling {
+                started_at: Instant::now(),
+            };
+            self.groups_streaming.clear();
+        }
+    }
+
+    /// Finalize a cancelled scan: drop the streaming buffer and return
+    /// to Idle. Called by the GUI polling loop when the worker thread
+    /// surfaces [`dedup_core::ScanError::Cancelled`] or disconnects
+    /// without a result during Cancelling.
+    pub fn cancel_completed(&mut self) {
+        self.groups_streaming.clear();
+        self.scan_state = ScanState::Idle;
     }
 
     /// Transition to [`ScanState::Completed`] with the given counts.
     ///
     /// The GUI calls this once the worker thread's result arrives; after
     /// the banner's auto-dismiss timer fires, [`Self::dismiss_completion`]
-    /// drops back to `Idle`.
+    /// drops back to `Idle`. Streaming buffer is cleared — by this point
+    /// the sidebar has been reloaded from the freshly-written cache and
+    /// the streaming buffer is redundant.
     pub fn finish_scan(&mut self, group_count: usize, file_count: usize, duration: Duration) {
+        self.groups_streaming.clear();
         self.scan_state = ScanState::Completed {
             group_count,
             file_count,
             duration,
         };
+    }
+
+    /// Merge a batch of streaming Tier A groups into
+    /// [`Self::groups_streaming`] while preserving the Impact-desc sort
+    /// order. Uses `binary_search_by` + `insert` so already-rendered
+    /// entries stay in place ("no visible shuffle" per #22 AC).
+    ///
+    /// Duplicate ids (same cache-row id already present) are ignored —
+    /// re-delivery of an already-rendered group is a no-op.
+    pub fn merge_streaming_groups(&mut self, incoming: Vec<GroupView>) {
+        for g in incoming {
+            if self.groups_streaming.iter().any(|x| x.id == g.id) {
+                continue;
+            }
+            let key = impact_key(&g);
+            let pos = self
+                .groups_streaming
+                .binary_search_by(|probe| impact_key(probe).cmp(&key))
+                .unwrap_or_else(|e| e);
+            self.groups_streaming.insert(pos, g);
+        }
     }
 
     /// Drop the completion banner and return to the idle state. Called
@@ -331,6 +422,68 @@ impl AppState {
         if matches!(self.scan_state, ScanState::Completed { .. }) {
             self.scan_state = ScanState::Idle;
         }
+    }
+}
+
+/// Shared handles handed to the scanner worker thread.
+///
+/// Groups the progress sink and the cancellation flag so the caller can
+/// pass one value around instead of two parallel arguments. Cheap to
+/// clone — every field is an `Arc`.
+#[derive(Debug, Clone)]
+pub struct ScanHandles {
+    pub progress: AtomicProgressSink,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Impact-desc sort key for streaming sidebar entries.
+///
+/// Impact is `occurrence_count * total_line_count` summed across all
+/// occurrences — a cheap proxy for "how much duplicated code is in this
+/// group". Higher impact groups sort first; ties break by **ascending**
+/// hex label so the key is total and deterministic given a fixed group
+/// set (no visible shuffle during streaming).
+///
+/// The returned key is shaped so `impact_key(a).cmp(&impact_key(b))`
+/// does the right thing directly — higher impact yields a *smaller*
+/// key (via `Reverse`-like inversion through `u64::MAX - impact`),
+/// which sorts first under ascending `Ord`.
+pub fn impact_key(group: &GroupView) -> (u64, String) {
+    let total_lines: u64 = group
+        .occurrences
+        .iter()
+        .map(|o| (o.end_line.saturating_sub(o.start_line).saturating_add(1)).max(0) as u64)
+        .sum();
+    let impact = (group.occurrences.len() as u64).saturating_mul(total_lines);
+    // Invert impact for ascending sort = descending impact order.
+    let inv = u64::MAX - impact;
+    (inv, group.label.clone())
+}
+
+/// Convert a core [`MatchGroup`] into the GUI's [`GroupView`] — used by
+/// the Tier A streaming callback. `id` is negative so it can't collide
+/// with cache-row ids (which come from SQLite's `INTEGER PRIMARY KEY`
+/// and are always `>= 1`). A scan that later completes and reloads the
+/// sidebar from the cache will replace these rows with real-id rows.
+pub fn group_view_from_match(group: &MatchGroup, index: usize) -> GroupView {
+    let occurrences: Vec<OccurrenceView> = group
+        .occurrences
+        .iter()
+        .map(|o| OccurrenceView {
+            path: o.path.clone(),
+            start_line: o.span.start_line as i64,
+            end_line: o.span.end_line as i64,
+        })
+        .collect();
+    let label = group_label(group.tier, None, None, occurrences.first());
+    GroupView {
+        // Negative sentinel ids keep streaming rows distinguishable from
+        // cache-backed rows. The index keeps each streaming id unique
+        // within the current scan (same scan can emit many groups).
+        id: -1 - index as i64,
+        tier: group.tier,
+        label,
+        occurrences,
     }
 }
 
@@ -735,17 +888,23 @@ mod tests {
     #[test]
     fn begin_scan_transitions_idle_to_running() {
         let mut s = AppState::new();
-        let sink = s.begin_scan().expect("idle → running must succeed");
+        let handles = s.begin_scan().expect("idle → running must succeed");
         assert!(s.scan_state.is_running());
         // Sink handed back to the caller must be the same one held in
         // state — otherwise the worker thread bumps one set of counters
         // and the UI polls a different set.
         match &s.scan_state {
-            ScanState::Running { progress, .. } => {
+            ScanState::Running {
+                progress, cancel, ..
+            } => {
                 progress
                     .files_scanned
                     .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
-                assert_eq!(sink.files_scanned(), 3);
+                assert_eq!(handles.progress.files_scanned(), 3);
+                // Cancel flag must be shared Arc — flipping the one held
+                // in state is visible to the handle.
+                cancel.store(true, Ordering::Relaxed);
+                assert!(handles.cancel.load(Ordering::Relaxed));
             }
             _ => unreachable!(),
         }
@@ -758,6 +917,57 @@ mod tests {
         // Second call while still running must refuse to clobber state.
         assert!(s.begin_scan().is_none());
         assert!(s.scan_state.is_running());
+    }
+
+    #[test]
+    fn begin_scan_clears_streaming_buffer() {
+        let mut s = AppState::new();
+        s.groups_streaming = vec![GroupView {
+            id: -1,
+            tier: Tier::A,
+            label: "leftover".into(),
+            occurrences: vec![occ("x.rs", 1, 2)],
+        }];
+        let _ = s.begin_scan().unwrap();
+        assert!(s.groups_streaming.is_empty());
+    }
+
+    #[test]
+    fn request_cancel_flips_flag_and_transitions_to_cancelling() {
+        // The cancel flag must be the same Arc handed to the worker
+        // thread, otherwise the scanner never sees the flip and the
+        // 500 ms latency goal is unreachable.
+        let mut s = AppState::new();
+        let handles = s.begin_scan().unwrap();
+        s.request_cancel();
+        assert!(
+            handles.cancel.load(Ordering::Relaxed),
+            "request_cancel must flip the shared flag"
+        );
+        assert!(matches!(s.scan_state, ScanState::Cancelling { .. }));
+    }
+
+    #[test]
+    fn cancel_completed_returns_to_idle_and_clears_stream() {
+        let mut s = AppState::new();
+        let _ = s.begin_scan();
+        s.merge_streaming_groups(vec![GroupView {
+            id: -1,
+            tier: Tier::A,
+            label: "x".into(),
+            occurrences: vec![occ("x.rs", 1, 10)],
+        }]);
+        s.request_cancel();
+        s.cancel_completed();
+        assert!(matches!(s.scan_state, ScanState::Idle));
+        assert!(s.groups_streaming.is_empty());
+    }
+
+    #[test]
+    fn request_cancel_is_noop_when_idle() {
+        let mut s = AppState::new();
+        s.request_cancel();
+        assert!(matches!(s.scan_state, ScanState::Idle));
     }
 
     #[test]
@@ -795,6 +1005,97 @@ mod tests {
         let _ = s.begin_scan();
         s.dismiss_completion();
         assert!(s.scan_state.is_running());
+    }
+
+    // -------------------------------------------------------------------
+    // Impact-sort stability (issue #22).
+    //
+    // The streaming sidebar merges Tier A groups as they arrive; the
+    // acceptance criterion requires "no visible shuffle". We prove that
+    // by showing the binary-search-insert order equals the
+    // sort-everything-at-once order for a shuffled input set.
+    // -------------------------------------------------------------------
+
+    fn streaming_group(id: i64, occurrences: Vec<OccurrenceView>) -> GroupView {
+        GroupView {
+            id,
+            tier: Tier::A,
+            // Label participates in the tiebreak; using the id makes
+            // the ordering deterministic when impact collides.
+            label: format!("g{id}"),
+            occurrences,
+        }
+    }
+
+    #[test]
+    fn impact_key_is_higher_for_more_duplicated_code() {
+        let small = streaming_group(1, vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5)]);
+        let big = streaming_group(
+            2,
+            vec![occ("a.rs", 1, 50), occ("b.rs", 1, 50), occ("c.rs", 1, 50)],
+        );
+        // Ascending key means descending impact: big.key < small.key.
+        assert!(impact_key(&big) < impact_key(&small));
+    }
+
+    #[test]
+    fn streaming_merge_stays_sorted_no_matter_the_arrival_order() {
+        // Build a small corpus of groups with known impact values.
+        let gs = vec![
+            streaming_group(1, vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5)]), // impact 12
+            streaming_group(2, vec![occ("c.rs", 1, 20), occ("d.rs", 1, 20)]), // impact 84
+            streaming_group(3, vec![occ("e.rs", 1, 3), occ("f.rs", 1, 3)]), // impact 8
+            streaming_group(
+                4,
+                vec![occ("g.rs", 1, 10), occ("h.rs", 1, 10), occ("i.rs", 1, 10)],
+            ), // impact 99
+            streaming_group(5, vec![occ("j.rs", 1, 7), occ("k.rs", 1, 7)]), // impact 28
+        ];
+
+        // Reference: sort the full set at once.
+        let mut reference = gs.clone();
+        reference.sort_by_key(impact_key);
+        let expected_ids: Vec<i64> = reference.iter().map(|g| g.id).collect();
+
+        // Streaming: merge the same groups one-at-a-time in a shuffled
+        // order. Every intermediate state must also be sorted (no
+        // visible shuffle) and the final state must match the
+        // reference.
+        let shuffles: Vec<Vec<usize>> = vec![
+            vec![0, 1, 2, 3, 4],
+            vec![4, 3, 2, 1, 0],
+            vec![2, 0, 4, 1, 3],
+            vec![3, 1, 4, 0, 2],
+        ];
+        for order in shuffles {
+            let mut s = AppState::new();
+            for i in order {
+                s.merge_streaming_groups(vec![gs[i].clone()]);
+                // Intermediate invariant: groups_streaming is always
+                // sorted by impact_key ascending.
+                let keys: Vec<_> = s.groups_streaming.iter().map(impact_key).collect();
+                let mut sorted = keys.clone();
+                sorted.sort();
+                assert_eq!(
+                    keys, sorted,
+                    "streaming buffer must stay sorted after every insert"
+                );
+            }
+            let got_ids: Vec<i64> = s.groups_streaming.iter().map(|g| g.id).collect();
+            assert_eq!(
+                got_ids, expected_ids,
+                "binary-search insert order must equal full-sort order"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_merge_ignores_duplicate_ids() {
+        let mut s = AppState::new();
+        let g = streaming_group(1, vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5)]);
+        s.merge_streaming_groups(vec![g.clone()]);
+        s.merge_streaming_groups(vec![g.clone()]);
+        assert_eq!(s.groups_streaming.len(), 1);
     }
 
     #[test]

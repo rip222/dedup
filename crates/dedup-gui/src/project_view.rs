@@ -26,10 +26,12 @@ use gpui::{Context, MouseButton, Window, black, div, prelude::*, px, rgb, white}
 
 use crate::app_state::{
     AppState, AppStatus, GroupView, ScanState, SuppressionView, format_completion_banner,
-    format_elapsed, load_folder,
+    format_elapsed, group_view_from_match, load_folder,
 };
-use crate::menubar::{OpenFolder, StartScan};
-use dedup_core::{Cache, Config, ScanConfig, ScanResult, Scanner};
+use crate::menubar::{OpenFolder, StartScan, StopScan};
+use dedup_core::{
+    Cache, Config, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, TierAStreamCallback,
+};
 
 // Colors pulled out so the whole view uses one palette — the empty-state
 // view already picked `0x1e1e22` as the background, so we match.
@@ -46,12 +48,31 @@ const BANNER_TEXT: u32 = 0xd1fae5;
 const PROGRESS_BAR_BG: u32 = 0x2d2d35;
 const PROGRESS_BAR_FG: u32 = 0x3b82f6;
 
+/// Events the scan worker thread sends back to the GUI poll loop.
+///
+/// `TierAStream` may arrive once per scan (the single final-membership
+/// pulse the scanner emits before Tier B promotion). `Completed` or
+/// `Cancelled` arrive exactly once and terminate the stream. A
+/// disconnected channel without a terminator — e.g. the worker panicked
+/// — is treated as `Cancelled` by the poll loop.
+#[derive(Debug)]
+enum ScanEvent {
+    /// Tier A groups at final membership (issue #22 streaming).
+    TierAStream(Vec<GroupView>),
+    /// Scan finished normally. Wraps the full [`ScanResult`] so the
+    /// sidebar can be refreshed from the cache rows written afterward.
+    Completed(ScanResult),
+    /// Scanner returned [`ScanError::Cancelled`] in response to the
+    /// shared cancel flag.
+    Cancelled,
+}
+
 /// Scan-thread → GUI-thread handoff channel.
 ///
-/// The worker thread sends exactly one [`ScanResult`] on success (or
-/// swallows the error and sends nothing — the 250 ms timer sees a
-/// disconnected channel and transitions back to Idle either way).
-type ScanResultRx = Arc<Mutex<Option<mpsc::Receiver<ScanResult>>>>;
+/// The worker thread may send one [`ScanEvent::TierAStream`] (optional)
+/// followed by exactly one terminator ([`ScanEvent::Completed`] or
+/// [`ScanEvent::Cancelled`]).
+type ScanEventRx = Arc<Mutex<Option<mpsc::Receiver<ScanEvent>>>>;
 
 /// How often the GUI polls the shared progress counters while a scan is
 /// running. The PRD / issue #21 calls for "~250 ms update cadence" — we
@@ -72,7 +93,7 @@ pub struct ProjectView {
     /// Receiver half of the scan-thread → GUI-thread channel. `None` when
     /// no scan is in flight. Stored behind an `Arc<Mutex<_>>` so the
     /// 250 ms polling task can poll it without taking `&mut self`.
-    scan_rx: ScanResultRx,
+    scan_rx: ScanEventRx,
 }
 
 impl ProjectView {
@@ -109,12 +130,12 @@ impl ProjectView {
     /// No-op when there's no current folder, or when a scan is already
     /// running (defensive — the UI disables the button in that case).
     ///
-    /// Issue #21 wiring; cancel + streaming updates land in #22.
+    /// Issue #21 wiring; cancel + Tier A streaming added in #22.
     pub fn start_scan(&mut self, cx: &mut Context<Self>) {
         let Some(folder) = self.state.current_folder.clone() else {
             return;
         };
-        let Some(progress) = self.state.begin_scan() else {
+        let Some(handles) = self.state.begin_scan() else {
             // Already running — ignore the re-entry.
             return;
         };
@@ -122,11 +143,13 @@ impl ProjectView {
         // Spawn the worker thread. Clone the `Arc`s so it owns them for
         // the life of the scan; the `ProgressSink` impl on
         // `AtomicProgressSink` is `Send + Sync`.
-        let (tx, rx) = mpsc::channel::<ScanResult>();
+        let (tx, rx) = mpsc::channel::<ScanEvent>();
         *self.scan_rx.lock().unwrap() = Some(rx);
 
         let worker_folder = folder.clone();
-        let worker_progress = progress.clone();
+        let worker_progress = handles.progress.clone();
+        let worker_cancel = handles.cancel.clone();
+        let worker_tx = tx.clone();
         thread::spawn(move || {
             // Build a ScanConfig that matches the CLI's defaults: honour
             // any `.dedup/config.toml` the user has in place, then pin the
@@ -134,10 +157,34 @@ impl ProjectView {
             let config = Config::load(Some(&worker_folder)).unwrap_or_default();
             let mut scan_cfg = ScanConfig::from(&config);
             scan_cfg.cache_root = Some(worker_folder.clone());
-            let scanner = Scanner::new(scan_cfg);
+            scan_cfg.cancel = Some(worker_cancel.clone());
 
+            // Wire the Tier A streaming callback to the GUI channel.
+            // The callback fires exactly once on the worker thread
+            // (after bucket-fill, before Tier B) and forwards the
+            // finalized Tier A set as `GroupView` rows ready for the
+            // sidebar's impact-sorted merge.
+            let stream_tx = worker_tx.clone();
+            let cb: TierAStreamCallback = std::sync::Arc::new(move |groups: &[MatchGroup]| {
+                let views: Vec<GroupView> = groups
+                    .iter()
+                    .enumerate()
+                    .map(|(i, g)| group_view_from_match(g, i))
+                    .collect();
+                // Best-effort — if the poll loop has already dropped
+                // the rx we just swallow the send.
+                let _ = stream_tx.send(ScanEvent::TierAStream(views));
+            });
+            scan_cfg.on_tier_a_groups = Some(cb);
+
+            let scanner = Scanner::new(scan_cfg);
             let result = match scanner.scan_with_progress(&worker_folder, &worker_progress) {
                 Ok(r) => r,
+                Err(ScanError::Cancelled) => {
+                    log::info!("dedup-gui: scan cancelled for {}", worker_folder.display());
+                    let _ = worker_tx.send(ScanEvent::Cancelled);
+                    return;
+                }
                 Err(e) => {
                     log::warn!(
                         "dedup-gui: scan failed for {}: {e}",
@@ -174,8 +221,9 @@ impl ProjectView {
 
             // Send is best-effort — if the GUI already swapped the rx
             // out (e.g. user closed the window) we drop the result.
-            let _ = tx.send(result);
+            let _ = worker_tx.send(ScanEvent::Completed(result));
         });
+        drop(tx);
 
         // Polling loop on the foreground (per-entity) executor. `cx.spawn`
         // gives us an `AsyncApp` we can use to `update` the entity; the
@@ -185,65 +233,106 @@ impl ProjectView {
             loop {
                 cx.background_executor().timer(PROGRESS_POLL_INTERVAL).await;
 
-                // Try to pull a completion message off the channel; if
-                // one arrives, transition to Completed and refresh the
-                // sidebar. Otherwise just `notify()` so the progress bar
-                // redraws with fresh counters.
-                let result = {
-                    let mut guard = rx_handle.lock().unwrap();
-                    match guard.as_ref() {
-                        Some(rx) => match rx.try_recv() {
-                            Ok(r) => {
-                                *guard = None;
-                                Some(Ok(r))
-                            }
-                            Err(mpsc::TryRecvError::Empty) => None,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                *guard = None;
-                                Some(Err(()))
-                            }
-                        },
-                        None => Some(Err(())),
-                    }
-                };
+                // Drain everything currently on the channel in one go.
+                // The 250 ms cadence means we expect at most a handful
+                // of events per tick (1 streaming pulse + 1 terminator
+                // in the common case).
+                let events = drain_channel(&rx_handle);
 
-                match result {
-                    None => {
-                        // Still running — repaint the progress bar.
-                        if this.update(cx, |_, cx| cx.notify()).is_err() {
-                            return; // entity dropped; stop the loop.
-                        }
-                    }
-                    Some(Ok(scan_result)) => {
-                        // Scan returned a result — apply it + kick off
-                        // the banner auto-dismiss timer, then exit the
-                        // poll loop.
-                        let update = this.update(cx, |view, cx| {
-                            apply_scan_result(view, scan_result, cx);
-                        });
-                        if update.is_err() {
-                            return;
-                        }
-                        spawn_banner_dismiss(this, cx).await;
-                        return;
-                    }
-                    Some(Err(())) => {
-                        // Channel dropped without a message — worker
-                        // failed before sending. Clear the running
-                        // state so the button re-enables.
-                        let _ = this.update(cx, |view, cx| {
-                            if view.state.scan_state.is_running() {
-                                view.state.scan_state = ScanState::Idle;
+                let mut terminated = false;
+                for event in events {
+                    match event {
+                        ScanEvent::TierAStream(groups) => {
+                            let update = this.update(cx, |view, cx| {
+                                view.state.merge_streaming_groups(groups);
                                 cx.notify();
+                            });
+                            if update.is_err() {
+                                return;
                             }
-                        });
-                        return;
+                        }
+                        ScanEvent::Completed(scan_result) => {
+                            let update = this.update(cx, |view, cx| {
+                                apply_scan_result(view, scan_result, cx);
+                            });
+                            if update.is_err() {
+                                return;
+                            }
+                            spawn_banner_dismiss(this.clone(), cx).await;
+                            terminated = true;
+                            break;
+                        }
+                        ScanEvent::Cancelled => {
+                            let _ = this.update(cx, |view, cx| {
+                                view.state.cancel_completed();
+                                cx.notify();
+                            });
+                            terminated = true;
+                            break;
+                        }
                     }
+                }
+
+                if terminated {
+                    return;
+                }
+
+                // Channel dropped without a terminator → worker
+                // panicked. Clear the active state so buttons re-enable.
+                if rx_handle.lock().unwrap().is_none() {
+                    let _ = this.update(cx, |view, cx| {
+                        if view.state.scan_state.is_active() {
+                            view.state.cancel_completed();
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+
+                // Nothing to apply beyond a repaint of the progress bar.
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
                 }
             }
         })
         .detach();
     }
+
+    /// Request cooperative cancel of the in-flight scan. Flips the
+    /// shared cancel flag (the scanner checks it between files) and
+    /// transitions state to [`ScanState::Cancelling`]. The poll loop
+    /// turns the subsequent `ScanEvent::Cancelled` into the
+    /// Idle transition + sidebar restore.
+    pub fn request_cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.state.scan_state.is_running() {
+            return;
+        }
+        self.state.request_cancel();
+        cx.notify();
+    }
+}
+
+/// Drain every currently-buffered [`ScanEvent`] off the channel. On
+/// disconnect the receiver is dropped (set to `None`) so the poll loop
+/// can notice and tear down cleanly. Factored out of the poll loop so
+/// the lock scope is tight and doesn't straddle `.await` points.
+fn drain_channel(rx: &ScanEventRx) -> Vec<ScanEvent> {
+    let mut out = Vec::new();
+    let mut guard = rx.lock().unwrap();
+    let disconnected = loop {
+        let Some(receiver) = guard.as_ref() else {
+            break true;
+        };
+        match receiver.try_recv() {
+            Ok(e) => out.push(e),
+            Err(mpsc::TryRecvError::Empty) => break false,
+            Err(mpsc::TryRecvError::Disconnected) => break true,
+        }
+    };
+    if disconnected {
+        *guard = None;
+    }
+    out
 }
 
 /// Fold a completed [`ScanResult`] into the view: transition state to
@@ -348,6 +437,18 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
         };
         entity.update(cx, |view, cx| {
             view.start_scan(cx);
+        });
+    });
+
+    // `StopScan` (⌘. / Scan → Stop Scan) — cooperative cancel for an
+    // in-flight scan (issue #22). No-op when no scan is running so
+    // repeated fires are safe.
+    cx.on_action(|_: &StopScan, cx: &mut gpui::App| {
+        let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() else {
+            return;
+        };
+        entity.update(cx, |view, cx| {
+            view.request_cancel(cx);
         });
     });
 }
@@ -542,32 +643,44 @@ fn render_folder_footer(state: &AppState) -> gpui::Div {
 /// state) and on the Empty / NoDuplicates empty-state panels so the user
 /// can kick off a scan regardless of cache state.
 ///
-/// Disabled (dim + non-clickable) when no folder is open or a scan is
-/// already running. The click handler dispatches `StartScan`, which
-/// `register_root` routes to [`ProjectView::start_scan`].
+/// While a scan is in flight the button flips to a "Cancel" button that
+/// dispatches [`StopScan`] (issue #22). In Cancelling state the button
+/// dims to indicate the cancel has been acknowledged — further clicks
+/// are no-ops.
 fn render_scan_button(state: &AppState) -> gpui::Div {
-    let enabled = state.current_folder.is_some() && !state.scan_state.is_running();
-    let label = if state.scan_state.is_running() {
-        "Scanning\u{2026}"
-    } else {
-        "Scan"
-    };
+    let has_folder = state.current_folder.is_some();
     let base = div()
         .px(px(20.0))
         .py(px(8.0))
         .rounded(px(6.0))
         .text_size(px(13.0))
-        .text_color(white())
-        .child(label);
-    if enabled {
-        base.bg(rgb(ACCENT))
+        .text_color(white());
+
+    match &state.scan_state {
+        ScanState::Running { .. } => {
+            // Active scan — button doubles as Cancel.
+            base.child("Cancel")
+                .bg(rgb(ACCENT))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.dispatch_action(Box::new(StopScan), cx);
+                })
+        }
+        ScanState::Cancelling { .. } => base
+            .child("Cancelling\u{2026}")
+            .bg(rgb(ACCENT_DIM))
+            .text_color(rgb(ROW_TEXT_DIM)),
+        _ if !has_folder => base
+            .child("Scan")
+            .bg(rgb(ACCENT_DIM))
+            .text_color(rgb(ROW_TEXT_DIM)),
+        _ => base
+            .child("Scan")
+            .bg(rgb(ACCENT))
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                 window.dispatch_action(Box::new(StartScan), cx);
-            })
-    } else {
-        // Greyed-out, no click handler.
-        base.bg(rgb(ACCENT_DIM)).text_color(rgb(ROW_TEXT_DIM))
+            }),
     }
 }
 
@@ -585,8 +698,24 @@ fn render_loaded(state: &AppState) -> gpui::Div {
 }
 
 fn render_sidebar(state: &AppState) -> gpui::Div {
-    let tier_b: Vec<&GroupView> = state.tier_b_groups().collect();
-    let tier_a: Vec<&GroupView> = state.tier_a_groups().collect();
+    // While a scan is running, render Tier A groups from the streaming
+    // buffer (final-membership pulses, sorted by Impact). Tier B rows
+    // are only known after Tier B completes, so we keep the existing
+    // cache-backed Tier B section visible — it will be replaced by
+    // `apply_scan_result` when the scan finishes. Cancelling + Idle use
+    // the cache-backed view.
+    let (tier_a, tier_b): (Vec<&GroupView>, Vec<&GroupView>) =
+        if matches!(state.scan_state, ScanState::Running { .. }) {
+            (
+                state.groups_streaming.iter().collect(),
+                state.tier_b_groups().collect(),
+            )
+        } else {
+            (
+                state.tier_a_groups().collect(),
+                state.tier_b_groups().collect(),
+            )
+        };
 
     div()
         .w(px(320.0))
@@ -732,7 +861,9 @@ fn render_scan_overlay(state: &AppState) -> Option<gpui::Div> {
         ScanState::Running {
             started_at,
             progress,
+            ..
         } => Some(render_progress_banner(*started_at, progress)),
+        ScanState::Cancelling { started_at } => Some(render_cancelling_banner(*started_at)),
         ScanState::Completed {
             group_count,
             file_count,
@@ -743,6 +874,29 @@ fn render_scan_overlay(state: &AppState) -> Option<gpui::Div> {
             *duration,
         )),
     }
+}
+
+fn render_cancelling_banner(started_at: Instant) -> gpui::Div {
+    // Mirror of `render_progress_banner` styling so the banner shape
+    // doesn't jump — only the copy changes. The elapsed counter shows
+    // "time since the user clicked Cancel" so a slow cancel is visible.
+    let elapsed = format_elapsed(started_at.elapsed());
+    div()
+        .w_full()
+        .bg(rgb(ACCENT_DIM))
+        .px(px(12.0))
+        .py(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .border_b_1()
+        .border_color(black())
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(ROW_TEXT))
+                .child(format!("Cancelling\u{2026} ({elapsed})")),
+        )
 }
 
 fn render_progress_banner(

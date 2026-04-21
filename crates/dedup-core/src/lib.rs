@@ -39,5 +39,6 @@ pub use rolling_hash::{Hash, Span};
 pub use scanner::{
     AtomicProgressSink, FileIssue, FileIssueCounts, FileIssueKind, MatchGroup, NoopSink,
     Occurrence, ProgressSink, ScanConfig, ScanError, ScanResult, Scanner, Tier,
+    TierAStreamCallback,
 };
 pub use tokenizer::{Token, TokenKind};

@@ -45,6 +45,7 @@ fn tuned_scan_config(mode: NormalizationMode) -> ScanConfig {
         normalization: mode,
         jobs: None,
         cache_root: None,
+        ..ScanConfig::default()
     }
 }
 

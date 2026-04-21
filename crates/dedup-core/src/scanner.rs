@@ -57,12 +57,19 @@ use std::hash::Hasher;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use tree_sitter::Parser;
 
 /// The rolling-hash window size. Matches the Tier A `min_tokens` default.
 const WINDOW_SIZE: usize = 50;
+
+/// Tier A streaming callback (issue #22).
+///
+/// Fires exactly once per scan with the finalized Tier A group set,
+/// before Tier B runs. See [`ScanConfig::on_tier_a_groups`].
+pub type TierAStreamCallback = std::sync::Arc<dyn Fn(&[MatchGroup]) + Send + Sync>;
 
 /// Errors the scanner can emit. All per-file errors today are silently
 /// skipped; this enum exists so the API surface is stable as later issues
@@ -76,6 +83,11 @@ pub enum ScanError {
         #[source]
         source: ignore::Error,
     },
+    /// A cooperative cancel was requested via
+    /// [`ScanConfig::cancel`]. Partial work is discarded and callers are
+    /// expected to revert to their previous state (see issue #22).
+    #[error("scan cancelled")]
+    Cancelled,
 }
 
 /// Which detection pass emitted a [`MatchGroup`].
@@ -190,7 +202,7 @@ impl FileIssueCounts {
 
 /// Tunable scanner knobs. Defaults mirror the Tier A / Tier B thresholds
 /// from the PRD.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ScanConfig {
     /// Tier A: a match span must cover at least this many lines to be
     /// reported.
@@ -236,6 +248,51 @@ pub struct ScanConfig {
     /// default) disables the cache path entirely — the scanner
     /// behaves exactly as it did pre-#14.
     pub cache_root: Option<PathBuf>,
+    /// Optional cooperative cancellation flag (issue #22). When set by
+    /// the caller, the scanner checks it between per-file tasks and
+    /// returns [`ScanError::Cancelled`] at the next boundary.
+    ///
+    /// Cancellation is cooperative and coarse-grained: we check
+    /// **between files**, not mid-file. A scan blocked inside a very
+    /// large `tokenize` / tree-sitter parse will not abort until that
+    /// file's task finishes. For realistic workloads this stays well
+    /// under the 500 ms target called out by the GUI's Cancel button.
+    pub cancel: Option<std::sync::Arc<AtomicBool>>,
+    /// Optional streaming hook fired once with the finalized Tier A
+    /// groups, before Tier B is executed (issue #22).
+    ///
+    /// The callback is invoked **at most once** per scan, right after
+    /// the bucket-fill / greedy-extension / promotion-eligible Tier A
+    /// set is known — i.e. at *final membership*. Groups emitted here
+    /// may later be trimmed or removed by the Tier A → B promotion
+    /// step, but their own membership is stable. The GUI uses this
+    /// single pulse to render Tier A groups during the scan without
+    /// mid-stream "group grew from 2 to 3" shuffles.
+    pub on_tier_a_groups: Option<TierAStreamCallback>,
+}
+
+// Manual Debug: the streaming callback + cancel flag are not useful to
+// print, but the rest of the config is. Keeping the derive would force
+// callers to come up with a `Debug` impl for `Arc<dyn Fn>`.
+impl std::fmt::Debug for ScanConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanConfig")
+            .field("tier_a_min_lines", &self.tier_a_min_lines)
+            .field("tier_a_min_tokens", &self.tier_a_min_tokens)
+            .field("tier_b_min_lines", &self.tier_b_min_lines)
+            .field("tier_b_min_tokens", &self.tier_b_min_tokens)
+            .field("max_file_size", &self.max_file_size)
+            .field("follow_symlinks", &self.follow_symlinks)
+            .field("include_submodules", &self.include_submodules)
+            .field("no_gitignore", &self.no_gitignore)
+            .field("ignore_all", &self.ignore_all)
+            .field("normalization", &self.normalization)
+            .field("jobs", &self.jobs)
+            .field("cache_root", &self.cache_root)
+            .field("cancel", &self.cancel.is_some())
+            .field("on_tier_a_groups", &self.on_tier_a_groups.is_some())
+            .finish()
+    }
 }
 
 impl Default for ScanConfig {
@@ -253,6 +310,8 @@ impl Default for ScanConfig {
             normalization: NormalizationMode::Conservative,
             jobs: None,
             cache_root: None,
+            cancel: None,
+            on_tier_a_groups: None,
         }
     }
 }
@@ -272,6 +331,8 @@ impl From<&crate::config::Config> for ScanConfig {
             normalization: cfg.normalization.into(),
             jobs: None,
             cache_root: None,
+            cancel: None,
+            on_tier_a_groups: None,
         }
     }
 }
@@ -612,7 +673,19 @@ impl Scanner {
         // panicking grammar does not abort the scan. Wrapping that narrowly
         // (just the Tier B grammar work) keeps the blast radius tight — the
         // PRD-specified contract per issue #17.
+        // Cooperative cancellation (issue #22): checked once at task
+        // entry. Cancelled tasks return `Ok(None)` so they're filtered
+        // out cleanly alongside binary-sniff skips; the outer driver
+        // looks at the same flag after the parallel stage and returns
+        // [`ScanError::Cancelled`].
+        let cancel_flag = self.config.cancel.clone();
+        let cancel_ref = cancel_flag.as_ref();
         let process = |(abs, rel): &(PathBuf, PathBuf)| -> Result<Option<FileOutput>, FileIssue> {
+            if let Some(flag) = cancel_ref
+                && flag.load(Ordering::Relaxed)
+            {
+                return Ok(None);
+            }
             let meta = std::fs::metadata(abs).ok();
             let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
             let mtime = meta
@@ -744,6 +817,17 @@ impl Scanner {
                 }
             }
         };
+
+        // Cancellation check after the parallel stage completes. Any
+        // in-flight tasks that already passed the entry-guard will have
+        // returned `Ok(None)` once the flag was flipped; here we abort
+        // the rest of the pipeline and discard partial state.
+        if let Some(flag) = cancel_ref
+            && flag.load(Ordering::Relaxed)
+        {
+            info!("scan: cancelled after per-file stage");
+            return Err(ScanError::Cancelled);
+        }
 
         // Collapse into the scanner's internal file_bundle + per_file_hashes
         // shape. Order is preserved from `candidates`, which we sorted by
@@ -1002,6 +1086,27 @@ impl Scanner {
                 }
             })
             .collect();
+
+        // Streaming pulse (issue #22): publish the Tier A set at final
+        // membership — i.e. after bucket-fill + greedy-extension +
+        // filtering, but before Tier A → B promotion possibly trims it.
+        // Called at most once per scan. The GUI consumes this to paint
+        // the sidebar during the scan without mid-stream membership
+        // shuffles; the callback is responsible for its own ordering
+        // (the GUI sorts by Impact — see `app_state::impact_key`).
+        if let Some(cb) = self.config.on_tier_a_groups.as_ref() {
+            cb(&tier_a_groups);
+        }
+
+        // Cancellation check before the (potentially slow) Tier B pass.
+        // Tier B parse work is not instrumented with cancel checks —
+        // cooperative cancel is between files/stages, not mid-parser.
+        if let Some(flag) = cancel_ref
+            && flag.load(Ordering::Relaxed)
+        {
+            info!("scan: cancelled after tier A");
+            return Err(ScanError::Cancelled);
+        }
 
         // --- 7. Tier B: tree-sitter-backed syntactic-unit matching. -----
         let (tier_b_groups, tier_b_issues) = self.run_tier_b(&per_file);
@@ -1714,6 +1819,116 @@ mod tests {
         assert!(sink.files_scanned() >= 2, "both files should be counted");
         assert_eq!(sink.matches(), result.groups.len());
         assert!(sink.matches() >= 1, "identical files produce ≥ 1 group");
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #22 — cooperative cancellation + Tier A streaming callback.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn cancel_flag_before_scan_aborts_with_cancelled() {
+        // The simplest cancel-path: the flag is already set before any
+        // file task runs. Every task hits the entry guard and bails,
+        // then the post-parallel cancel check returns
+        // `ScanError::Cancelled`. No partial groups are returned and
+        // no cache is written.
+        let dir = tempdir().unwrap();
+        // Populate the directory with enough material to actually
+        // produce a Tier A group under a non-cancelled run — this
+        // proves cancellation genuinely suppressed work, not that the
+        // corpus was empty.
+        let body: String = (0..80)
+            .map(|i| format!("let shared_{i} = {i};\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        for i in 0..10 {
+            fs::write(dir.path().join(format!("f{i}.rs")), &body).unwrap();
+        }
+        let flag = std::sync::Arc::new(AtomicBool::new(true));
+
+        let cfg = ScanConfig {
+            cancel: Some(flag),
+            jobs: Some(1),
+            ..ScanConfig::default()
+        };
+        let scanner = Scanner::new(cfg);
+        let err = scanner.scan(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, ScanError::Cancelled),
+            "pre-set cancel flag must abort the scan"
+        );
+    }
+
+    #[test]
+    fn cancel_flag_flipped_mid_walk_aborts_before_tier_b() {
+        // Flip the cancel flag from inside the Tier A streaming
+        // callback — i.e. *after* the per-file pass has already
+        // finished. The subsequent stage-boundary check must see the
+        // flag and short-circuit with `Cancelled`, proving mid-run
+        // cancellation is wired at stage boundaries (not only at
+        // startup).
+        let dir = tempdir().unwrap();
+        let body: String = (0..80)
+            .map(|i| format!("let shared_{i} = {i};\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        fs::write(dir.path().join("a.rs"), &body).unwrap();
+        fs::write(dir.path().join("b.rs"), &body).unwrap();
+
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let flag_cb = flag.clone();
+        let cb: TierAStreamCallback = std::sync::Arc::new(move |_groups: &[MatchGroup]| {
+            flag_cb.store(true, Ordering::Relaxed);
+        });
+
+        let cfg = ScanConfig {
+            cancel: Some(flag),
+            on_tier_a_groups: Some(cb),
+            jobs: Some(1),
+            ..ScanConfig::default()
+        };
+        let scanner = Scanner::new(cfg);
+        let err = scanner.scan(dir.path()).unwrap_err();
+        assert!(matches!(err, ScanError::Cancelled));
+    }
+
+    #[test]
+    fn tier_a_streaming_callback_fires_once_with_final_membership() {
+        // The streaming hook must fire exactly once per scan, and the
+        // groups it sees must match the Tier A subset of the final
+        // `ScanResult.groups`. Tier B is disabled here so promotion
+        // can't trim Tier A after the callback — that keeps the
+        // "before promotion" and "after promotion" sets identical for
+        // this assertion.
+        let dir = tempdir().unwrap();
+        let body: String = (0..80)
+            .map(|i| format!("let always_shared_{i} = {i};\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        fs::write(dir.path().join("a.txt"), &body).unwrap();
+        fs::write(dir.path().join("b.txt"), &body).unwrap();
+
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let calls_cb = calls.clone();
+        let cb: TierAStreamCallback = std::sync::Arc::new(move |groups: &[MatchGroup]| {
+            calls_cb.lock().unwrap().push(groups.len());
+        });
+
+        let cfg = ScanConfig {
+            on_tier_a_groups: Some(cb),
+            ..ScanConfig::default()
+        };
+        let scanner = Scanner::with_profiles(cfg, vec![]); // Tier B off.
+        let result = scanner.scan(dir.path()).unwrap();
+
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "callback must fire exactly once");
+        let tier_a_final = result.groups.iter().filter(|g| g.tier == Tier::A).count();
+        assert_eq!(
+            seen[0], tier_a_final,
+            "streamed tier A count must match final tier A count"
+        );
+        assert!(seen[0] >= 1, "duplicate bodies produced a group");
     }
 
     #[test]
