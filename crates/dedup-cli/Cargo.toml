@@ -12,3 +12,9 @@ name = "dedup"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+dedup-core = { path = "../dedup-core" }
+
+[dev-dependencies]
+assert_cmd = "2"
+insta = "1"
