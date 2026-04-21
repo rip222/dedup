@@ -26,7 +26,7 @@ pub mod rolling_hash;
 pub mod scanner;
 pub mod tokenizer;
 
-pub use cache::{Cache, CacheError, CachedOccurrence, GroupDetail, GroupSummary};
+pub use cache::{Cache, CacheError, CachedOccurrence, GroupDetail, GroupSummary, Suppression};
 pub use config::{
     Config, ConfigError, Normalization, SCHEMA_VERSION as CONFIG_SCHEMA_VERSION, ScanSettings,
     Thresholds, TierAThresholds, TierBThresholds,

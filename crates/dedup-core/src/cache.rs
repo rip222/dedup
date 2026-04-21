@@ -24,7 +24,18 @@
 //!
 //! - Content-hash-keyed warm-scan skip (→ #14).
 //! - Concurrent-writer testing and real schema bumps (→ #18).
-//! - Dismissal tracking (→ #11).
+//!
+//! # Suppressions (issue #11)
+//!
+//! A `suppressions` table keys dismissed groups by **normalized-block-hash**
+//! — the same `group_hash` value stored on `match_groups`. Keying by hash
+//! (rather than file path or group id) means cosmetic whitespace changes
+//! that leave the normalized token stream untouched stay hidden, while any
+//! meaningful edit changes the hash and honestly re-surfaces the group.
+//!
+//! Dismissals are never used to mutate the `match_groups` rows themselves;
+//! filtering happens at report time in the CLI frontend. That preserves
+//! the "altered block re-surfaces" property by construction.
 
 use std::path::{Path, PathBuf};
 
@@ -96,6 +107,25 @@ pub struct CachedOccurrence {
     pub end_line: i64,
     pub start_byte: i64,
     pub end_byte: i64,
+}
+
+/// One dismissed-group entry. Keyed by the normalized-block-hash of the
+/// group at dismissal time (the same `group_hash` that lives on
+/// `match_groups`). `last_group_id` is informational — it records which
+/// group-id the user named when they called `dedup dismiss`, so
+/// `dedup suppressions list` can echo it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suppression {
+    /// The normalized-block-hash. Stored on disk as an 8-byte big-endian
+    /// blob so it round-trips identically to `match_groups.group_hash`.
+    pub hash: crate::rolling_hash::Hash,
+    /// Unix-epoch seconds at which the dismissal was recorded.
+    pub dismissed_at: i64,
+    /// The group id the user named when dismissing, if any. The row
+    /// referenced may since have been replaced by a subsequent
+    /// `write_scan_result` — this field is a breadcrumb, not a foreign
+    /// key.
+    pub last_group_id: Option<i64>,
 }
 
 /// Owning handle to the SQLite cache.
@@ -365,6 +395,97 @@ impl Cache {
         }))
     }
 
+    /// Look up the normalized-block-hash for a given `match_groups.id`.
+    /// Returns `Ok(None)` if no such id exists in the current cache.
+    ///
+    /// This is what `dedup dismiss <group-id>` uses to translate from the
+    /// user-facing group number to the stable hash we actually key
+    /// suppressions by.
+    pub fn group_hash(&self, id: i64) -> Result<Option<crate::rolling_hash::Hash>, CacheError> {
+        let row: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT group_hash FROM match_groups WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(row.and_then(|bytes| blob_to_hash(&bytes)))
+    }
+
+    /// Record a dismissal for `hash`. Idempotent: a second call with the
+    /// same hash refreshes `dismissed_at` and `last_group_id` via
+    /// `INSERT OR REPLACE` rather than erroring.
+    pub fn dismiss_hash(
+        &mut self,
+        hash: crate::rolling_hash::Hash,
+        last_group_id: Option<i64>,
+    ) -> Result<(), CacheError> {
+        let now = now_unix_seconds();
+        let bytes = hash.to_be_bytes();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO suppressions \
+                (group_hash, dismissed_at, last_group_id) \
+             VALUES (?1, ?2, ?3)",
+            params![&bytes[..], now, last_group_id],
+        )?;
+        Ok(())
+    }
+
+    /// List every dismissed hash, sorted by dismissal time (oldest first)
+    /// then by hash for a stable tiebreaker.
+    pub fn list_suppressions(&self) -> Result<Vec<Suppression>, CacheError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_hash, dismissed_at, last_group_id \
+             FROM suppressions \
+             ORDER BY dismissed_at ASC, group_hash ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            let dismissed_at: i64 = row.get(1)?;
+            let last_group_id: Option<i64> = row.get(2)?;
+            Ok((bytes, dismissed_at, last_group_id))
+        })?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (bytes, dismissed_at, last_group_id) = r?;
+            if let Some(hash) = blob_to_hash(&bytes) {
+                out.push(Suppression {
+                    hash,
+                    dismissed_at,
+                    last_group_id,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return the set of currently suppressed hashes. Cheap helper for
+    /// report-time filtering that doesn't need timestamps.
+    pub fn suppressed_hashes(
+        &self,
+    ) -> Result<std::collections::HashSet<crate::rolling_hash::Hash>, CacheError> {
+        let mut stmt = self.conn.prepare("SELECT group_hash FROM suppressions")?;
+        let rows = stmt.query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            Ok(bytes)
+        })?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            if let Some(hash) = blob_to_hash(&r?) {
+                out.insert(hash);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Truncate the suppressions table. Used by `dedup suppressions clear`.
+    pub fn clear_suppressions(&mut self) -> Result<usize, CacheError> {
+        let n = self.conn.execute("DELETE FROM suppressions", [])?;
+        Ok(n)
+    }
+
     /// The current database schema version. Public so tests can assert
     /// on it directly; callers shouldn't normally need it.
     pub fn schema_version(&self) -> Result<i64, CacheError> {
@@ -446,6 +567,11 @@ fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
 /// bumping to v2; `tier` stores `"A"` or `"B"` as TEXT and defaults to
 /// `"A"` for any row written by older code.
 fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
+    // NOTE: the `suppressions` table was added as part of issue #11 before
+    // any production v1 deployments; per the same "extend v1 in place"
+    // reasoning that applied to `match_groups.tier` (issue #6), we fold
+    // it into the v1 bootstrap rather than bumping to v2. #18 will
+    // introduce the real migration runner.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_hashes (\
             path         TEXT PRIMARY KEY,\
@@ -470,7 +596,12 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
             end_byte    INTEGER\
          );\
          CREATE INDEX IF NOT EXISTS occurrences_group_idx \
-            ON occurrences(group_id);",
+            ON occurrences(group_id);\
+         CREATE TABLE IF NOT EXISTS suppressions (\
+            group_hash     BLOB PRIMARY KEY,\
+            dismissed_at   INTEGER NOT NULL,\
+            last_group_id  INTEGER\
+         );",
     )?;
     Ok(())
 }
@@ -516,6 +647,19 @@ fn group_totals(group: &MatchGroup) -> (usize, usize) {
 /// so the cache is cross-platform-portable.
 fn path_to_posix_str(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
+}
+
+/// Decode an 8-byte big-endian blob back into a [`crate::rolling_hash::Hash`].
+/// Returns `None` if the blob is the wrong size — callers treat this as
+/// "row is malformed, skip it" rather than surfacing an error, so that a
+/// legacy row from an earlier build can never crash a list or a filter.
+fn blob_to_hash(bytes: &[u8]) -> Option<crate::rolling_hash::Hash> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Some(u64::from_be_bytes(arr))
 }
 
 fn now_unix_seconds() -> i64 {
@@ -724,6 +868,129 @@ mod tests {
         let dir = tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         assert!(cache.get_group(9_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn suppressions_roundtrip_by_hash() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        cache.write_scan_result(&synthetic_result()).unwrap();
+
+        // Resolve the hash behind group-id 1, then dismiss by that hash.
+        let groups = cache.list_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        let gid = groups[0].id;
+        let hash = cache.group_hash(gid).unwrap().expect("hash present");
+        assert_eq!(hash, 0xdead_beef_cafe_f00d);
+
+        cache.dismiss_hash(hash, Some(gid)).unwrap();
+
+        let entries = cache.list_suppressions().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, hash);
+        assert_eq!(entries[0].last_group_id, Some(gid));
+
+        let set = cache.suppressed_hashes().unwrap();
+        assert!(set.contains(&hash));
+    }
+
+    #[test]
+    fn suppression_keyed_by_hash_not_group_id() {
+        // Re-scan replaces all match_groups rows, so group_id changes. The
+        // hash is stable, so the suppression must still apply.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        cache.write_scan_result(&synthetic_result()).unwrap();
+        let gid_before = cache.list_groups().unwrap()[0].id;
+        let hash = cache.group_hash(gid_before).unwrap().unwrap();
+        cache.dismiss_hash(hash, Some(gid_before)).unwrap();
+
+        // Simulate a re-scan: same hash, but write_scan_result truncates
+        // and re-inserts, so the id very likely changes.
+        cache.write_scan_result(&synthetic_result()).unwrap();
+        let gid_after = cache.list_groups().unwrap()[0].id;
+        // The suppression is still there, still keyed by hash.
+        assert!(cache.suppressed_hashes().unwrap().contains(&hash));
+        // And the new group resolves to the same hash — so filtering will
+        // still hide it.
+        let hash_after = cache.group_hash(gid_after).unwrap().unwrap();
+        assert_eq!(hash, hash_after);
+    }
+
+    #[test]
+    fn altered_block_hash_no_longer_suppressed() {
+        // Dismiss one hash; write a "mutated" scan result with a different
+        // hash. The suppression should NOT match the new hash.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        cache.write_scan_result(&synthetic_result()).unwrap();
+        let original = 0xdead_beef_cafe_f00d_u64;
+        cache.dismiss_hash(original, Some(1)).unwrap();
+
+        let mutated = ScanResult {
+            groups: vec![MatchGroup {
+                hash: 0x0000_1111_2222_3333,
+                tier: Tier::A,
+                occurrences: vec![
+                    Occurrence {
+                        path: PathBuf::from("a.rs"),
+                        span: Span {
+                            start_line: 1,
+                            end_line: 10,
+                            start_byte: 0,
+                            end_byte: 100,
+                        },
+                    },
+                    Occurrence {
+                        path: PathBuf::from("b.rs"),
+                        span: Span {
+                            start_line: 5,
+                            end_line: 14,
+                            start_byte: 40,
+                            end_byte: 140,
+                        },
+                    },
+                ],
+            }],
+            files_scanned: 2,
+        };
+        cache.write_scan_result(&mutated).unwrap();
+
+        let set = cache.suppressed_hashes().unwrap();
+        assert!(set.contains(&original));
+        assert!(!set.contains(&0x0000_1111_2222_3333));
+    }
+
+    #[test]
+    fn dismiss_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        cache.dismiss_hash(0xabcd, Some(42)).unwrap();
+        cache.dismiss_hash(0xabcd, Some(43)).unwrap();
+        let entries = cache.list_suppressions().unwrap();
+        assert_eq!(entries.len(), 1);
+        // Second write overwrites last_group_id.
+        assert_eq!(entries[0].last_group_id, Some(43));
+    }
+
+    #[test]
+    fn clear_suppressions_truncates() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        cache.dismiss_hash(0x1111, None).unwrap();
+        cache.dismiss_hash(0x2222, None).unwrap();
+        assert_eq!(cache.list_suppressions().unwrap().len(), 2);
+
+        let removed = cache.clear_suppressions().unwrap();
+        assert_eq!(removed, 2);
+        assert!(cache.list_suppressions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn group_hash_returns_none_for_unknown_id() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        assert!(cache.group_hash(9_999).unwrap().is_none());
     }
 
     #[test]

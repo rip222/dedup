@@ -187,6 +187,54 @@ enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Suppress a group from future reports. The dismissal is keyed by
+    /// the group's normalized-block-hash, so cosmetic whitespace changes
+    /// leave it hidden but any meaningful edit re-surfaces it.
+    Dismiss {
+        /// The group id (as printed by `dedup list` / `dedup scan`).
+        id: i64,
+        /// Directory whose `.dedup/cache.sqlite` should be updated.
+        /// Defaults to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Manage the set of currently dismissed groups.
+    Suppressions {
+        #[command(subcommand)]
+        action: SuppressionsAction,
+    },
+    /// Delete the `.dedup/` cache directory entirely. Prompts for
+    /// confirmation when stdin is a TTY; `--yes` skips the prompt.
+    Clean {
+        /// Directory whose `.dedup/` should be removed. Defaults to the
+        /// current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Skip the interactive confirmation prompt. Required when stdin
+        /// is not a TTY (scripts, CI) to avoid hanging.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SuppressionsAction {
+    /// List the currently dismissed entries (hash, timestamp, last known
+    /// group id).
+    List {
+        /// Directory whose `.dedup/cache.sqlite` should be read. Defaults
+        /// to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Remove every dismissal. Irreversible; previously hidden groups
+    /// surface again on the next `scan` / `list`.
+    Clear {
+        /// Directory whose `.dedup/cache.sqlite` should be updated.
+        /// Defaults to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -248,6 +296,12 @@ fn main() -> ExitCode {
             ConfigAction::Path { path } => Ok(run_config_path(&path)),
             ConfigAction::Edit { path } => Ok(run_config_edit(&path)),
         },
+        Command::Dismiss { id, ref path } => run_dismiss(id, path),
+        Command::Suppressions { action } => match action {
+            SuppressionsAction::List { path } => run_suppressions_list(&path),
+            SuppressionsAction::Clear { path } => run_suppressions_clear(&path),
+        },
+        Command::Clean { ref path, yes } => run_clean(path, yes),
     };
 
     match result {
@@ -333,10 +387,22 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     // Persist before printing so the cache reflects stdout exactly.
     // Failure to persist is surfaced but does NOT suppress the print:
     // losing the cache is recoverable, losing the scan output isn't.
+    //
+    // We also fetch the set of dismissed hashes here: suppressions are
+    // filtered at report time, never mutated into the cache. A cache
+    // failure downgrades to "no suppressions" so the scan still prints.
+    let mut suppressed: std::collections::HashSet<dedup_core::Hash> =
+        std::collections::HashSet::new();
     match Cache::open(path) {
         Ok(mut cache) => {
             if let Err(e) = cache.write_scan_result(&result) {
                 eprintln!("dedup: warning: failed to persist scan: {e}");
+            }
+            match cache.suppressed_hashes() {
+                Ok(s) => suppressed = s,
+                Err(e) => {
+                    eprintln!("dedup: warning: failed to read suppressions: {e}");
+                }
             }
         }
         Err(e) => {
@@ -344,13 +410,16 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
         }
     }
 
-    // Apply the tier / lang filters to produce the user-visible group
-    // slice. Tier A groups pass the lang filter unconditionally
-    // (they're language-oblivious); Tier B groups must additionally
-    // clear the `--lang` filter when one is specified.
+    // Apply the tier / lang / suppression filters to produce the
+    // user-visible group slice. Tier A groups pass the lang filter
+    // unconditionally (they're language-oblivious); Tier B groups must
+    // additionally clear the `--lang` filter when one is specified.
+    // Suppressions key by the group's normalized-block-hash, so any edit
+    // that changes the hash will surface the group again.
     let visible: Vec<&MatchGroup> = result
         .groups
         .iter()
+        .filter(|g| !suppressed.contains(&g.hash))
         .filter(|g| match g.tier {
             Tier::A => tier_allows_a(globals),
             Tier::B => tier_allows_b(globals) && lang_allows(globals, g),
@@ -379,6 +448,9 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     };
 
     let groups = cache.list_groups().context("failed to read cache")?;
+    let suppressed = cache
+        .suppressed_hashes()
+        .context("failed to read suppressions")?;
 
     let allow_a = tier_allows_a(globals);
     let allow_b = tier_allows_b(globals);
@@ -394,6 +466,15 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
             Tier::B => allow_b,
         };
         if !tier_ok {
+            continue;
+        }
+        // Suppression check keyed by normalized-block-hash. Looking it up
+        // per-group is cheap; `list` is already one-query-per-group.
+        if let Some(hash) = cache
+            .group_hash(summary.id)
+            .with_context(|| format!("failed to read hash for group {}", summary.id))?
+            && suppressed.contains(&hash)
+        {
             continue;
         }
         let detail = match cache
@@ -446,6 +527,158 @@ fn run_show(id: i64, path: &Path, _globals: &GlobalArgs) -> Result<ExitCode> {
     let mut stdout = std::io::stdout();
     print_cached_group_show(&detail, &mut stdout).ok();
 
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `dedup dismiss <id>` — translate the caller-visible group id into the
+/// stable normalized-block-hash stored on `match_groups`, then record the
+/// hash in the `suppressions` table. Subsequent scans (and list/show)
+/// will omit any group whose hash still matches.
+///
+/// Failure modes:
+/// - No `.dedup/` cache → exit 2 with a friendly message. Users run
+///   `scan` first.
+/// - Unknown group id → exit 2, telling the user which id they named.
+/// - Any other cache failure bubbles up through `anyhow`.
+fn run_dismiss(id: i64, path: &Path) -> Result<ExitCode> {
+    let mut cache = match Cache::open_readonly(path)
+        .with_context(|| format!("failed to open cache at {}", path.display()))?
+    {
+        Some(c) => c,
+        None => {
+            eprintln!("dedup: No cached scan found. Run `dedup scan` first.");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
+    let hash = match cache
+        .group_hash(id)
+        .with_context(|| format!("failed to read group {id}"))?
+    {
+        Some(h) => h,
+        None => {
+            eprintln!("dedup: no group with id {id}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
+    cache
+        .dismiss_hash(hash, Some(id))
+        .context("failed to record dismissal")?;
+
+    // Print the hash as hex so the user can cross-reference with
+    // `suppressions list` output.
+    println!("dismissed group {id} (hash {hash:016x})");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `dedup suppressions list` — emit one row per dismissal with hex hash,
+/// ISO-8601-ish timestamp, and the originally-dismissed group id.
+fn run_suppressions_list(path: &Path) -> Result<ExitCode> {
+    let cache = match Cache::open_readonly(path)
+        .with_context(|| format!("failed to open cache at {}", path.display()))?
+    {
+        Some(c) => c,
+        None => {
+            eprintln!("dedup: No cached scan found. Run `dedup scan` first.");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
+    let entries = cache
+        .list_suppressions()
+        .context("failed to read suppressions")?;
+
+    if entries.is_empty() {
+        println!("(no suppressions)");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for e in entries {
+        let gid = match e.last_group_id {
+            Some(id) => id.to_string(),
+            None => "-".to_string(),
+        };
+        println!(
+            "{hash:016x}  dismissed_at={ts}  last_group_id={gid}",
+            hash = e.hash,
+            ts = e.dismissed_at,
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `dedup suppressions clear` — truncate the suppressions table. Prints
+/// how many rows were removed so scripts can assert.
+fn run_suppressions_clear(path: &Path) -> Result<ExitCode> {
+    let mut cache = match Cache::open_readonly(path)
+        .with_context(|| format!("failed to open cache at {}", path.display()))?
+    {
+        Some(c) => c,
+        None => {
+            eprintln!("dedup: No cached scan found. Run `dedup scan` first.");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
+    let n = cache
+        .clear_suppressions()
+        .context("failed to clear suppressions")?;
+    println!("cleared {n} suppression(s)");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `dedup clean` — delete the entire `.dedup/` directory.
+///
+/// Prompting policy:
+/// - If `--yes` / `-y` is passed, no prompt — always proceeds.
+/// - Else if stdin is a TTY, prompt for `y/N`. Default (empty input,
+///   EOF, or anything but `y`/`yes`) is "No".
+/// - Else (non-TTY without `--yes`): refuse. Exit 2 with a message
+///   telling the user to re-run with `--yes`. This avoids hanging a
+///   non-interactive script on stdin.
+fn run_clean(path: &Path, yes: bool) -> Result<ExitCode> {
+    let dedup_dir = path.join(".dedup");
+    if !dedup_dir.exists() {
+        println!(
+            "dedup: nothing to clean (no .dedup/ directory at {})",
+            path.display()
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "dedup: refusing to delete {} without --yes (stdin is not a TTY)",
+                dedup_dir.display()
+            );
+            return Ok(ExitCode::from(2));
+        }
+        // Interactive prompt.
+        print!(
+            "Delete {} and all cached scan results? [y/N] ",
+            dedup_dir.display()
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("dedup: failed to read confirmation: {e}");
+                return Ok(ExitCode::from(2));
+            }
+        }
+        let trimmed = line.trim().to_ascii_lowercase();
+        if trimmed != "y" && trimmed != "yes" {
+            println!("cancelled");
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
+    std::fs::remove_dir_all(&dedup_dir)
+        .with_context(|| format!("failed to remove {}", dedup_dir.display()))?;
+    println!("removed {}", dedup_dir.display());
     Ok(ExitCode::SUCCESS)
 }
 
