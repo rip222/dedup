@@ -66,7 +66,7 @@ fn strict_exits_one_when_findings_present() {
     // the exit code, not the output.
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.starts_with("--- group "),
+        stdout.starts_with("--- ["),
         "expected groups on stdout, got: {stdout:?}"
     );
 }
@@ -147,19 +147,25 @@ fn tier_a_is_accepted_and_emits_groups() {
         .unwrap();
     assert!(out.status.success(), "tier a scan failed: {:?}", out);
     let stdout = String::from_utf8(out.stdout).unwrap();
-    // Tier A is the only tier that emits at MVP — we expect groups.
+    // `--tier a` must only emit Tier A group headers; Tier B headers are
+    // filtered out. The fixture's `compute_totals` body would otherwise
+    // surface as a Tier B group (#6), so we also assert the `[B]` prefix
+    // is absent to prove the tier filter is doing real work.
     assert!(
-        stdout.contains("--- group "),
-        "tier a should emit groups, got: {stdout:?}"
+        stdout.contains("--- [A] group "),
+        "tier a should emit Tier A groups, got: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("--- [B] group "),
+        "tier a should NOT emit Tier B groups, got: {stdout:?}"
     );
 }
 
 #[test]
-fn tier_b_filters_out_tier_a_groups_at_mvp() {
-    // Tier B isn't emitted yet (lands in #6), so `--tier b` should
-    // filter the Tier A groups out and leave stdout empty. This is the
-    // documented MVP behavior — when #6 lands, Tier B groups appear and
-    // this test needs an update.
+fn tier_b_filters_out_tier_a_groups() {
+    // With #6 landed Tier B is real, so `--tier b` filters the Tier A
+    // groups out while keeping the Tier B ones. The fixture's
+    // `compute_totals` body is an exact dup across the three files.
     let tmp = prepare_fixture();
     let out = Command::cargo_bin("dedup")
         .unwrap()
@@ -172,8 +178,12 @@ fn tier_b_filters_out_tier_a_groups_at_mvp() {
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.is_empty(),
-        "tier b should yield no groups pre-#6, got: {stdout:?}"
+        !stdout.contains("--- [A] group "),
+        "tier b should drop Tier A groups, got: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("--- [B] group "),
+        "tier b should keep Tier B groups, got: {stdout:?}"
     );
 }
 
@@ -195,7 +205,9 @@ fn jobs_flag_is_accepted() {
 
 #[test]
 fn lang_flag_is_accepted() {
-    // Like `--jobs`, this is a stub pending #6 Tier B — parse-only.
+    // The fixture is all `.rs`, so `--lang rust` keeps its Tier B
+    // groups and `--lang ts` filters them out. Tier A is always
+    // language-oblivious.
     let tmp = prepare_fixture();
     let out = Command::cargo_bin("dedup")
         .unwrap()
@@ -206,6 +218,48 @@ fn lang_flag_is_accepted() {
         .output()
         .unwrap();
     assert!(out.status.success(), "--lang scan failed: {:?}", out);
+}
+
+#[test]
+fn lang_rust_keeps_tier_b_rust_groups() {
+    let tmp = prepare_fixture();
+    let out = Command::cargo_bin("dedup")
+        .unwrap()
+        .arg("scan")
+        .arg("--tier")
+        .arg("b")
+        .arg("--lang")
+        .arg("rust")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("--- [B] group "),
+        "--lang rust should keep Rust Tier B groups, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn lang_ts_filters_out_rust_tier_b_groups() {
+    let tmp = prepare_fixture();
+    let out = Command::cargo_bin("dedup")
+        .unwrap()
+        .arg("scan")
+        .arg("--tier")
+        .arg("b")
+        .arg("--lang")
+        .arg("ts")
+        .arg(tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.is_empty(),
+        "--lang ts should drop all Rust Tier B groups, got: {stdout:?}"
+    );
 }
 
 #[test]

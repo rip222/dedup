@@ -208,7 +208,7 @@ fn cache_survives_process_restart() {
         "cache should survive process restart and yield groups"
     );
     assert!(
-        stdout.starts_with("--- group "),
+        stdout.starts_with("--- ["),
         "output shape changed: {stdout:?}"
     );
 }

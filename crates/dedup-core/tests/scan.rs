@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use dedup_core::{ScanConfig, Scanner};
+use dedup_core::{ScanConfig, Scanner, Tier};
 
 fn workspace_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` points at the crate dir; the workspace root is
@@ -32,15 +32,17 @@ fn scans_tier_a_basic_fixture() {
     // 3 fixture files, all text.
     assert_eq!(result.files_scanned, 3, "expected 3 files scanned");
 
-    // The shared duplicate block is ≥ 6 lines AND ≥ 50 tokens, so exactly
-    // one Tier A match group should be emitted.
+    // The shared duplicate block is ≥ 6 lines AND ≥ 50 tokens. Exactly one
+    // Tier A match group should be emitted; Tier B additionally emits a
+    // group for the embedded `fn compute_totals` body.
+    let tier_a: Vec<_> = result.groups.iter().filter(|g| g.tier == Tier::A).collect();
     assert_eq!(
-        result.groups.len(),
+        tier_a.len(),
         1,
-        "expected exactly 1 match group, got {:#?}",
+        "expected exactly 1 Tier A match group, got {:#?}",
         result.groups
     );
-    let group = &result.groups[0];
+    let group = tier_a[0];
     assert_eq!(group.occurrences.len(), 3, "expected 3 occurrences");
 
     let paths: Vec<String> = group

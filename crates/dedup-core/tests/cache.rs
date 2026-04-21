@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use dedup_core::{Cache, MatchGroup, Occurrence, ScanResult, Span};
+use dedup_core::{Cache, MatchGroup, Occurrence, ScanResult, Span, Tier};
 use tempfile::tempdir;
 
 fn sample_result() -> ScanResult {
@@ -16,6 +16,7 @@ fn sample_result() -> ScanResult {
         groups: vec![
             MatchGroup {
                 hash: 0x1122_3344_5566_7788,
+                tier: Tier::A,
                 occurrences: vec![
                     Occurrence {
                         path: PathBuf::from("alpha.rs"),
@@ -48,6 +49,7 @@ fn sample_result() -> ScanResult {
             },
             MatchGroup {
                 hash: 0xdead_beef_0000_0001,
+                tier: Tier::A,
                 occurrences: vec![
                     Occurrence {
                         path: PathBuf::from("x.rs"),
@@ -127,6 +129,7 @@ fn second_write_replaces_first() {
     let smaller = ScanResult {
         groups: vec![MatchGroup {
             hash: 0xaabb_ccdd_eeff_0011,
+            tier: Tier::A,
             occurrences: vec![
                 Occurrence {
                     path: PathBuf::from("only.rs"),

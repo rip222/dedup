@@ -1,4 +1,4 @@
-//! Tier A scanner: walks files, rolls hashes, buckets match groups.
+//! Tier A + Tier B scanner: walks files, rolls hashes, buckets match groups.
 //!
 //! The scanner is the top-level orchestrator for this milestone. It:
 //!
@@ -12,27 +12,38 @@
 //!    ≥ 2 members after collection.
 //! 5. Greedily extends adjacent matching windows in each file into maximal
 //!    spans, then filters by the `min_lines` / `min_tokens` thresholds.
-//! 6. Emits [`MatchGroup`]s — one per cluster of equivalent extended spans
-//!    across files — suitable for the CLI to print or for later issues
-//!    (#4 cache, #12 formats) to consume.
+//! 6. For any file whose extension matches a registered [`LanguageProfile`],
+//!    also runs Tier B: parses with tree-sitter, extracts syntactic units
+//!    (function / type / impl bodies), alpha-renames locals, subtree-hashes,
+//!    and buckets those.
+//! 7. Applies the **Tier A → B promotion rule**: a Tier A occurrence that
+//!    exactly aligns (same file + same start/end lines) with a Tier B unit
+//!    is dropped from its Tier A group so the duplicate is reported once,
+//!    at the more semantic Tier B level. If dropping leaves a Tier A group
+//!    with < 2 occurrences, the whole group is removed.
+//! 8. Emits [`MatchGroup`]s tagged with [`Tier::A`] or [`Tier::B`] —
+//!    suitable for the CLI to print or for later issues to consume.
 //!
 //! What this scanner deliberately does NOT do at this milestone:
 //!
-//! - No cache (lands in #4).
 //! - No `ignore`-crate layers (lands in #5): we honor only the hard-coded
 //!   binary + `.git/` skip.
 //! - No parallelism (lands in #14).
-//! - No tree-sitter Tier B (lands in #6).
-//! - No typed-error surfacing for per-file I/O failures: they are silently
-//!   skipped. `ScanError` exists for top-level catastrophic failures
-//!   (none today, but the surface is ready for #17).
+//! - No aggressive literal abstraction (lands in #10).
+//! - No typed-error surfacing for per-file I/O or parse failures: they are
+//!   silently skipped. `ScanError` exists for top-level catastrophic
+//!   failures (none today, but the surface is ready for #17).
 
 use crate::rolling_hash::{Hash, Span, rolling_hash};
 use crate::tokenizer::{Token, tokenize};
+use dedup_lang::{
+    LanguageProfile, SyntacticUnit, all_profiles, extract_units, profile_for_extension,
+};
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info, warn};
+use tree_sitter::Parser;
 use walkdir::WalkDir;
 
 /// The rolling-hash window size. Matches the Tier A `min_tokens` default.
@@ -55,17 +66,46 @@ pub enum ScanError {
     },
 }
 
-/// Tunable scanner knobs. Defaults mirror the Tier A thresholds from the PRD.
+/// Which detection pass emitted a [`MatchGroup`].
+///
+/// Tier A is the fast, language-oblivious rolling-hash pass.
+/// Tier B is the tree-sitter-backed, alpha-rename-aware pass.
+///
+/// The order of variants is stable: `A < B` lexicographically. Callers
+/// (CLI output, JSON export, ...) can rely on `Tier::A` coming before
+/// `Tier::B` when sorting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Tier {
+    /// Fast, language-oblivious rolling-hash Tier A match.
+    A,
+    /// Tree-sitter Tier B match (normalization-aware; rename-resilient).
+    B,
+}
+
+impl Tier {
+    /// One-character label used in human-readable output (`[A]` / `[B]`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::A => "A",
+            Tier::B => "B",
+        }
+    }
+}
+
+/// Tunable scanner knobs. Defaults mirror the Tier A / Tier B thresholds
+/// from the PRD.
 #[derive(Debug, Clone)]
 pub struct ScanConfig {
-    /// A match span must cover at least this many lines to be reported.
+    /// Tier A: a match span must cover at least this many lines to be
+    /// reported.
     pub tier_a_min_lines: usize,
-    /// A match span must cover at least this many tokens to be reported.
+    /// Tier A: a match span must cover at least this many tokens to be
+    /// reported.
     pub tier_a_min_tokens: usize,
-    /// Tier B minimum lines. Tier B detection lands in #6; today this
-    /// field is stored so the config→scanner bridge is one-shot.
+    /// Tier B: a syntactic unit must cover at least this many lines.
     pub tier_b_min_lines: usize,
-    /// Tier B minimum tokens.
+    /// Tier B: a syntactic unit must cover at least this many normalized
+    /// tokens.
     pub tier_b_min_tokens: usize,
     /// Files larger than this (in bytes) are skipped during scan.
     pub max_file_size: u64,
@@ -121,6 +161,8 @@ pub struct MatchGroup {
     /// Representative hash for the extended span (the hash of the first
     /// rolling window in the span; good enough for grouping at Tier A).
     pub hash: Hash,
+    /// Which detection pass emitted this group.
+    pub tier: Tier,
     /// All file-local occurrences; always `len() >= 2` after filtering.
     pub occurrences: Vec<Occurrence>,
 }
@@ -167,26 +209,62 @@ impl ProgressSink for NoopSink {
     fn on_match_group(&self, _group: &MatchGroup) {}
 }
 
-/// Public scanner handle. Cheap to construct; holds only configuration.
-#[derive(Debug, Clone, Default)]
+/// Public scanner handle. Cheap to construct; holds only configuration
+/// plus the Tier B language-profile registry.
+///
+/// The set of Tier B profiles is injected at construction time so
+/// callers can extend or restrict coverage. [`Scanner::default`] and
+/// [`Scanner::new`] use every profile registered in
+/// [`dedup_lang::all_profiles`].
 pub struct Scanner {
     config: ScanConfig,
+    profiles: Vec<&'static dyn LanguageProfile>,
+}
+
+impl std::fmt::Debug for Scanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Scanner")
+            .field("config", &self.config)
+            .field(
+                "profiles",
+                &self.profiles.iter().map(|p| p.name()).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl Default for Scanner {
+    fn default() -> Self {
+        Self::new(ScanConfig::default())
+    }
 }
 
 impl Scanner {
-    /// Build a scanner with explicit configuration.
+    /// Build a scanner with explicit configuration and every profile
+    /// shipped with this build.
     pub fn new(config: ScanConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            profiles: all_profiles(),
+        }
     }
 
-    /// Walk `root` and return all Tier A match groups. Convenience wrapper
-    /// around [`Scanner::scan_with_progress`] with a no-op progress sink.
+    /// Build a scanner with explicit configuration *and* a custom set
+    /// of Tier B profiles. Passing an empty slice disables Tier B
+    /// entirely — useful in tests that want to lock down Tier A output.
+    pub fn with_profiles(config: ScanConfig, profiles: Vec<&'static dyn LanguageProfile>) -> Self {
+        Self { config, profiles }
+    }
+
+    /// Walk `root`, run Tier A + Tier B, and return all match groups.
+    /// Convenience wrapper around [`Scanner::scan_with_progress`] with a
+    /// no-op progress sink.
     pub fn scan(&self, root: &Path) -> Result<ScanResult, ScanError> {
         self.scan_with_progress(root, &NoopSink)
     }
 
-    /// Walk `root` and return all Tier A match groups, reporting progress
-    /// through `sink`.
+    /// Walk `root`, run Tier A + Tier B, and return all match groups,
+    /// reporting progress through `sink`.
     ///
     /// `sink` is called:
     ///
@@ -205,7 +283,10 @@ impl Scanner {
         info!(root = %root.display(), "scan: starting");
 
         // --- 1. Walk and tokenize each candidate file. --------------------
-        let mut per_file: Vec<(PathBuf, Vec<Token>)> = Vec::new();
+        //
+        // We retain the original source text alongside the token stream so
+        // Tier B can re-parse with tree-sitter without going back to disk.
+        let mut per_file: Vec<FileBundle> = Vec::new();
 
         let follow = self.config.follow_symlinks;
         let include_submodules = self.config.include_submodules;
@@ -279,7 +360,11 @@ impl Scanner {
             let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
             let tokens = tokenize(&text);
             debug!(path = %rel.display(), tokens = tokens.len(), "scan: tokenized file");
-            per_file.push((rel, tokens));
+            per_file.push(FileBundle {
+                path: rel,
+                source: text,
+                tokens,
+            });
             // Report progress *after* the file is staged so sinks that
             // update a spinner see work that has actually been done.
             sink.on_file_processed(abs);
@@ -298,8 +383,8 @@ impl Scanner {
         let mut by_hash: FxHashMap<Hash, Vec<WindowKey>> = FxHashMap::default();
         let mut per_file_hashes: Vec<Vec<(Hash, Span)>> = Vec::with_capacity(per_file.len());
 
-        for (fi, (_path, tokens)) in per_file.iter().enumerate() {
-            let windows = rolling_hash(tokens, WINDOW_SIZE);
+        for (fi, bundle) in per_file.iter().enumerate() {
+            let windows = rolling_hash(&bundle.tokens, WINDOW_SIZE);
             for (wi, (h, _)) in windows.iter().enumerate() {
                 by_hash
                     .entry(*h)
@@ -420,7 +505,8 @@ impl Scanner {
         let mut clusters: FxHashMap<(Hash, usize), Vec<Occurrence>> = FxHashMap::default();
         for (fi, spans) in extended.iter().enumerate() {
             for s in spans {
-                let (path, tokens) = &per_file[fi];
+                let path = &per_file[fi].path;
+                let tokens = &per_file[fi].tokens;
                 let windows = &per_file_hashes[fi];
                 let first_span = windows[s.start_win].1;
                 let last_span = windows[s.end_win].1;
@@ -450,8 +536,8 @@ impl Scanner {
             }
         }
 
-        // --- 6. Finalize: keep only ≥ 2-occurrence clusters and sort. ----
-        let mut groups: Vec<MatchGroup> = clusters
+        // --- 6. Finalize Tier A: keep only ≥ 2-occurrence clusters. -----
+        let mut tier_a_groups: Vec<MatchGroup> = clusters
             .into_iter()
             .filter(|(_, occ)| occ.len() >= 2)
             .map(|((hash, _), mut occ)| {
@@ -462,17 +548,41 @@ impl Scanner {
                 });
                 MatchGroup {
                     hash,
+                    tier: Tier::A,
                     occurrences: occ,
                 }
             })
             .collect();
 
+        // --- 7. Tier B: tree-sitter-backed syntactic-unit matching. -----
+        let tier_b_groups = self.run_tier_b(&per_file);
+
+        // --- 8. Tier A → Tier B promotion.
+        //
+        // When a Tier A occurrence's span exactly aligns with a Tier B
+        // syntactic unit in the same file (same path, same start/end
+        // lines — i.e. the Tier A span and the Tier B unit are the same
+        // block of source), we drop that Tier A occurrence so the
+        // duplicate is reported only at the more-semantic Tier B level.
+        // If dropping leaves a Tier A group with < 2 occurrences, the
+        // whole group goes away.
+        let tier_b_unit_index = build_unit_index(&tier_b_groups);
+        for group in tier_a_groups.iter_mut() {
+            group
+                .occurrences
+                .retain(|occ| !tier_b_unit_index.contains(&occurrence_key(occ)));
+        }
+        tier_a_groups.retain(|g| g.occurrences.len() >= 2);
+
+        // --- 9. Merge and sort all groups for deterministic output. ----
+        let mut groups: Vec<MatchGroup> = tier_a_groups.into_iter().chain(tier_b_groups).collect();
         groups.sort_by(|a, b| {
             let ap = &a.occurrences[0];
             let bp = &b.occurrences[0];
-            ap.path
-                .cmp(&bp.path)
-                .then(ap.span.start_line.cmp(&bp.span.start_line))
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| ap.path.cmp(&bp.path))
+                .then_with(|| ap.span.start_line.cmp(&bp.span.start_line))
         });
 
         // Replay groups through the progress sink so the CLI can flush a
@@ -490,6 +600,157 @@ impl Scanner {
             files_scanned,
         })
     }
+
+    /// Execute Tier B on every file whose extension matches a registered
+    /// profile.
+    ///
+    /// Returns the Tier B [`MatchGroup`]s, pre-filtered by the
+    /// `tier_b_min_lines` / `tier_b_min_tokens` thresholds and with
+    /// hash-collision buckets already verified via exact normalized-token
+    /// compare.
+    fn run_tier_b(&self, per_file: &[FileBundle]) -> Vec<MatchGroup> {
+        if self.profiles.is_empty() {
+            return Vec::new();
+        }
+
+        // Collect Tier B candidates per file.
+        //
+        // Each entry pairs a file's syntactic unit with a cheap
+        // file-index reference so we can attach the path later.
+        #[derive(Clone)]
+        struct Candidate {
+            file: usize,
+            unit: SyntacticUnit,
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for (fi, bundle) in per_file.iter().enumerate() {
+            let ext = match bundle.path.extension().and_then(|s| s.to_str()) {
+                Some(e) => e,
+                None => continue,
+            };
+            let profile = match profile_for_extension(ext) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !self.profiles.iter().any(|p| p.name() == profile.name()) {
+                // Profile is registered globally but not on this Scanner.
+                continue;
+            }
+
+            let mut parser = Parser::new();
+            if parser
+                .set_language(&profile.tree_sitter_language())
+                .is_err()
+            {
+                // Incompatible grammar ABI — skip rather than panic.
+                continue;
+            }
+            let tree = match parser.parse(bundle.source.as_bytes(), None) {
+                Some(t) => t,
+                None => continue,
+            };
+            for unit in extract_units(&tree, bundle.source.as_bytes(), profile) {
+                // Threshold filtering lives here so candidates that
+                // survive are all "big enough".
+                let lines = unit.end_line.saturating_sub(unit.start_line) + 1;
+                if lines < self.config.tier_b_min_lines {
+                    continue;
+                }
+                if unit.tokens.len() < self.config.tier_b_min_tokens {
+                    continue;
+                }
+                candidates.push(Candidate { file: fi, unit });
+            }
+        }
+
+        // Bucket by hash and verify via exact normalized-token compare
+        // to rule out hash collisions.
+        let mut by_hash: FxHashMap<u64, Vec<Candidate>> = FxHashMap::default();
+        for c in candidates {
+            by_hash.entry(c.unit.hash).or_default().push(c);
+        }
+
+        let mut out: Vec<MatchGroup> = Vec::new();
+        for (_h, bucket) in by_hash {
+            if bucket.len() < 2 {
+                continue;
+            }
+            // Exact-compare partition: group members whose normalized
+            // token streams are byte-for-byte equal. This is the
+            // collision-verification step spec'd for Tier B.
+            let mut partitions: Vec<Vec<Candidate>> = Vec::new();
+            'assign: for c in bucket {
+                for part in partitions.iter_mut() {
+                    if part[0].unit.tokens == c.unit.tokens {
+                        part.push(c);
+                        continue 'assign;
+                    }
+                }
+                partitions.push(vec![c]);
+            }
+
+            for part in partitions {
+                if part.len() < 2 {
+                    continue;
+                }
+                let hash = part[0].unit.hash;
+                let mut occurrences: Vec<Occurrence> = part
+                    .iter()
+                    .map(|c| Occurrence {
+                        path: per_file[c.file].path.clone(),
+                        span: Span {
+                            start_line: c.unit.start_line,
+                            end_line: c.unit.end_line,
+                            start_byte: c.unit.start_byte,
+                            end_byte: c.unit.end_byte,
+                        },
+                    })
+                    .collect();
+                occurrences.sort_by(|a, b| {
+                    a.path
+                        .cmp(&b.path)
+                        .then(a.span.start_line.cmp(&b.span.start_line))
+                });
+
+                out.push(MatchGroup {
+                    hash,
+                    tier: Tier::B,
+                    occurrences,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Per-file bundle collected during the walk.
+///
+/// Source text is retained so Tier B can re-parse with tree-sitter
+/// without touching the filesystem again.
+struct FileBundle {
+    path: PathBuf,
+    source: String,
+    tokens: Vec<Token>,
+}
+
+/// Deterministic key identifying an occurrence's location (path + line
+/// range) for the Tier A → B promotion check.
+fn occurrence_key(occ: &Occurrence) -> (PathBuf, usize, usize) {
+    (occ.path.clone(), occ.span.start_line, occ.span.end_line)
+}
+
+/// Flat set of every (path, start_line, end_line) covered by a Tier B
+/// unit. Used to drop Tier A occurrences that coincide with a Tier B
+/// unit (the promotion rule).
+fn build_unit_index(groups: &[MatchGroup]) -> rustc_hash::FxHashSet<(PathBuf, usize, usize)> {
+    let mut idx: rustc_hash::FxHashSet<(PathBuf, usize, usize)> = rustc_hash::FxHashSet::default();
+    for g in groups {
+        for occ in &g.occurrences {
+            idx.insert(occurrence_key(occ));
+        }
+    }
+    idx
 }
 
 /// Count how many tokens fall within `[start_byte, end_byte)`.
@@ -582,7 +843,10 @@ mod tests {
     #[test]
     fn progress_sink_sees_every_file_and_group() {
         // Two files with enough duplicated tokens to clear the default
-        // Tier A thresholds (≥ 6 lines, ≥ 50 tokens).
+        // Tier A thresholds (≥ 6 lines, ≥ 50 tokens). `let`-at-file-
+        // scope isn't valid Rust so tree-sitter won't emit a
+        // `function_item` here — Tier B stays silent and the progress-
+        // sink contract we're checking is the Tier A path.
         let body: String = (0..60)
             .map(|i| format!("let x{i} = {i};\n"))
             .collect::<Vec<_>>()
