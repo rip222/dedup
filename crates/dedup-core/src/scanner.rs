@@ -2,8 +2,10 @@
 //!
 //! The scanner is the top-level orchestrator for this milestone. It:
 //!
-//! 1. Walks `root` with [`walkdir`], skipping `.git/` directories and binary
-//!    files (content-sniffed via the first 512 bytes).
+//! 1. Walks `root` with the [`ignore`] crate's `WalkBuilder` and filters
+//!    each candidate through the four-layer [`IgnoreRules`] stack
+//!    (binary sniff, size cap, `.git/`, gitignore stack, built-in
+//!    defaults, `.dedupignore`).
 //! 2. Reads each file as UTF-8 (silently skips decode failures — the PRD
 //!    says skip at debug level; logging lands in #16).
 //! 3. Tokenizes, then runs a fixed-window rolling hash with window size 50
@@ -26,31 +28,27 @@
 //!
 //! What this scanner deliberately does NOT do at this milestone:
 //!
-//! - No `ignore`-crate layers (lands in #5): we honor only the hard-coded
-//!   binary + `.git/` skip.
 //! - No parallelism (lands in #14).
 //! - No aggressive literal abstraction (lands in #10).
 //! - No typed-error surfacing for per-file I/O or parse failures: they are
 //!   silently skipped. `ScanError` exists for top-level catastrophic
 //!   failures (none today, but the surface is ready for #17).
 
+use crate::ignore::{IgnoreRules, IgnoreRulesOptions};
 use crate::rolling_hash::{Hash, Span, rolling_hash};
 use crate::tokenizer::{Token, tokenize};
 use dedup_lang::{
     LanguageProfile, SyntacticUnit, all_profiles, extract_units, profile_for_extension,
 };
+use ignore::WalkBuilder;
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use tree_sitter::Parser;
-use walkdir::WalkDir;
 
 /// The rolling-hash window size. Matches the Tier A `min_tokens` default.
 const WINDOW_SIZE: usize = 50;
-
-/// Number of leading bytes inspected for binary content-sniff.
-const BINARY_SNIFF_BYTES: usize = 512;
 
 /// Errors the scanner can emit. All per-file errors today are silently
 /// skipped; this enum exists so the API surface is stable as later issues
@@ -62,7 +60,7 @@ pub enum ScanError {
     Walk {
         path: PathBuf,
         #[source]
-        source: walkdir::Error,
+        source: ignore::Error,
     },
 }
 
@@ -114,6 +112,13 @@ pub struct ScanConfig {
     /// If true, descend into nested submodule directories (those
     /// containing a `.git` file/dir). Default false.
     pub include_submodules: bool,
+    /// Disable layer 2 (`.gitignore` / `.git/info/exclude` / global
+    /// gitignore) in the [`IgnoreRules`] stack. Layers 1, 3, and 4 still
+    /// apply. CLI flag: `--no-gitignore`.
+    pub no_gitignore: bool,
+    /// Disable layers 1–3 of the [`IgnoreRules`] stack. Layer 4
+    /// (`.dedupignore`) still applies. CLI flag: `--all`.
+    pub ignore_all: bool,
 }
 
 impl Default for ScanConfig {
@@ -126,6 +131,8 @@ impl Default for ScanConfig {
             max_file_size: 1_048_576,
             follow_symlinks: false,
             include_submodules: false,
+            no_gitignore: false,
+            ignore_all: false,
         }
     }
 }
@@ -140,6 +147,8 @@ impl From<&crate::config::Config> for ScanConfig {
             max_file_size: cfg.scan.max_file_size,
             follow_symlinks: cfg.scan.follow_symlinks,
             include_submodules: cfg.scan.include_submodules,
+            no_gitignore: false,
+            ignore_all: false,
         }
     }
 }
@@ -290,50 +299,91 @@ impl Scanner {
 
         let follow = self.config.follow_symlinks;
         let include_submodules = self.config.include_submodules;
-        let max_bytes = self.config.max_file_size;
 
-        for entry in WalkDir::new(root)
-            .follow_links(follow)
-            .into_iter()
-            .filter_entry(|e| {
-                // Skip `.git/` directories wholesale.
-                if e.file_type().is_dir() && e.file_name() == ".git" {
-                    return false;
-                }
-                // Skip nested submodule directories unless explicitly
-                // asked to include them. A submodule is identified by a
-                // `.git` entry (file or dir) inside a directory *other
-                // than* the top-level root.
-                if !include_submodules
-                    && e.file_type().is_dir()
-                    && e.depth() > 0
-                    && e.path().join(".git").exists()
-                {
-                    return false;
-                }
-                true
-            })
-        {
+        // Build the four-layer ignore-rule stack rooted at the scan root.
+        // Layer 2 (gitignore) is enforced by the walker; layers 1, 3, and
+        // 4 are consulted inline below.
+        let ignore_rules = IgnoreRules::new(
+            root,
+            IgnoreRulesOptions {
+                max_file_size: self.config.max_file_size,
+                no_gitignore: self.config.no_gitignore,
+                all: self.config.ignore_all,
+            },
+        );
+
+        let mut walker = WalkBuilder::new(root);
+        walker.follow_links(follow);
+        ignore_rules.apply_to_walk_builder(&mut walker);
+
+        for entry in walker.build() {
             let entry = match entry {
                 Ok(e) => e,
                 // Tolerate per-entry walk errors (permission denied on a
                 // sibling, symlink loop, ...) so one bad file doesn't kill
                 // the scan. Per-file graceful degradation lands in #17.
                 Err(e) => {
-                    warn!(error = %e, "scan: walkdir entry error, skipping");
+                    warn!(error = %e, "scan: walker entry error, skipping");
                     continue;
                 }
             };
-            if !entry.file_type().is_file() {
+            let abs = entry.path();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
+
+            // Layer 1: `.git/` and nested submodule directories.
+            if is_dir {
+                if ignore_rules.is_git_dir(&rel) {
+                    // `ignore::Walk` does not auto-skip nested `.git/`
+                    // contents when `git_ignore` is off, so we skip the
+                    // entry explicitly. The walker will still descend
+                    // into it, but every child will re-enter this guard
+                    // on its own rel path and be dropped.
+                    continue;
+                }
+                if !include_submodules && !rel.as_os_str().is_empty() && abs.join(".git").exists() {
+                    // Submodule roots are identified by a `.git` entry
+                    // (file or dir) below the top-level root. The
+                    // directory itself is allowed through so its
+                    // children can be filtered individually, matching
+                    // the previous walkdir behavior: drop only the
+                    // submodule *contents*, not the root entry.
+                    continue;
+                }
+                // Layer 3/4 path ignores for directories (so vendored
+                // dirs stop descending early in common cases; the walker
+                // still visits the children but the path predicate
+                // drops them).
+                if ignore_rules.is_path_ignored(&rel, true) {
+                    continue;
+                }
+                continue; // directory entries never get tokenized
+            }
+
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
 
-            let abs = entry.path();
-            // Honor the size cap before the full read — we still need
-            // metadata to make the decision, so a cheap `metadata()` is
-            // worth it over always loading the whole file.
+            // Layer 1: `.git/` file contents.
+            if ignore_rules.is_git_dir(&rel) {
+                continue;
+            }
+
+            // Submodule guard for files (mirror of the dir check above,
+            // catches files directly under a submodule root).
+            if !include_submodules && file_is_under_submodule(root, abs) {
+                continue;
+            }
+
+            // Layer 3 + Layer 4 path-based ignores.
+            if ignore_rules.is_path_ignored(&rel, false) {
+                continue;
+            }
+
+            // Layer 1: size cap. Uses metadata to avoid reading a huge
+            // file just to discard it.
             if let Ok(meta) = entry.metadata()
-                && meta.len() > max_bytes
+                && ignore_rules.is_over_size_limit(meta.len())
             {
                 continue;
             }
@@ -344,7 +394,8 @@ impl Scanner {
                     continue;
                 }
             };
-            if looks_binary(&bytes) {
+            // Layer 1: binary content sniff.
+            if ignore_rules.looks_binary(&bytes) {
                 continue;
             }
             let text = match std::str::from_utf8(&bytes) {
@@ -352,12 +403,15 @@ impl Scanner {
                 Err(e) => {
                     // UTF-8 decode is routine in a mixed-encoding tree;
                     // per the PRD this is debug-level, not warn.
-                    debug!(path = %abs.display(), error = %e, "scan: utf-8 decode failed, skipping");
+                    IgnoreRules::log_utf8_skip(abs, &e);
                     continue;
                 }
             };
+            // Layer 3: `@generated` / `AUTO-GENERATED` header scan.
+            if ignore_rules.has_generated_header(&text) {
+                continue;
+            }
 
-            let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
             let tokens = tokenize(&text);
             debug!(path = %rel.display(), tokens = tokens.len(), "scan: tokenized file");
             per_file.push(FileBundle {
@@ -764,11 +818,23 @@ fn token_count_between(tokens: &[Token], start_byte: usize, end_byte: usize) -> 
         .count()
 }
 
-/// Content-sniff for binary files: look at the first [`BINARY_SNIFF_BYTES`]
-/// bytes and treat the file as binary if any NUL byte is present. This is
-/// the same heuristic `git` and `ripgrep` use for their "is binary?" check.
-fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0)
+/// True iff `abs` lives strictly underneath a submodule-rooted directory
+/// (identified by a `.git` entry, file or dir) below `scan_root`. The
+/// scan root itself is never a submodule — its own `.git/` is a primary
+/// checkout. Used to mirror the pre-#5 walkdir `filter_entry` behavior
+/// with the new `ignore::Walk` iterator.
+fn file_is_under_submodule(scan_root: &Path, abs: &Path) -> bool {
+    let mut cur = abs.parent();
+    while let Some(dir) = cur {
+        if dir == scan_root {
+            return false;
+        }
+        if dir.join(".git").exists() {
+            return true;
+        }
+        cur = dir.parent();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -776,12 +842,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-
-    #[test]
-    fn binary_sniff_detects_nul() {
-        assert!(looks_binary(b"hello\0world"));
-        assert!(!looks_binary(b"hello world"));
-    }
 
     #[test]
     fn empty_directory_yields_no_groups() {

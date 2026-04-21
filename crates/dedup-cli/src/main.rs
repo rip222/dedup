@@ -86,10 +86,16 @@ struct Cli {
 /// without re-breaking the CLI.
 #[derive(Args, Debug, Clone)]
 pub struct GlobalArgs {
-    /// Disable the gitignore layer. Parsed and stored; full wiring lands
-    /// with the `ignore` crate integration in #5.
+    /// Disable the gitignore layer (layer 2 of the ignore-rule stack).
+    /// Layers 1, 3, and 4 still apply — see [`dedup_core::IgnoreRules`].
     #[arg(long, global = true)]
     pub no_gitignore: bool,
+
+    /// Disable layers 1–3 of the ignore-rule stack (binary sniff, size
+    /// cap, `.git/`, built-in defaults). Layer 4 (`.dedupignore`) still
+    /// applies. The flag name is deliberately `--all` per the PRD.
+    #[arg(long, global = true)]
+    pub all: bool,
 
     /// Restrict detection tier. Tier A is the language-oblivious
     /// rolling-hash scan; Tier B is per-language tree-sitter matching.
@@ -299,7 +305,10 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
         }
     };
 
-    let scanner = Scanner::new(ScanConfig::from(&config));
+    let mut scan_cfg = ScanConfig::from(&config);
+    scan_cfg.no_gitignore = globals.no_gitignore;
+    scan_cfg.ignore_all = globals.all;
+    let scanner = Scanner::new(scan_cfg);
 
     // Build the progress sink. Spinner is suppressed when:
     // - stdout is not a TTY (piped output), OR
@@ -776,6 +785,15 @@ mod tests {
         assert!(cli.globals.lang.is_empty());
         assert_eq!(cli.globals.jobs, None);
         assert!(!cli.globals.no_gitignore);
+        assert!(!cli.globals.all);
+    }
+
+    #[test]
+    fn no_gitignore_and_all_parse() {
+        let cli = Cli::parse_from(["dedup", "--no-gitignore", "scan"]);
+        assert!(cli.globals.no_gitignore);
+        let cli = Cli::parse_from(["dedup", "--all", "scan"]);
+        assert!(cli.globals.all);
     }
 
     #[test]

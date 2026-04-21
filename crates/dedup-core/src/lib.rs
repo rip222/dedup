@@ -21,6 +21,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod ignore;
 pub mod rolling_hash;
 pub mod scanner;
 pub mod tokenizer;
@@ -30,6 +31,7 @@ pub use config::{
     Config, ConfigError, Normalization, SCHEMA_VERSION as CONFIG_SCHEMA_VERSION, ScanSettings,
     Thresholds, TierAThresholds, TierBThresholds,
 };
+pub use ignore::{IgnoreRules, IgnoreRulesOptions};
 pub use rolling_hash::{Hash, Span};
 pub use scanner::{
     MatchGroup, NoopSink, Occurrence, ProgressSink, ScanConfig, ScanError, ScanResult, Scanner,

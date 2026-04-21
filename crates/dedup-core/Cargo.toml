@@ -10,6 +10,7 @@ description = "Core detection, normalization, and persistence primitives for ded
 [dependencies]
 dedup-lang = { path = "../dedup-lang" }
 dirs = "5"
+ignore = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
