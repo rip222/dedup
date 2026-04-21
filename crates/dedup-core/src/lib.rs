@@ -31,8 +31,8 @@ pub use cache::{
     Suppression,
 };
 pub use config::{
-    Config, ConfigError, Normalization, SCHEMA_VERSION as CONFIG_SCHEMA_VERSION, ScanSettings,
-    Thresholds, TierAThresholds, TierBThresholds,
+    Config, ConfigError, DetailConfig, Normalization, SCHEMA_VERSION as CONFIG_SCHEMA_VERSION,
+    ScanSettings, Thresholds, TierAThresholds, TierBThresholds,
 };
 pub use ignore::{IgnoreRules, IgnoreRulesOptions};
 pub use rolling_hash::{Hash, Span};

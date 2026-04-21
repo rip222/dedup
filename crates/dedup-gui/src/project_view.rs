@@ -16,13 +16,14 @@
 //! second, Dismissed collapsed last.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gpui::{Context, MouseButton, Window, black, div, prelude::*, px, rgb, white};
+use gpui::{Context, MouseButton, Window, black, div, prelude::*, px, rgb, uniform_list, white};
 
 use crate::app_state::{
     AppState, AppStatus, GroupView, Pane, ScanState, SortKey, SuppressionView,
@@ -1205,218 +1206,326 @@ fn render_completion_banner(
         )
 }
 
-fn render_detail(state: &AppState) -> gpui::Div {
-    let occurrences = state.selected_occurrences();
-    let mut body = div().flex().flex_col().size_full().p(px(16.0)).gap(px(8.0));
-    if occurrences.is_empty() {
-        body = body.child(
-            div()
-                .text_size(px(13.0))
-                .text_color(rgb(ROW_TEXT_DIM))
-                .child("Select a duplicate group to see its occurrences."),
-        );
-    } else {
-        body = body.child(
-            div()
-                .text_size(px(12.0))
-                .text_color(rgb(ROW_TEXT_DIM))
-                .child(format!("{} occurrences", occurrences.len())),
-        );
-        for occ in occurrences {
-            body = body.child(render_occurrence_card(state, occ));
-        }
-    }
-    body.bg(rgb(BG)).flex_1()
+/// One flattened row of the detail pane's virtualized list (issue #26).
+///
+/// A group with `N` occurrences and `M` rendered lines per occurrence
+/// flattens to `N * (M + spacing_rows) + header_rows` rows, all of
+/// which get shoveled into [`gpui::uniform_list`]. Rows are a uniform
+/// pixel height (see [`DETAIL_ROW_HEIGHT`]); the list lazy-renders only
+/// the visible window, so a group with 100+ occurrences scrolls
+/// smoothly even though the underlying vec may be tens of thousands of
+/// rows long.
+#[derive(Debug, Clone)]
+enum DetailRow {
+    /// The `{occurrences.len()} occurrences` preamble at the top of
+    /// the pane.
+    Summary(String),
+    /// One per occurrence — `path:Lstart–end`.
+    OccurrenceHeader(String),
+    /// Blank row between consecutive occurrence cards, for visual
+    /// separation in the flattened list.
+    Gap,
+    /// One rendered source line. Pre-tokenised into text segments
+    /// (already split by highlight kind + tint overlay) so the
+    /// per-frame render closure is a straight map instead of a
+    /// tokeniser.
+    CodeLine {
+        /// Absolute 1-based file line number (shown in the gutter).
+        line_number: u32,
+        /// Whether this line is dimmed context or focus.
+        is_context: bool,
+        /// Pre-coloured segments for this line, in source order.
+        segments: Vec<LineSegment>,
+    },
+    /// Placeholder when reading the source file failed.
+    Unavailable,
 }
 
-/// One occurrence card: `path:Lstart–end` header plus the highlighted
-/// source slice for that line range. Issue #24.
+/// One styled sub-string of a rendered code line.
 ///
-/// `state.current_folder` is joined with the occurrence's relative path
-/// to get the absolute path on disk. Reading / highlighting happens
-/// here synchronously — source files are small by duplicate-group
-/// definition (one function's worth of lines) and the render pass is
-/// already on the main thread. If the file can't be read (deleted,
-/// permissions, moved since the scan) we render a muted "File not
-/// available" line; no panic.
-fn render_occurrence_card(state: &AppState, occ: &crate::app_state::OccurrenceView) -> gpui::Div {
-    let header = div()
-        .text_size(px(12.0))
-        .text_color(rgb(ROW_TEXT))
-        .child(occ.label());
+/// `fg_color` is the highlight palette colour (from [`highlight`]);
+/// `bg_color` is `Some(rgb)` when the byte range lies inside an
+/// alpha-rename tint span (#25).
+#[derive(Debug, Clone)]
+struct LineSegment {
+    text: String,
+    fg_color: u32,
+    bg_color: Option<u32>,
+}
 
-    let body_el = match read_occurrence_body(state, occ) {
-        Some(body) => render_highlighted_body(&body, occ),
-        None => div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .text_size(px(11.0))
-            .text_color(rgb(ROW_TEXT_DIM))
-            .child("(file not available)")
-            .into_any_element(),
-    };
+/// Fixed row height for the detail-pane `uniform_list`. `uniform_list`
+/// measures the first item and reuses that height for every other item,
+/// so headers, gaps, and code lines all render at the same height. 20
+/// pixels at 12px font size gives ~8 px of breathing room without
+/// making the list feel sparse.
+const DETAIL_ROW_HEIGHT: f32 = 20.0;
+
+/// Width of the gutter column. Six digits at 12 px Menlo monospace is
+/// ~7 px per glyph; 48 px comfortably fits line numbers up to 999,999.
+const DETAIL_GUTTER_WIDTH: f32 = 48.0;
+
+/// Dimming applied to context lines — rendered as an alpha composite
+/// of the palette colour with the background. The palette colours are
+/// already middling-brightness so 60 % opacity is enough to clearly
+/// distinguish context from focus without washing out to unreadable.
+const CONTEXT_ALPHA: f32 = 0.55;
+
+fn render_detail(state: &AppState) -> gpui::AnyElement {
+    let occurrences = state.selected_occurrences();
+    if occurrences.is_empty() {
+        return div()
+            .size_full()
+            .p(px(16.0))
+            .bg(rgb(BG))
+            .flex_1()
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(ROW_TEXT_DIM))
+                    .child("Select a duplicate group to see its occurrences."),
+            )
+            .into_any_element();
+    }
+
+    let rows = build_detail_rows(state, occurrences);
+    let rows = Rc::new(rows);
+    let row_count = rows.len();
+
+    // The `uniform_list` lazy-renders only the visible slice — with 100+
+    // occurrences the flattened `rows` vec can hold thousands of
+    // `CodeLine` rows, but we only ever materialise what the viewport
+    // shows + a small buffer on either side.
+    let rows_for_render = rows.clone();
+    let list = uniform_list("detail-rows", row_count, move |range, _window, _cx| {
+        range
+            .map(|idx| render_detail_row(&rows_for_render[idx]))
+            .collect::<Vec<_>>()
+    })
+    .h_full()
+    .flex_1();
 
     div()
-        .px(px(12.0))
-        .py(px(8.0))
-        .bg(rgb(SIDEBAR_BG))
-        .rounded(px(4.0))
+        .size_full()
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .child(header)
-        .child(body_el)
+        .bg(rgb(BG))
+        .p(px(16.0))
+        .flex_1()
+        .child(list)
+        .into_any_element()
 }
 
-/// File contents + language hint for one occurrence, windowed to the
-/// stored line range. Returns `None` on any I/O error so the caller
-/// can show the "file not available" placeholder.
-struct OccurrenceBody {
-    /// Whole-file source — tree-sitter parses more accurately with
-    /// full context than with a windowed slice. The renderer filters
-    /// runs to the windowed range afterwards.
-    source: String,
-    /// Byte range within `source` that belongs to the occurrence's
-    /// line span (inclusive start line, inclusive end line).
-    slice: std::ops::Range<usize>,
-    /// 1-based line number of the first rendered line. Used for
-    /// line-number gutter formatting.
-    first_line: i64,
-    /// Canonical language hint (`"rust"`, `"typescript"`, ...).
-    lang_hint: Option<String>,
+/// Render one flattened row from [`build_detail_rows`].
+///
+/// Returns a fixed-height `Div` — `uniform_list` assumes every row is
+/// the same height, so all four variants use [`DETAIL_ROW_HEIGHT`].
+fn render_detail_row(row: &DetailRow) -> gpui::Div {
+    match row {
+        DetailRow::Summary(text) => div()
+            .h(px(DETAIL_ROW_HEIGHT))
+            .text_size(px(12.0))
+            .text_color(rgb(ROW_TEXT_DIM))
+            .child(text.clone()),
+        DetailRow::OccurrenceHeader(text) => div()
+            .h(px(DETAIL_ROW_HEIGHT))
+            .px(px(8.0))
+            .bg(rgb(SIDEBAR_BG))
+            .text_size(px(12.0))
+            .text_color(rgb(ROW_TEXT))
+            .child(text.clone()),
+        DetailRow::Gap => div().h(px(DETAIL_ROW_HEIGHT)),
+        DetailRow::Unavailable => div()
+            .h(px(DETAIL_ROW_HEIGHT))
+            .px(px(8.0))
+            .text_size(px(11.0))
+            .text_color(rgb(ROW_TEXT_DIM))
+            .child("(file not available)"),
+        DetailRow::CodeLine {
+            line_number,
+            is_context,
+            segments,
+        } => render_code_line(*line_number, *is_context, segments),
+    }
 }
 
-fn read_occurrence_body(
+/// Render one `[gutter][code]` row with horizontal overflow scrolling
+/// on the code cell and no wrapping — AC: "Long lines scroll
+/// horizontally; no wrap".
+fn render_code_line(line_number: u32, is_context: bool, segments: &[LineSegment]) -> gpui::Div {
+    let gutter = div()
+        .w(px(DETAIL_GUTTER_WIDTH))
+        .flex_none()
+        .text_color(rgb(if is_context {
+            dim(ROW_TEXT_DIM)
+        } else {
+            ROW_TEXT_DIM
+        }))
+        .child(format!("{line_number}"));
+
+    let mut code = div()
+        .id(("detail-code-line", line_number as u64))
+        .flex_1()
+        .overflow_x_scroll()
+        .whitespace_nowrap();
+
+    for seg in segments {
+        let fg = if is_context {
+            dim(seg.fg_color)
+        } else {
+            seg.fg_color
+        };
+        let mut node = div().text_color(rgb(fg)).child(seg.text.clone());
+        if let Some(bg) = seg.bg_color {
+            node = node.bg(rgb(bg));
+        }
+        code = code.child(node);
+    }
+
+    div()
+        .h(px(DETAIL_ROW_HEIGHT))
+        .flex()
+        .flex_row()
+        .gap(px(8.0))
+        .text_size(px(12.0))
+        .font_family("Menlo")
+        .child(gutter)
+        .child(code)
+}
+
+/// Multiply every RGB channel of `color` by [`CONTEXT_ALPHA`] against a
+/// notional black background. Keeps the dimming purely compositional —
+/// we don't need a real alpha channel, just a perceptibly quieter fg.
+fn dim(color: u32) -> u32 {
+    let r = ((color >> 16) & 0xff) as f32 * CONTEXT_ALPHA;
+    let g = ((color >> 8) & 0xff) as f32 * CONTEXT_ALPHA;
+    let b = (color & 0xff) as f32 * CONTEXT_ALPHA;
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Build the flat row list from the current occurrences. Pure helper —
+/// the closure handed to `uniform_list` is `'static` so we pre-compute
+/// everything here rather than recomputing per-frame.
+fn build_detail_rows(
+    state: &AppState,
+    occurrences: &[crate::app_state::OccurrenceView],
+) -> Vec<DetailRow> {
+    let mut out = Vec::with_capacity(occurrences.len() * 8);
+    out.push(DetailRow::Summary(format!(
+        "{} occurrences",
+        occurrences.len()
+    )));
+
+    let context_lines = state.detail_config.context_lines;
+    for (i, occ) in occurrences.iter().enumerate() {
+        if i > 0 {
+            out.push(DetailRow::Gap);
+        }
+        out.push(DetailRow::OccurrenceHeader(occ.label()));
+        match read_occurrence_source(state, occ) {
+            Some((source, lang_hint)) => {
+                let slice = crate::detail::extract_with_context(
+                    &source,
+                    occ.start_line.max(1) as u32,
+                    occ.end_line.max(1) as u32,
+                    context_lines,
+                );
+                append_slice_rows(&mut out, &source, lang_hint.as_deref(), &slice, occ);
+            }
+            None => out.push(DetailRow::Unavailable),
+        }
+    }
+
+    out
+}
+
+/// Read the source file for an occurrence; returns `(source, lang_hint)`
+/// or `None` on any I/O failure.
+fn read_occurrence_source(
     state: &AppState,
     occ: &crate::app_state::OccurrenceView,
-) -> Option<OccurrenceBody> {
+) -> Option<(String, Option<String>)> {
     let folder = state.current_folder.as_ref()?;
     let abs = folder.join(&occ.path);
     let source = std::fs::read_to_string(&abs).ok()?;
-
-    // Convert 1-based inclusive line range → byte range. Clamp both
-    // ends so a stale cache (file shortened since scan) still renders
-    // whatever lines remain rather than panicking.
-    let start_line = occ.start_line.max(1) as usize;
-    let end_line = occ.end_line.max(1) as usize;
-    let mut byte_start: Option<usize> = None;
-    let mut byte_end: usize = source.len();
-    let mut line_no: usize = 1;
-    // Walk line boundaries once.
-    for (idx, ch) in source.char_indices() {
-        if line_no == start_line && byte_start.is_none() {
-            byte_start = Some(idx);
-        }
-        if ch == '\n' {
-            if line_no == end_line {
-                byte_end = idx + 1;
-                break;
-            }
-            line_no += 1;
-        }
-    }
-    let byte_start = byte_start.unwrap_or(0);
-    let byte_end = byte_end.min(source.len()).max(byte_start);
-
     let lang_hint = crate::highlight::lang_hint_for_path(&occ.path);
-    Some(OccurrenceBody {
-        source,
-        slice: byte_start..byte_end,
-        first_line: start_line as i64,
-        lang_hint,
-    })
+    Some((source, lang_hint))
 }
 
-fn render_highlighted_body(
-    body: &OccurrenceBody,
+/// Append one [`DetailRow::CodeLine`] per line in `slice`, pre-
+/// tokenised with the same highlight + tint pipeline the non-
+/// virtualised render used.
+fn append_slice_rows(
+    out: &mut Vec<DetailRow>,
+    source: &str,
+    lang_hint: Option<&str>,
+    slice: &crate::detail::ContextualSlice,
     occ: &crate::app_state::OccurrenceView,
-) -> gpui::AnyElement {
-    use crate::highlight::{highlight, theme_color};
+) {
+    use crate::detail::LineKind;
+    use crate::highlight::highlight;
 
-    let runs = highlight(&body.source, body.lang_hint.as_deref());
-    let src = &body.source;
-    let slice = &body.slice;
+    // Highlight the whole file once — tree-sitter parses more accurately
+    // with full context than with a windowed slice, and we amortise the
+    // cost across the occurrence's lines.
+    let runs = highlight(source, lang_hint);
 
-    // Sort alpha-rename spans by start byte so the overlay merge-walk
-    // below is O(n). Tier A occurrences hand us an empty slice here; the
-    // overlay pass is then a no-op (no tints to apply).
+    // Sort tint spans once. Tier A occurrences hand us an empty vec;
+    // the overlay pass is then a no-op.
     let mut tint_spans: Vec<(usize, usize, u32)> = occ.alpha_rename_spans.clone();
     tint_spans.sort_unstable_by_key(|(s, _, _)| *s);
 
-    // Build one line-wrapping element per rendered line. We iterate
-    // through the slice's bytes and split on '\n' so a newline inside
-    // a highlight run (possible for multi-line strings) becomes a
-    // paragraph break.
-    let mut lines: Vec<gpui::Div> = Vec::new();
-    let mut current_line_children: Vec<gpui::AnyElement> = Vec::new();
-    let mut current_line_no = body.first_line;
+    for line in &slice.lines {
+        let segments = segments_for_range(source, &runs, &tint_spans, line.byte_range.clone());
+        out.push(DetailRow::CodeLine {
+            line_number: line.line_number,
+            is_context: line.kind == LineKind::Context,
+            segments,
+        });
+    }
+}
 
-    let push_line = |line_no: i64, children: Vec<gpui::AnyElement>, lines: &mut Vec<gpui::Div>| {
-        let gutter = div()
-            .w(px(40.0))
-            .text_color(rgb(ROW_TEXT_DIM))
-            .child(format!("{line_no}"));
-        lines.push(
-            div()
-                .flex()
-                .flex_row()
-                .gap(px(8.0))
-                .child(gutter)
-                .child(div().flex_1().children(children)),
-        );
-    };
+/// Clip the highlighted runs + tint spans to a single line's byte
+/// range and produce the `LineSegment` list. Runs never straddle `\n`
+/// by construction (well, except multi-line strings — but the line's
+/// `byte_range` has already been trimmed to exclude `\n` by
+/// `extract_with_context`, so any straddle is silently clipped here).
+fn segments_for_range(
+    source: &str,
+    runs: &[crate::highlight::HighlightedRun],
+    tint_spans: &[(usize, usize, u32)],
+    line: std::ops::Range<usize>,
+) -> Vec<LineSegment> {
+    use crate::highlight::theme_color;
 
+    if line.is_empty() {
+        return Vec::new();
+    }
+
+    let mut segments = Vec::new();
     for run in runs.iter() {
-        // Clip the run to the occurrence's byte window.
-        if run.end <= slice.start {
+        if run.end <= line.start {
             continue;
         }
-        if run.start >= slice.end {
+        if run.start >= line.end {
             break;
         }
-        let run_start = run.start.max(slice.start);
-        let run_end = run.end.min(slice.end);
+        let run_start = run.start.max(line.start);
+        let run_end = run.end.min(line.end);
 
-        // Subdivide the clipped run into (tint?, sub-range) pieces so
-        // identifiers that fall inside an alpha-rename span pick up the
-        // right background color. Each piece inherits the run's
-        // foreground highlight.
-        for piece in split_by_tints(run_start..run_end, &tint_spans) {
-            let text = &src[piece.range.clone()];
-            // Split each piece on newlines so each line gets its own
-            // row. Multi-line pieces are rare (alpha-rename spans cover
-            // single identifiers) but the pathological case still has to
-            // render sanely.
-            let mut parts = text.split('\n').peekable();
-            while let Some(part) = parts.next() {
-                if !part.is_empty() {
-                    let mut node = div()
-                        .text_color(rgb(theme_color(run.kind)))
-                        .child(part.to_string());
-                    if let Some(tint) = piece.tint {
-                        node = node.bg(rgb(tint));
-                    }
-                    current_line_children.push(node.into_any_element());
-                }
-                if parts.peek().is_some() {
-                    let taken = std::mem::take(&mut current_line_children);
-                    push_line(current_line_no, taken, &mut lines);
-                    current_line_no += 1;
-                }
+        for piece in split_by_tints(run_start..run_end, tint_spans) {
+            let text = source[piece.range.clone()].to_string();
+            if text.is_empty() {
+                continue;
             }
+            segments.push(LineSegment {
+                text,
+                fg_color: theme_color(run.kind),
+                bg_color: piece.tint,
+            });
         }
     }
-    if !current_line_children.is_empty() {
-        push_line(current_line_no, current_line_children, &mut lines);
-    }
 
-    div()
-        .flex()
-        .flex_col()
-        .text_size(px(12.0))
-        .font_family("Menlo")
-        .children(lines)
-        .into_any_element()
+    segments
 }
 
 /// One sub-piece of a syntax-highlighted run after overlaying the

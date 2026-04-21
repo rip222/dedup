@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use dedup_core::{AtomicProgressSink, Cache, CacheError, MatchGroup, Tier};
+use dedup_core::{AtomicProgressSink, Cache, CacheError, Config, DetailConfig, MatchGroup, Tier};
 
 /// View-model for one duplicate group as shown in the sidebar.
 ///
@@ -322,6 +322,11 @@ pub struct AppState {
     /// [`dedup_core::Cache::dismiss_hash`] (invoked by the `x` action
     /// handler in `project_view`).
     pub session_dismissed: std::collections::HashSet<u64>,
+    /// GUI detail-pane tunables (issue #26). Cached on folder open —
+    /// not reloaded per frame. Currently carries just
+    /// [`DetailConfig::context_lines`] (number of dimmed before/after
+    /// context lines).
+    pub detail_config: DetailConfig,
 }
 
 /// Which pane currently has logical focus.
@@ -595,6 +600,14 @@ impl AppState {
     /// Resets `selected_group` to the first group if any, so the detail
     /// pane isn't blank on open.
     pub fn set_folder_result(&mut self, result: FolderLoadResult) {
+        // Issue #26 — pick up `detail.context_lines` (and any future
+        // detail-pane knobs) from the project's config before we blow
+        // away `current_folder`. Config layering errors fall back to
+        // defaults so a malformed TOML doesn't break the UI; the
+        // dedicated `dedup config` subcommand already warns loudly.
+        self.detail_config = Config::load(Some(&result.folder))
+            .map(|c| c.detail)
+            .unwrap_or_default();
         self.current_folder = Some(result.folder);
         self.selected_group = result.groups.first().map(|g| g.id);
         self.groups = result.groups;

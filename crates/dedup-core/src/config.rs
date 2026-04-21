@@ -154,6 +154,25 @@ impl Default for ScanSettings {
     }
 }
 
+/// GUI detail-pane tunables (issue #26). Currently just the number of
+/// before/after context lines shown around each duplicate range; further
+/// knobs (line-wrap, highlight theme, …) can land here without growing
+/// the top-level [`Config`] schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DetailConfig {
+    /// Number of dimmed context lines to show above and below each
+    /// duplicated range in the GUI detail pane. `0` disables context
+    /// entirely. Default: 3.
+    pub context_lines: usize,
+}
+
+impl Default for DetailConfig {
+    fn default() -> Self {
+        Self { context_lines: 3 }
+    }
+}
+
 /// The resolved config — always populated from the layering rules
 /// documented on [`Config::load`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +182,7 @@ pub struct Config {
     pub thresholds: Thresholds,
     pub normalization: Normalization,
     pub scan: ScanSettings,
+    pub detail: DetailConfig,
 }
 
 impl Default for Config {
@@ -172,6 +192,7 @@ impl Default for Config {
             thresholds: Thresholds::default(),
             normalization: Normalization::default(),
             scan: ScanSettings::default(),
+            detail: DetailConfig::default(),
         }
     }
 }
@@ -186,6 +207,13 @@ struct PartialConfig {
     thresholds: Option<PartialThresholds>,
     normalization: Option<Normalization>,
     scan: Option<PartialScanSettings>,
+    detail: Option<PartialDetailConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PartialDetailConfig {
+    context_lines: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -253,6 +281,11 @@ impl PartialConfig {
             if let Some(v) = s.include_submodules {
                 base.scan.include_submodules = v;
             }
+        }
+        if let Some(d) = self.detail
+            && let Some(v) = d.context_lines
+        {
+            base.detail.context_lines = v;
         }
     }
 }
@@ -585,6 +618,30 @@ include_submodules = true
                 .join(GLOBAL_CONFIG_SUBDIR)
                 .join(CONFIG_FILE)
         );
+    }
+
+    #[test]
+    fn detail_context_lines_parses_from_toml() {
+        // Issue #26 — the GUI detail pane reads `detail.context_lines`
+        // to decide how many dimmed lines to show around each duplicate
+        // range. Verify it parses, overrides the default, and that an
+        // absent value falls through to the 3-line default.
+        let home = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        write_project(
+            root.path(),
+            r#"
+[detail]
+context_lines = 7
+"#,
+        );
+        let cfg = with_test_home(home.path(), || Config::load(Some(root.path()))).unwrap();
+        assert_eq!(cfg.detail.context_lines, 7);
+
+        // Default when unspecified.
+        let root2 = tempdir().unwrap();
+        let cfg2 = with_test_home(home.path(), || Config::load(Some(root2.path()))).unwrap();
+        assert_eq!(cfg2.detail.context_lines, 3);
     }
 
     #[test]
