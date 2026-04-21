@@ -20,7 +20,7 @@
 //! apply post-scan, `--strict` controls the exit code, progress is
 //! driven through the core's `ProgressSink` trait, and verbose / color /
 //! jobs flags are stored on the config for downstream issues (`#6` Tier
-//! B, `#14` parallelism, `#16` tracing subscriber) to pick up.
+//! B, `#14` parallelism) to pick up.
 //!
 //! # Exit codes
 //!
@@ -31,17 +31,30 @@
 //!   kind to `2` before exit).
 //! - `101` Rust panic (the default `panic = "unwind"` behavior; we do
 //!   not override it here).
+//!
+//! # Logging (issue #16)
+//!
+//! Library crates emit `tracing` events; this CLI installs a
+//! [`tracing_subscriber`] that writes to **stderr** with the pretty
+//! formatter. The filter is built from `RUST_LOG` if set, otherwise it
+//! defaults to `warn`. The `--verbose` / `-v` flag (owned by
+//! [`GlobalArgs`] per #13) lowers the default to `dedup=debug`, still
+//! overridable by `RUST_LOG`. Frontend errors use `anyhow::Result` with
+//! `.context(...)` for ergonomic propagation; library errors keep their
+//! `thiserror` enums per the PRD.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use dedup_core::{
     Cache, Config, ConfigError, GroupDetail, MatchGroup, ProgressSink, ScanConfig, Scanner,
 };
 use indicatif::{ProgressBar, ProgressStyle};
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// Root CLI parser. Subcommands live under [`Command`]; shared flags live
 /// on [`GlobalArgs`] and are flattened into this struct so every
@@ -102,9 +115,8 @@ pub struct GlobalArgs {
     #[arg(long, short = 'q', global = true, conflicts_with = "verbose")]
     pub quiet: bool,
 
-    /// Enable debug logging (`RUST_LOG=dedup=debug`). The env var is
-    /// set before any subscriber init; the subscriber itself lands in
-    /// #16.
+    /// Enable debug logging. Lowers the default `tracing` filter to
+    /// `dedup=debug`. `RUST_LOG` (when set) still wins.
     #[arg(long, short = 'v', action = ArgAction::SetTrue, global = true)]
     pub verbose: bool,
 
@@ -218,28 +230,53 @@ fn main() -> ExitCode {
         }
     };
 
-    // `-v` sets `RUST_LOG` early so the subscriber (landing in #16) can
-    // pick it up. We only set the env var if the user hasn't already
-    // overridden it — respect explicit `RUST_LOG=...` from the shell.
-    if cli.globals.verbose && std::env::var_os("RUST_LOG").is_none() {
-        // SAFETY: single-threaded at this point; nothing has spawned yet.
-        unsafe {
-            std::env::set_var("RUST_LOG", "dedup=debug");
-        }
-    }
+    // Install the tracing subscriber as early as possible so every
+    // downstream call (including the config load below) can emit.
+    init_logging(cli.globals.verbose);
 
-    match cli.command {
+    let result = match cli.command {
         Command::Scan { ref path } => run_scan(path, &cli.globals),
         Command::List { ref path } => run_list(path, &cli.globals),
         Command::Show { id, ref path } => run_show(id, path, &cli.globals),
         Command::Config { action } => match action {
-            ConfigAction::Path { path } => run_config_path(&path),
-            ConfigAction::Edit { path } => run_config_edit(&path),
+            ConfigAction::Path { path } => Ok(run_config_path(&path)),
+            ConfigAction::Edit { path } => Ok(run_config_edit(&path)),
         },
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            // `{:#}` prints the full anyhow chain on one line. Context
+            // strings added via `.context(...)` at call sites show up as
+            // the leading segment.
+            eprintln!("dedup: {err:#}");
+            ExitCode::from(2)
+        }
     }
 }
 
-fn run_scan(path: &Path, globals: &GlobalArgs) -> ExitCode {
+/// Install the process-wide [`tracing`] subscriber.
+///
+/// - Writes to stderr so scan output on stdout stays clean and pipeable.
+/// - Pretty formatter for human-readable dev output.
+/// - `EnvFilter` built from `RUST_LOG` when set; otherwise defaults to
+///   `warn` (or `dedup=debug` if `--verbose` was passed).
+///
+/// Idempotent enough in practice: `try_init` silently no-ops if a
+/// subscriber was already installed, which keeps integration tests that
+/// invoke the binary multiple times from panicking.
+fn init_logging(verbose: bool) {
+    let default = if verbose { "dedup=debug" } else { "warn" };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .pretty()
+        .try_init();
+}
+
+fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     // Load layered config before scanning. Parse errors are fatal; a
     // newer-schema file is treated as a warning and falls back to
     // defaults (the `.bak` migration flow is deferred — see #9 spec).
@@ -258,7 +295,7 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> ExitCode {
         }
         Err(e) => {
             eprintln!("dedup: config error: {e}");
-            return ExitCode::from(2);
+            return Ok(ExitCode::from(2));
         }
     };
 
@@ -276,13 +313,9 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> ExitCode {
         Box::new(dedup_core::NoopSink)
     };
 
-    let result = match scanner.scan_with_progress(path, sink.as_ref()) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("dedup: scan failed: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    let result = scanner
+        .scan_with_progress(path, sink.as_ref())
+        .with_context(|| format!("scan failed for {}", path.display()))?;
 
     // Finalize the spinner before emitting any group text so progress
     // output doesn't collide with stdout lines.
@@ -317,31 +350,23 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> ExitCode {
     print_scan_groups(&visible, &mut std::io::stdout()).ok();
 
     if had_findings && globals.strict {
-        return ExitCode::from(1);
+        return Ok(ExitCode::from(1));
     }
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
-fn run_list(path: &Path, globals: &GlobalArgs) -> ExitCode {
-    let cache = match Cache::open_readonly(path) {
-        Ok(Some(c)) => c,
-        Ok(None) => {
+fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
+    let cache = match Cache::open_readonly(path)
+        .with_context(|| format!("failed to open cache at {}", path.display()))?
+    {
+        Some(c) => c,
+        None => {
             eprintln!("dedup: No cached scan found. Run `dedup scan` first.");
-            return ExitCode::from(2);
-        }
-        Err(e) => {
-            eprintln!("dedup: failed to open cache: {e}");
-            return ExitCode::from(2);
+            return Ok(ExitCode::from(2));
         }
     };
 
-    let groups = match cache.list_groups() {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("dedup: failed to read cache: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    let groups = cache.list_groups().context("failed to read cache")?;
 
     let allow_a = tier_allows_a(globals);
 
@@ -353,56 +378,52 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> ExitCode {
         if !allow_a {
             continue;
         }
-        let detail = match cache.get_group(summary.id) {
-            Ok(Some(d)) => d,
-            Ok(None) => continue, // group vanished mid-read; skip.
-            Err(e) => {
-                eprintln!("dedup: failed to read group {}: {e}", summary.id);
-                return ExitCode::from(2);
-            }
+        let detail = match cache
+            .get_group(summary.id)
+            .with_context(|| format!("failed to read group {}", summary.id))?
+        {
+            Some(d) => d,
+            None => continue, // group vanished mid-read; skip.
         };
         if print_cached_group_full(ord + 1, &detail, &mut stdout).is_err() {
             // Broken pipe / closed stdout — treat as clean exit.
-            return ExitCode::SUCCESS;
+            return Ok(ExitCode::SUCCESS);
         }
         emitted += 1;
     }
 
     if emitted > 0 && globals.strict {
-        return ExitCode::from(1);
+        return Ok(ExitCode::from(1));
     }
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
-fn run_show(id: i64, path: &Path, _globals: &GlobalArgs) -> ExitCode {
-    let cache = match Cache::open_readonly(path) {
-        Ok(Some(c)) => c,
-        Ok(None) => {
+fn run_show(id: i64, path: &Path, _globals: &GlobalArgs) -> Result<ExitCode> {
+    let cache = match Cache::open_readonly(path)
+        .with_context(|| format!("failed to open cache at {}", path.display()))?
+    {
+        Some(c) => c,
+        None => {
             eprintln!("dedup: No cached scan found. Run `dedup scan` first.");
-            return ExitCode::from(2);
-        }
-        Err(e) => {
-            eprintln!("dedup: failed to open cache: {e}");
-            return ExitCode::from(2);
+            return Ok(ExitCode::from(2));
         }
     };
 
-    let detail = match cache.get_group(id) {
-        Ok(Some(d)) => d,
-        Ok(None) => {
+    let detail = match cache
+        .get_group(id)
+        .with_context(|| format!("failed to read group {id}"))?
+    {
+        Some(d) => d,
+        None => {
             eprintln!("dedup: no group with id {id}");
-            return ExitCode::from(2);
-        }
-        Err(e) => {
-            eprintln!("dedup: failed to read cache: {e}");
-            return ExitCode::from(2);
+            return Ok(ExitCode::from(2));
         }
     };
 
     let mut stdout = std::io::stdout();
     print_cached_group_show(&detail, &mut stdout).ok();
 
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `dedup config path` — print one line per config layer with a
