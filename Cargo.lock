@@ -1440,6 +1440,7 @@ dependencies = [
  "insta",
  "jsonschema",
  "predicates",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

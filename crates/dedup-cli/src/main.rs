@@ -51,8 +51,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use dedup_core::{
-    Cache, Config, ConfigError, FileIssueCounts, GroupDetail, MatchGroup, ProgressSink, ScanConfig,
-    Scanner, Tier,
+    Cache, CacheError, Config, ConfigError, FileIssueCounts, GroupDetail, MatchGroup, ProgressSink,
+    ScanConfig, Scanner, Tier,
 };
 use human_panic::setup_panic;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -372,7 +372,52 @@ fn init_logging(verbose: bool) {
         .try_init();
 }
 
+/// Probe the on-disk cache (if any) for a newer-than-supported schema.
+///
+/// Issue #18 acceptance: if `PRAGMA user_version` on the cache file is
+/// greater than the running build's `CURRENT_SCHEMA_VERSION`, the file
+/// must be left untouched and the user must see a "Cache created by
+/// newer Dedup version. Rescan?" prompt on stderr. The CLI surfaces this
+/// once, up front, before any other cache-opening work.
+///
+/// Returns:
+/// - `Ok(None)` — no newer-schema cache detected. Caller proceeds.
+/// - `Ok(Some(exit_code))` — newer schema detected and the user declined
+///   (non-TTY, no `--yes`, or answered "no"). Caller returns this code
+///   immediately without further cache work.
+/// - `Err(_)` — genuine cache I/O error unrelated to schema version.
+fn check_newer_schema(path: &Path) -> Result<Option<ExitCode>> {
+    match Cache::open_readonly(path) {
+        Ok(_) => Ok(None),
+        Err(CacheError::NewerSchema { found, supported }) => {
+            // Match the error's `Display`, but add the actionable hint.
+            // Written to stderr so machine-readable stdout (scan / list
+            // output) stays clean when callers script around this.
+            eprintln!(
+                "dedup: Cache created by newer Dedup version (schema {found} > \
+                 supported {supported}). Rescan? Run `dedup clean --yes` first to \
+                 discard the cache, or upgrade dedup to read it."
+            );
+            // Exit code 2 — matches the PRD convention for "usage error /
+            // user-actionable refusal". We do NOT destroy the cache or
+            // fall through to writing it; the acceptance criterion is
+            // explicit that the file is preserved in place.
+            Ok(Some(ExitCode::from(2)))
+        }
+        Err(e) => Err(anyhow::Error::new(e)),
+    }
+}
+
 fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
+    // Before anything expensive, check the cache's schema version. If
+    // it's newer than this build, surface the prompt + exit without
+    // touching the file. Scanning would succeed in memory but we'd fail
+    // to persist — better to refuse up front than to silently drop the
+    // scan output on the floor.
+    if let Some(code) = check_newer_schema(path)? {
+        return Ok(code);
+    }
+
     // Load layered config before scanning. Parse errors are fatal; a
     // newer-schema file is treated as a warning and falls back to
     // defaults (the `.bak` migration flow is deferred — see #9 spec).
@@ -544,6 +589,9 @@ fn resolve_log_dir_for_panic() -> String {
 }
 
 fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
+    if let Some(code) = check_newer_schema(path)? {
+        return Ok(code);
+    }
     let cache = match Cache::open_readonly(path)
         .with_context(|| format!("failed to open cache at {}", path.display()))?
     {
@@ -636,6 +684,9 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
 }
 
 fn run_show(id: i64, path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
+    if let Some(code) = check_newer_schema(path)? {
+        return Ok(code);
+    }
     let cache = match Cache::open_readonly(path)
         .with_context(|| format!("failed to open cache at {}", path.display()))?
     {
@@ -690,6 +741,9 @@ fn run_show(id: i64, path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
 /// - Unknown group id → exit 2, telling the user which id they named.
 /// - Any other cache failure bubbles up through `anyhow`.
 fn run_dismiss(id: i64, path: &Path) -> Result<ExitCode> {
+    if let Some(code) = check_newer_schema(path)? {
+        return Ok(code);
+    }
     let mut cache = match Cache::open_readonly(path)
         .with_context(|| format!("failed to open cache at {}", path.display()))?
     {
@@ -727,6 +781,9 @@ fn run_dismiss(id: i64, path: &Path) -> Result<ExitCode> {
 /// JSON mode: NDJSON — one JSON object per line with the same fields.
 /// SARIF mode: falls back to text (suppressions aren't a SARIF concept).
 fn run_suppressions_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
+    if let Some(code) = check_newer_schema(path)? {
+        return Ok(code);
+    }
     let cache = match Cache::open_readonly(path)
         .with_context(|| format!("failed to open cache at {}", path.display()))?
     {
@@ -772,6 +829,9 @@ fn run_suppressions_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> 
 /// `dedup suppressions clear` — truncate the suppressions table. Prints
 /// how many rows were removed so scripts can assert.
 fn run_suppressions_clear(path: &Path) -> Result<ExitCode> {
+    if let Some(code) = check_newer_schema(path)? {
+        return Ok(code);
+    }
     let mut cache = match Cache::open_readonly(path)
         .with_context(|| format!("failed to open cache at {}", path.display()))?
     {

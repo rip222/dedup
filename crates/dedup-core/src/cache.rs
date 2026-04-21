@@ -12,17 +12,19 @@
 //! - Auto-`.gitignore`: on fresh `.dedup/` creation we write a single-line
 //!   `*` `.gitignore`. If the user has customized the file, we leave it
 //!   alone (idempotent create).
-//! - Schema v1: tracked in a `schema_version` metadata table so later
-//!   issues (#18) can extend with real migrations. The migration runner
-//!   here is a stub: opening at v1 is a no-op.
+//! - Schema versioning (issue #18): the schema version is tracked in
+//!   SQLite's `PRAGMA user_version` (an integer stored in the database
+//!   file header). A small migration runner walks a `(from, fn)` ladder
+//!   on open. A cache whose `user_version` is *newer* than the running
+//!   build is left untouched on disk and surfaces as
+//!   [`CacheError::NewerSchema`] so the CLI can print a "rescan?" prompt.
 //! - Idempotent writes: [`Cache::write_scan_result`] wraps a full replace
 //!   of `match_groups` (cascade-deletes occurrences) in a single
 //!   transaction so a second write on the same repo yields the second
-//!   write's state, not a union.
-//!
-//! Out of scope here (punted to later issues per the PRD / issue #4 spec):
-//!
-//! - Concurrent-writer testing and real schema bumps (→ #18).
+//!   write's state, not a union. `put_file_entry` and `dismiss_hash` use
+//!   `INSERT OR REPLACE`, so content-hash-keyed writes are idempotent
+//!   and safe under concurrent writers (WAL auto-retries via
+//!   `busy_timeout`).
 //!
 //! # Warm-scan cache (issue #14)
 //!
@@ -69,9 +71,24 @@ use crate::scanner::{MatchGroup, Occurrence, ScanResult, Tier};
 pub const CACHE_DIR: &str = ".dedup";
 /// File name of the SQLite database inside [`CACHE_DIR`].
 pub const CACHE_FILE: &str = "cache.sqlite";
-/// The schema version this build understands. Bumped in #18 when the
-/// schema evolves.
-pub const SCHEMA_VERSION: i64 = 1;
+/// The schema version this build understands. Bumped when the on-disk
+/// schema evolves. The migration runner in [`run_migrations`] walks from
+/// whatever `PRAGMA user_version` reports up to this number.
+///
+/// v1 folds in every table/column that existed in the ad-hoc `probe-and-
+/// add` era (issues #4, #6, #11, #14, #17): no real user databases ship
+/// v0, so collapsing the history into a single-step bootstrap is safe.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// Backwards-compatible alias for [`CURRENT_SCHEMA_VERSION`]. Kept so
+/// `pub use` consumers of this crate don't break on the #18 rename.
+pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION as i64;
+
+/// Busy-timeout every [`Cache`] connection runs with. Long enough that a
+/// normal scan/list/show contention window (sub-second) auto-retries
+/// without surfacing `SQLITE_BUSY` to the caller, short enough that a
+/// genuinely stuck writer still fails loudly.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Errors the cache layer can surface. Most are thin wrappers around
 /// `rusqlite::Error` / `std::io::Error` so callers can `?` through.
@@ -87,10 +104,13 @@ pub enum CacheError {
         source: std::io::Error,
     },
 
+    /// The on-disk cache declares a schema version newer than this build
+    /// understands. The file is left untouched — the CLI surfaces a
+    /// "rescan?" prompt, the GUI surfaces a toast (issue #30).
     #[error(
-        "cache schema version {found} is newer than supported version {supported}; upgrade dedup"
+        "Cache created by newer Dedup version (schema {found} > supported {supported}). Rescan?"
     )]
-    FutureSchema { found: i64, supported: i64 },
+    NewerSchema { found: u32, supported: u32 },
 }
 
 /// Summary row returned by [`Cache::list_groups`]. One entry per stored
@@ -190,8 +210,12 @@ impl Cache {
     /// 1. Creates `<repo_root>/.dedup/` if missing.
     /// 2. Writes `<repo_root>/.dedup/.gitignore` with `*` if missing.
     /// 3. Opens/creates `<repo_root>/.dedup/cache.sqlite`.
-    /// 4. Enables `foreign_keys` and `journal_mode = WAL`.
-    /// 5. Creates or verifies schema v1.
+    /// 4. Enables `foreign_keys`, `journal_mode = WAL`, and a 5-second
+    ///    `busy_timeout` so concurrent writers auto-retry briefly instead
+    ///    of surfacing `SQLITE_BUSY`.
+    /// 5. Runs the migration ladder up to [`CURRENT_SCHEMA_VERSION`]. If
+    ///    the on-disk `user_version` is *newer* than this build, the file
+    ///    is left untouched and [`CacheError::NewerSchema`] is returned.
     pub fn open(repo_root: &Path) -> Result<Self, CacheError> {
         let dir = repo_root.join(CACHE_DIR);
         if !dir.exists() {
@@ -213,9 +237,12 @@ impl Cache {
         }
 
         let db_path = dir.join(CACHE_FILE);
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
         configure_connection(&conn)?;
-        ensure_schema(&conn)?;
+        // IMPORTANT: migration runner must run AFTER WAL + busy_timeout
+        // are set so any CREATE TABLE contention with a parallel opener
+        // is retried rather than erroring out.
+        ensure_schema(&mut conn)?;
 
         let mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
@@ -234,6 +261,9 @@ impl Cache {
     /// Returns `Ok(None)` if `<repo_root>/.dedup/cache.sqlite` does not
     /// exist. Never creates any files or directories — this is the mode
     /// `dedup list` / `dedup show` use.
+    ///
+    /// A newer-than-supported schema surfaces as [`CacheError::NewerSchema`];
+    /// the on-disk file is not modified in that case.
     pub fn open_readonly(repo_root: &Path) -> Result<Option<Self>, CacheError> {
         let db_path = repo_root.join(CACHE_DIR).join(CACHE_FILE);
         if !db_path.exists() {
@@ -249,18 +279,22 @@ impl Cache {
         // semantics. WAL mode sticks to the database file itself, so
         // setting it here is a cheap no-op if already WAL.
         configure_connection(&conn)?;
-        // Schema check: refuse to operate on a future schema. Upgrading is
-        // #18's job.
-        let version = read_schema_version(&conn)?;
-        if version > SCHEMA_VERSION {
+        // Schema check: refuse to operate on a newer schema. We do NOT
+        // run migrations here — open_readonly is used by list/show/dismiss
+        // and must never mutate a freshly-opened DB's schema. If the file
+        // is at an older version than we support we also refuse rather
+        // than silently upgrading through a read-only path; the caller
+        // should fall back to [`Cache::open`] to trigger migrations.
+        let version = read_user_version(&conn)?;
+        if version > CURRENT_SCHEMA_VERSION {
             warn!(
                 found = version,
-                supported = SCHEMA_VERSION,
+                supported = CURRENT_SCHEMA_VERSION,
                 "cache: schema newer than supported build"
             );
-            return Err(CacheError::FutureSchema {
+            return Err(CacheError::NewerSchema {
                 found: version,
-                supported: SCHEMA_VERSION,
+                supported: CURRENT_SCHEMA_VERSION,
             });
         }
 
@@ -613,10 +647,11 @@ impl Cache {
         Ok(n)
     }
 
-    /// The current database schema version. Public so tests can assert
-    /// on it directly; callers shouldn't normally need it.
+    /// The current database schema version, as reported by
+    /// `PRAGMA user_version`. Public so tests can assert on it directly;
+    /// callers shouldn't normally need it.
     pub fn schema_version(&self) -> Result<i64, CacheError> {
-        read_schema_version(&self.conn)
+        Ok(read_user_version(&self.conn)? as i64)
     }
 
     /// The active journal mode. Useful for tests that assert WAL is
@@ -630,76 +665,133 @@ impl Cache {
 }
 
 /// Apply the pragmas every connection needs: WAL journal, foreign keys,
-/// and a reasonable busy timeout for the common case of a second process
-/// (list/show) briefly contending with a write (scan).
+/// and a reasonable busy timeout so concurrent writers auto-retry instead
+/// of surfacing `SQLITE_BUSY` to callers during a normal scan/list/show
+/// contention window.
 fn configure_connection(conn: &Connection) -> Result<(), CacheError> {
     // Order matters: set WAL first so the `.wal` sidecar exists, then
-    // turn on FKs so cascade-delete works for occurrences.
+    // turn on FKs so cascade-delete works for occurrences. The busy
+    // timeout is load-bearing for issue #18's concurrent-writer story:
+    // WAL lets multiple readers + one writer coexist without blocking,
+    // but two *writers* briefly serialize; without a busy timeout the
+    // second would surface `SQLITE_BUSY` immediately.
     let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    // 5s is plenty for tiny repos; #18 will revisit.
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(())
 }
 
-/// Create schema v1 if missing, or run the (trivial) migration sequence
-/// to bring an older version up to v1. This is the migration-runner stub
-/// the issue calls for.
-fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_version (\
-            version INTEGER NOT NULL PRIMARY KEY\
-         );",
-    )?;
+/// A single migration step: given a transaction sitting at `from_version`,
+/// apply schema deltas that bring it to `from_version + 1`. The runner
+/// sets `PRAGMA user_version` on commit; each step only touches DDL.
+type MigrationFn = fn(&rusqlite::Transaction<'_>) -> Result<(), CacheError>;
 
-    let current: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        [],
-        |row| row.get(0),
-    )?;
+/// Ordered ladder of schema migrations. Each entry is `(from_version, fn)`:
+/// the migration runner runs every entry whose `from_version >= current`
+/// and `< CURRENT_SCHEMA_VERSION` in order, bumping the stored version as
+/// it goes.
+///
+/// Today there is exactly one step (`0 → 1`), which bootstraps the entire
+/// schema — folding in the ad-hoc columns/tables that earlier issues
+/// (#6 `tier`, #11 `suppressions`, #14 `size`/`mtime` + `file_blocks`)
+/// added as probe-and-add tweaks to the pre-#18 "stub migration runner".
+/// Consolidation is safe because no real user DBs exist yet; the only
+/// pre-#18 databases are dev scratchpads regenerated on every run. A
+/// future v2 entry would add a new `(1, migrate_v1_to_v2)` row.
+const MIGRATIONS: &[(u32, MigrationFn)] = &[(0, migrate_v0_to_v1)];
 
-    if current > SCHEMA_VERSION {
+/// Ensure the cache is at [`CURRENT_SCHEMA_VERSION`].
+///
+/// Semantics:
+/// - `user_version == 0` on a fresh or legacy-stub DB → run all
+///   migrations whose `from_version >= 0`.
+/// - `user_version < CURRENT_SCHEMA_VERSION` → run the remaining ladder.
+/// - `user_version == CURRENT_SCHEMA_VERSION` → no-op, cheap open.
+/// - `user_version > CURRENT_SCHEMA_VERSION` → refuse. The file is left
+///   untouched (no DDL runs) and we surface `NewerSchema` so the CLI can
+///   print a "rescan?" prompt. This is the core acceptance criterion of
+///   issue #18.
+fn ensure_schema(conn: &mut Connection) -> Result<(), CacheError> {
+    let current = read_user_version(conn)?;
+
+    if current > CURRENT_SCHEMA_VERSION {
         warn!(
             found = current,
-            supported = SCHEMA_VERSION,
+            supported = CURRENT_SCHEMA_VERSION,
             "cache: schema newer than supported build"
         );
-        return Err(CacheError::FutureSchema {
+        return Err(CacheError::NewerSchema {
             found: current,
-            supported: SCHEMA_VERSION,
+            supported: CURRENT_SCHEMA_VERSION,
         });
     }
 
-    // Walk the migration ladder. Today there is exactly one step, from 0
-    // to 1. #18 extends this with more entries.
-    if current < 1 {
-        migrate_v0_to_v1(conn)?;
-        conn.execute(
-            "INSERT INTO schema_version (version) VALUES (?1)",
-            params![1_i64],
-        )?;
+    // Handle one legacy edge case before running migrations: the pre-#18
+    // stub runner tracked versions in a `schema_version` table and never
+    // set `PRAGMA user_version`. If such a DB exists (dev-only — no real
+    // users shipped it), read the stub value, stamp `user_version`
+    // accordingly, and drop the defunct table. The actual schema DDL is
+    // identical to v1 already, so the ladder below is a no-op from here.
+    let legacy = legacy_schema_version(conn)?;
+    if let Some(v) = legacy
+        && current == 0
+        && v >= 1
+        && v <= CURRENT_SCHEMA_VERSION
+    {
+        conn.execute("DROP TABLE IF EXISTS schema_version", [])?;
+        conn.pragma_update(None, "user_version", v)?;
+        return Ok(());
     }
 
-    // Opening an already-current cache is a no-op: the loop above simply
-    // falls through. This keeps `Cache::open` cheap on every run.
-
+    run_migrations(conn, current, CURRENT_SCHEMA_VERSION)?;
     Ok(())
 }
 
-/// Create the initial v1 schema.
+/// Walk the migration ladder from `from` up to (but not past) `to`, each
+/// step inside its own transaction. Stamping `user_version` is part of
+/// the same transaction so a crash mid-migration can never leave the DB
+/// at a version the DDL didn't actually finish.
+fn run_migrations(conn: &mut Connection, from: u32, to: u32) -> Result<(), CacheError> {
+    let mut current = from;
+    while current < to {
+        // Look up the step for `current`. If no entry matches, we've
+        // reached the top of the declared ladder — log and bail out so a
+        // miscounted CURRENT_SCHEMA_VERSION bump is loud instead of
+        // silently "succeeding" with an unmigrated DB.
+        let step = MIGRATIONS
+            .iter()
+            .find(|(from_v, _)| *from_v == current)
+            .ok_or_else(|| {
+                CacheError::Sqlite(rusqlite::Error::ToSqlConversionFailure(
+                    format!("no migration registered for schema version {current}").into(),
+                ))
+            })?;
+        let next = current + 1;
+        let tx = conn.transaction()?;
+        (step.1)(&tx)?;
+        tx.pragma_update(None, "user_version", next)?;
+        tx.commit()?;
+        info!(from = current, to = next, "cache: migration applied");
+        current = next;
+    }
+    Ok(())
+}
+
+/// Bootstrap the v1 schema. Folds in every table/column that earlier
+/// issues added as ad-hoc tweaks:
 ///
-/// The `match_groups.tier` column was added in issue #6 as part of the
-/// Tier B rollout. Because v1 has no production deployments yet (#4
-/// just shipped), we extend the v1 schema directly rather than
-/// bumping to v2; `tier` stores `"A"` or `"B"` as TEXT and defaults to
-/// `"A"` for any row written by older code.
-fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
-    // NOTE: the `suppressions` table was added as part of issue #11 before
-    // any production v1 deployments; per the same "extend v1 in place"
-    // reasoning that applied to `match_groups.tier` (issue #6), we fold
-    // it into the v1 bootstrap rather than bumping to v2. #18 will
-    // introduce the real migration runner.
-    conn.execute_batch(
+/// - `match_groups.tier` — issue #6 (Tier B)
+/// - `file_hashes.size` / `file_hashes.mtime` — issue #14 (warm cache)
+/// - `file_blocks` — issue #14 (warm cache)
+/// - `suppressions` — issue #11 (dismiss)
+///
+/// All are created up-front here rather than as a chain of ALTER TABLEs
+/// because no production v1 DBs exist; the consolidation is a one-time
+/// clean-up. `CREATE TABLE IF NOT EXISTS` guards make the step idempotent
+/// against dev DBs that already had the tables from the pre-#18 stub
+/// runner — `ensure_schema` stamps `user_version = 1` on those in place.
+fn migrate_v0_to_v1(tx: &rusqlite::Transaction<'_>) -> Result<(), CacheError> {
+    tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS file_hashes (\
             path         TEXT PRIMARY KEY,\
             content_hash BLOB NOT NULL,\
@@ -737,41 +829,23 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), CacheError> {
             last_group_id  INTEGER\
          );",
     )?;
-    // Additive columns for v1 in-place extension (issue #14). These are
-    // ADD COLUMN IF-they-don't-exist idempotent probes: SQLite errors on
-    // a duplicate column, which we tolerate. A real migration runner
-    // lands in #18.
-    add_column_if_missing(conn, "file_hashes", "size", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "file_hashes", "mtime", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
 }
 
-/// `ALTER TABLE ... ADD COLUMN` guarded against a pre-existing column.
-/// Tolerates the "duplicate column name" error so re-opening an older
-/// cache that already has the column is a no-op.
-fn add_column_if_missing(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    decl: &str,
-) -> Result<(), CacheError> {
-    // Probe for the column via PRAGMA table_info.
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let cols: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<_, _>>()?;
-    if cols.iter().any(|c| c == column) {
-        return Ok(());
-    }
-    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
-    conn.execute(&sql, [])?;
-    Ok(())
+/// Read `PRAGMA user_version` as a `u32`. SQLite stores it as a signed
+/// 32-bit integer; negative values would be a corrupted-header edge case
+/// we'd never write ourselves, so we clamp to 0 rather than surfacing an
+/// error.
+fn read_user_version(conn: &Connection) -> Result<u32, CacheError> {
+    let raw: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    Ok(raw.max(0) as u32)
 }
 
-fn read_schema_version(conn: &Connection) -> Result<i64, CacheError> {
-    // Be defensive: if the metadata table doesn't exist, report 0 rather
-    // than erroring. This lets `open_readonly` gracefully handle the
-    // "file exists but schema never ran" edge case.
+/// Peek at the legacy pre-#18 `schema_version` table, if it exists.
+/// Returns `None` when absent (fresh DB or modern DB). Used by
+/// [`ensure_schema`] to promote pre-#18 dev DBs (whose schema matches v1
+/// already) to `PRAGMA user_version = 1` without re-running DDL.
+fn legacy_schema_version(conn: &Connection) -> Result<Option<u32>, CacheError> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master \
          WHERE type = 'table' AND name = 'schema_version'",
@@ -779,14 +853,14 @@ fn read_schema_version(conn: &Connection) -> Result<i64, CacheError> {
         |row| row.get(0),
     )?;
     if exists == 0 {
-        return Ok(0);
+        return Ok(None);
     }
-    let version: i64 = conn.query_row(
+    let v: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_version",
         [],
         |row| row.get(0),
     )?;
-    Ok(version)
+    Ok(Some(v.max(0) as u32))
 }
 
 /// Sum up `(total_lines, total_tokens)` across a group's occurrences.
@@ -1302,5 +1376,234 @@ mod tests {
 
         // Row still present after the scan write.
         assert!(cache.file_fingerprint(&path).unwrap().is_some());
+    }
+
+    // --- Schema versioning (issue #18) --------------------------------
+
+    #[test]
+    fn user_version_stamped_on_fresh_open() {
+        // A fresh DB must be stamped with `PRAGMA user_version` =
+        // CURRENT_SCHEMA_VERSION so re-opens recognize it as current and
+        // skip the migration ladder.
+        let dir = tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let raw: i64 = cache
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw, CURRENT_SCHEMA_VERSION as i64);
+    }
+
+    #[test]
+    fn newer_schema_is_preserved_and_surfaces_error() {
+        // Core acceptance criterion of #18: a DB whose user_version is
+        // *newer* than this build must (a) surface NewerSchema and (b)
+        // leave the file bytes untouched.
+        let dir = tempdir().unwrap();
+        {
+            let _ = Cache::open(dir.path()).unwrap();
+        }
+        let db_path = dir.path().join(CACHE_DIR).join(CACHE_FILE);
+
+        // Bump user_version out-of-band to a far-future value.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "user_version", 999_u32).unwrap();
+        }
+
+        let bytes_before = std::fs::read(&db_path).unwrap();
+
+        // open() must refuse and leave the file untouched.
+        match Cache::open(dir.path()) {
+            Err(CacheError::NewerSchema { found, supported }) => {
+                assert_eq!(found, 999);
+                assert_eq!(supported, CURRENT_SCHEMA_VERSION);
+            }
+            Err(other) => panic!("expected NewerSchema, got {other:?}"),
+            Ok(_) => panic!("expected NewerSchema error, got success"),
+        }
+
+        // open_readonly must refuse the same way.
+        match Cache::open_readonly(dir.path()) {
+            Err(CacheError::NewerSchema { found: 999, .. }) => {}
+            Err(other) => panic!("expected NewerSchema, got {other:?}"),
+            Ok(_) => panic!("expected NewerSchema error, got success"),
+        }
+
+        let bytes_after = std::fs::read(&db_path).unwrap();
+        assert_eq!(
+            bytes_before, bytes_after,
+            "cache file must be preserved byte-for-byte when newer schema refused"
+        );
+    }
+
+    #[test]
+    fn legacy_stub_db_promoted_to_user_version() {
+        // Pre-#18 dev DBs recorded the version in a `schema_version`
+        // table and left PRAGMA user_version = 0. ensure_schema should
+        // promote those in place (no DDL re-run, no data loss) by
+        // stamping user_version and dropping the defunct table.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(CACHE_DIR)).unwrap();
+        let db_path = dir.path().join(CACHE_DIR).join(CACHE_FILE);
+
+        {
+            // Hand-roll the pre-#18 layout: full v1 schema + legacy
+            // `schema_version` table with value 1. user_version stays 0.
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL PRIMARY KEY);\
+                 INSERT INTO schema_version (version) VALUES (1);\
+                 CREATE TABLE match_groups (\
+                    id INTEGER PRIMARY KEY, group_hash BLOB NOT NULL,\
+                    occurrence_count INTEGER, total_tokens INTEGER,\
+                    total_lines INTEGER, tier TEXT NOT NULL DEFAULT 'A');\
+                 CREATE TABLE occurrences (\
+                    id INTEGER PRIMARY KEY,\
+                    group_id INTEGER NOT NULL REFERENCES match_groups(id) \
+                        ON DELETE CASCADE,\
+                    path TEXT NOT NULL, start_line INTEGER, end_line INTEGER,\
+                    start_byte INTEGER, end_byte INTEGER);\
+                 CREATE TABLE file_hashes (\
+                    path TEXT PRIMARY KEY, content_hash BLOB NOT NULL,\
+                    scanned_at INTEGER, size INTEGER NOT NULL DEFAULT 0,\
+                    mtime INTEGER NOT NULL DEFAULT 0);\
+                 CREATE TABLE file_blocks (\
+                    path TEXT PRIMARY KEY, content_hash BLOB NOT NULL,\
+                    block_hashes BLOB NOT NULL);\
+                 CREATE TABLE suppressions (\
+                    group_hash BLOB PRIMARY KEY, dismissed_at INTEGER NOT NULL,\
+                    last_group_id INTEGER);",
+            )
+            .unwrap();
+        }
+
+        let cache = Cache::open(dir.path()).expect("legacy DB should be promoted");
+        assert_eq!(cache.schema_version().unwrap(), 1);
+
+        // The legacy table should be gone after promotion.
+        let exists: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "legacy schema_version table should be dropped");
+    }
+
+    #[test]
+    fn put_file_entry_is_idempotent_on_same_hash() {
+        // Content-hash-keyed writes: calling put_file_entry twice with
+        // the same hash must converge (row count unchanged, no error).
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let path = PathBuf::from("idempotent.rs");
+        let fp = FileFingerprint {
+            content_hash: 0xfeed_face_cafe_0001,
+            size: 42,
+            mtime: 1_700_000_000,
+        };
+        let blocks = vec![0xaa, 0xbb, 0xcc];
+
+        cache.put_file_entry(&path, &fp, &blocks).unwrap();
+        cache.put_file_entry(&path, &fp, &blocks).unwrap();
+        cache.put_file_entry(&path, &fp, &blocks).unwrap();
+
+        let hash_count: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_hashes WHERE path = ?1",
+                params![path_to_posix_str(&path)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hash_count, 1, "duplicate writes should not add rows");
+        let blocks_count: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_blocks WHERE path = ?1",
+                params![path_to_posix_str(&path)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocks_count, 1);
+    }
+
+    #[test]
+    fn concurrent_writers_on_same_db_converge() {
+        // Two threads, each with their own `Connection` to the same DB,
+        // writing overlapping `put_file_entry` calls. WAL + busy_timeout
+        // must let them both land without corruption and with idempotent
+        // convergence on shared keys.
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().unwrap();
+        // Materialize the schema up front so the two writer threads
+        // don't both try to run migrations concurrently.
+        {
+            let _ = Cache::open(dir.path()).unwrap();
+        }
+        let root: Arc<PathBuf> = Arc::new(dir.path().to_path_buf());
+
+        let writer = |thread_id: usize, root: Arc<PathBuf>| {
+            let mut cache = Cache::open(&root).unwrap();
+            for i in 0..50 {
+                // Interleave writes: half of the keys are thread-unique,
+                // half are shared so both writers target the same row.
+                let shared = i % 2 == 0;
+                let path = if shared {
+                    PathBuf::from(format!("shared-{i}.rs"))
+                } else {
+                    PathBuf::from(format!("t{thread_id}-{i}.rs"))
+                };
+                let fp = FileFingerprint {
+                    content_hash: if shared {
+                        0x1111_2222_3333_4444
+                    } else {
+                        0xdead_0000_0000_0000 | (thread_id as u64) << 32 | (i as u64)
+                    },
+                    size: i as u64,
+                    mtime: i as i64,
+                };
+                cache.put_file_entry(&path, &fp, &[i as u64]).unwrap();
+            }
+        };
+
+        let h1 = {
+            let r = Arc::clone(&root);
+            thread::spawn(move || writer(1, r))
+        };
+        let h2 = {
+            let r = Arc::clone(&root);
+            thread::spawn(move || writer(2, r))
+        };
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        // Verify final state: every shared key is present exactly once
+        // (idempotent convergence); every thread-unique key is present.
+        let cache = Cache::open(dir.path()).unwrap();
+        let shared_count: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_hashes WHERE path LIKE 'shared-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_count, 25, "25 shared keys, one row each");
+        let unique_count: i64 = cache
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_hashes WHERE path LIKE 't%-%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unique_count, 50, "25 unique keys per thread, 2 threads");
     }
 }

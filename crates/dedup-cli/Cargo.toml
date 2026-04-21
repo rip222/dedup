@@ -26,5 +26,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 assert_cmd = "2"
 insta = "1"
 jsonschema = { version = "0.46", default-features = false, features = ["resolve-file"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
 predicates = "3"

@@ -8,7 +8,9 @@
 
 use std::path::PathBuf;
 
-use dedup_core::{Cache, MatchGroup, Occurrence, ScanResult, Span, Tier};
+use dedup_core::{
+    Cache, CacheError, FileFingerprint, MatchGroup, Occurrence, ScanResult, Span, Tier,
+};
 use tempfile::tempdir;
 
 fn sample_result() -> ScanResult {
@@ -188,4 +190,174 @@ fn readonly_open_returns_none_without_cache() {
     assert!(Cache::open_readonly(dir.path()).unwrap().is_none());
     // And .dedup/ was never created.
     assert!(!dir.path().join(".dedup").exists());
+}
+
+// --- Schema versioning + WAL concurrency (issue #18) --------------------
+
+#[test]
+fn concurrent_writers_both_succeed() {
+    // The acceptance-criterion test: two writers, each holding their own
+    // Connection to the same `.dedup/cache.sqlite`, both write, both
+    // read, no corruption.
+    //
+    // We use threads-with-separate-Connections rather than two processes.
+    // For SQLite's WAL + busy_timeout path, the unit of serialization is
+    // a Connection, not a process: a writer from any process with its
+    // own connection takes the same reserved-lock path and is subject to
+    // the same `SQLITE_BUSY` + retry loop. Threads in one test binary
+    // are faster to run in CI, deterministic, and easier to observe on
+    // failure — while exercising the exact same SQLite code paths.
+    use std::sync::Arc;
+    use std::thread;
+
+    let dir = tempdir().unwrap();
+    // Materialize the schema in a single-threaded pass first so the two
+    // writer threads don't race on the v1 migration's CREATE TABLE
+    // statements.
+    {
+        let _ = Cache::open(dir.path()).unwrap();
+    }
+    let root = Arc::new(dir.path().to_path_buf());
+
+    let writer = |thread_id: usize, root: Arc<PathBuf>| {
+        let mut cache = Cache::open(&root).expect("open in writer thread");
+        // Confirm the writer sees WAL mode.
+        assert_eq!(
+            cache.journal_mode().unwrap().to_ascii_lowercase(),
+            "wal",
+            "each writer connection must see WAL journal mode"
+        );
+        for i in 0..100 {
+            let shared = i % 3 == 0;
+            let path = if shared {
+                PathBuf::from(format!("shared/f{i}.rs"))
+            } else {
+                PathBuf::from(format!("t{thread_id}/f{i}.rs"))
+            };
+            // Shared keys use the same content_hash from both threads —
+            // that's the "idempotent on same hash" property. Per-thread
+            // keys use per-thread hashes so we can count both writers'
+            // contributions afterwards.
+            let fp = FileFingerprint {
+                content_hash: if shared {
+                    0xabcd_ef01_0000_0000 | i as u64
+                } else {
+                    0xdead_0000_0000_0000 | ((thread_id as u64) << 32) | i as u64
+                },
+                size: i as u64,
+                mtime: 1_700_000_000 + i as i64,
+            };
+            cache
+                .put_file_entry(&path, &fp, &[i as u64, 0xffff])
+                .expect("put");
+        }
+    };
+
+    let t1 = {
+        let r = Arc::clone(&root);
+        thread::spawn(move || writer(1, r))
+    };
+    let t2 = {
+        let r = Arc::clone(&root);
+        thread::spawn(move || writer(2, r))
+    };
+    t1.join().unwrap();
+    t2.join().unwrap();
+
+    // Both writers ran; reopen fresh and confirm state is consistent.
+    let cache = Cache::open_readonly(dir.path()).unwrap().expect("present");
+    // Shared keys are the same path from both threads — each one should
+    // exist exactly once (idempotent convergence).
+    for i in (0..100).step_by(3) {
+        let fp = cache
+            .file_fingerprint(&PathBuf::from(format!("shared/f{i}.rs")))
+            .unwrap()
+            .expect("shared key present");
+        let expected = 0xabcd_ef01_0000_0000_u64 | i as u64;
+        assert_eq!(
+            fp.content_hash, expected,
+            "shared key must have converged content_hash"
+        );
+    }
+    // Per-thread keys: every non-shared index from each thread must
+    // be present.
+    for thread_id in 1..=2 {
+        for i in 0..100 {
+            if i % 3 == 0 {
+                continue;
+            }
+            assert!(
+                cache
+                    .file_fingerprint(&PathBuf::from(format!("t{thread_id}/f{i}.rs")))
+                    .unwrap()
+                    .is_some(),
+                "missing per-thread key t{thread_id}/f{i}.rs"
+            );
+        }
+    }
+}
+
+#[test]
+fn newer_schema_on_open_surfaces_error_and_preserves_file() {
+    // Core #18 acceptance: a cache with PRAGMA user_version > build's
+    // CURRENT_SCHEMA_VERSION must surface NewerSchema and leave the file
+    // byte-for-byte unchanged.
+    use rusqlite::Connection;
+
+    let dir = tempdir().unwrap();
+    {
+        // Bootstrap a normal cache at v1.
+        let _ = Cache::open(dir.path()).unwrap();
+    }
+    let db_path = dir.path().join(".dedup").join("cache.sqlite");
+
+    // Bump the version out-of-band to simulate a future build.
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "user_version", 42_u32).unwrap();
+    }
+
+    let bytes_before = std::fs::read(&db_path).unwrap();
+
+    match Cache::open(dir.path()) {
+        Err(CacheError::NewerSchema { found, supported }) => {
+            assert_eq!(found, 42);
+            assert!(supported < 42);
+        }
+        Err(other) => panic!("expected NewerSchema, got {other:?}"),
+        Ok(_) => panic!("expected NewerSchema error, got success"),
+    }
+
+    let bytes_after = std::fs::read(&db_path).unwrap();
+    assert_eq!(
+        bytes_before, bytes_after,
+        "refused open must preserve cache file bytes"
+    );
+}
+
+#[test]
+fn idempotent_content_hash_keyed_writes() {
+    // Writing the same (path, content_hash) multiple times must be a
+    // no-op past the first call: row count stays at 1.
+    let dir = tempdir().unwrap();
+    let mut cache = Cache::open(dir.path()).unwrap();
+
+    let path = PathBuf::from("src/idempotent.rs");
+    let fp = FileFingerprint {
+        content_hash: 0x1234_5678_9abc_def0,
+        size: 256,
+        mtime: 1_700_100_200,
+    };
+    for _ in 0..10 {
+        cache.put_file_entry(&path, &fp, &[1, 2, 3]).unwrap();
+    }
+
+    // Confirm exactly one row round-trips.
+    let fp_loaded = cache.file_fingerprint(&path).unwrap().expect("present");
+    assert_eq!(fp_loaded, fp);
+    let blocks = cache
+        .file_blocks(&path, fp.content_hash)
+        .unwrap()
+        .expect("blocks");
+    assert_eq!(blocks.block_hashes, vec![1, 2, 3]);
 }
