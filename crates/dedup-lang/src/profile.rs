@@ -16,6 +16,48 @@
 //! LanguageProfile` and registers it with [`crate::all_profiles`]. The
 //! Scanner in `dedup-core` takes a slice of these and runs Tier B on
 //! any file whose extension matches a registered profile.
+//!
+//! # Contributing a new profile
+//!
+//! See `docs/contributing-language-profile.md` in the repository root
+//! for the end-to-end checklist. In brief:
+//!
+//! 1. Add a `tree-sitter-<lang>` dependency to `dedup-lang`'s
+//!    `Cargo.toml`.
+//! 2. Create a new module (e.g. `src/<lang>.rs`) with a unit struct
+//!    implementing [`LanguageProfile`] and a
+//!    `pub static <LANG>_PROFILE: <Lang>Profile` singleton.
+//! 3. Implement the required methods:
+//!    - [`LanguageProfile::name`] — human-readable name for logs.
+//!    - [`LanguageProfile::extensions`] — file extensions (no dot).
+//!    - [`LanguageProfile::tree_sitter_language`] — the grammar's
+//!      `LANGUAGE` constant.
+//!    - [`LanguageProfile::syntactic_units`] — the tree-sitter node
+//!      kinds that count as candidate subtrees (e.g. `"function_item"`,
+//!      `"impl_item"`).
+//!    - [`LanguageProfile::rename_class`] — per-kind literal /
+//!      identifier classification. Default to [`RenameClass::Kept`]
+//!      when unsure; over-keeping is safe.
+//!    - Optionally override [`LanguageProfile::classify_node`] when the
+//!      grammar reuses the same leaf kind across must-keep and
+//!      must-rename positions (e.g. TSX's plain `identifier`).
+//! 4. Append `&<LANG>_PROFILE` to [`crate::all_profiles`] and re-export
+//!    the singleton + type from `lib.rs`.
+//! 5. Extend the CLI's `--lang` filter in
+//!    `crates/dedup-cli/src/main.rs`.
+//! 6. Ship fixtures + insta snapshots under
+//!    `crates/dedup-lang/tests/fixtures/<lang>/` that exercise
+//!    [`crate::extract_units`] and assert on the normalised shape.
+//!
+//! The existing profiles are the reference implementations:
+//!
+//! - [`crate::rust`] — straightforward: Rust's grammar uses distinct
+//!   leaf kinds, so the default [`LanguageProfile::classify_node`] is
+//!   enough.
+//! - [`crate::typescript`] — overrides `classify_node` to disambiguate
+//!   TSX element tags from identifier bindings.
+//! - [`crate::python`] — decorator-aware classification so
+//!   `@staticmethod` does not collapse with `@classmethod`.
 
 use tree_sitter::{Language, Node};
 
