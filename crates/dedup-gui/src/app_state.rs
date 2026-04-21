@@ -347,6 +347,28 @@ pub struct AppState {
     /// [`DetailConfig::context_lines`] (number of dimmed before/after
     /// context lines).
     pub detail_config: DetailConfig,
+    /// File → Open Recent MRU list (issue #28). Loaded from
+    /// `recent.json` at app startup via [`AppState::load_from_disk`]; the
+    /// menubar renders entries directly off this field. Every successful
+    /// folder open pushes the folder to the front and persists.
+    pub recent_projects: crate::recent::RecentProjects,
+    /// Transient "stale-entry" banner (issue #28). Non-`None` when the
+    /// user clicked an Open Recent entry whose path no longer exists;
+    /// the banner exposes a `[Remove from recents]` action that calls
+    /// [`AppState::remove_recent`] and dismisses itself.
+    ///
+    // TODO(#30): promote to toast — #28 uses an inline banner because
+    // the real toast system lands in #30.
+    pub recent_banner: Option<RecentBanner>,
+}
+
+/// Inline banner used to surface a stale Open Recent entry. The
+/// `[Remove from recents]` button wipes `path` from the MRU and
+/// dismisses the banner. Not a full toast — that's issue #30.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecentBanner {
+    /// The missing/moved path the user clicked on.
+    pub path: PathBuf,
 }
 
 /// Which pane currently has logical focus.
@@ -613,6 +635,76 @@ impl AppState {
     /// Fresh state — no folder open, start-here empty view.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fresh state with recents hydrated from `~/.config/dedup/recent.json`.
+    ///
+    /// This is the entry point `ProjectView::new` uses at app startup.
+    /// Unit tests prefer [`AppState::new`] so they don't touch real
+    /// `$HOME`; the MRU-specific tests round-trip through explicit
+    /// paths in a tempdir instead.
+    pub fn with_recents_from_disk() -> Self {
+        Self {
+            recent_projects: crate::recent::RecentProjects::load_from_disk(),
+            ..Self::default()
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #28 — Open Recent MRU helpers.
+    //
+    // Mutations are split across "bump the list" + "persist to disk".
+    // Persist failures are logged at debug level and swallowed; the
+    // in-memory MRU is the source of truth for the current session, and
+    // the menubar already handles an out-of-date `recent.json` (reload
+    // returns empty on parse errors).
+    // -----------------------------------------------------------------
+
+    /// Push `path` to the front of the recents MRU and persist.
+    ///
+    /// Called after a successful `File → Open…` (or click on a recent
+    /// entry) — i.e. anywhere [`Self::set_folder_result`] just applied a
+    /// non-[`AppStatus::Error`] result. Errors are never pushed (see the
+    /// caller in `project_view`) so a failed open doesn't pollute the
+    /// list.
+    pub fn push_recent(&mut self, path: impl Into<PathBuf>) {
+        self.recent_projects.push(path);
+        self.persist_recents();
+    }
+
+    /// Drop a single recent entry + persist. Used by the banner's
+    /// `[Remove from recents]` button.
+    pub fn remove_recent(&mut self, path: &Path) {
+        self.recent_projects.remove(path);
+        self.persist_recents();
+    }
+
+    /// Wipe every recent + persist. Used by File → Open Recent → Clear
+    /// Menu.
+    pub fn clear_recents(&mut self) {
+        self.recent_projects.clear();
+        self.persist_recents();
+    }
+
+    /// Attach a stale-entry banner (user clicked a moved / missing
+    /// recent). Replaces any existing banner — we only ever show one
+    /// stale-entry banner at a time.
+    pub fn surface_recent_banner(&mut self, path: PathBuf) {
+        self.recent_banner = Some(RecentBanner { path });
+    }
+
+    /// Dismiss the stale-entry banner without touching the MRU.
+    pub fn dismiss_recent_banner(&mut self) {
+        self.recent_banner = None;
+    }
+
+    fn persist_recents(&self) {
+        if let Err(e) = self.recent_projects.save_to_disk() {
+            tracing::debug!(
+                error = %e,
+                "dedup-gui: failed to persist recent.json — keeping in-memory MRU",
+            );
+        }
     }
 
     /// Apply a [`FolderLoadResult`] (from [`load_folder`]) to this state.
@@ -2634,5 +2726,155 @@ mod tests {
         // Only one occurrence remains → group dropped entirely.
         assert!(r.groups.is_empty());
         assert_eq!(r.status, AppStatus::NoDuplicates);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #28 — Open Recent MRU state methods on AppState.
+    //
+    // The persistence side of things (load/save) is covered by the
+    // tests in `recent.rs`; these tests exercise the GPUI-free
+    // mutations the view layer calls (push/remove/clear + the banner
+    // helpers). We deliberately use `AppState::new` — not
+    // `with_recents_from_disk` — so tests never touch the real
+    // `$HOME/.config/dedup/recent.json`.
+    //
+    // `push_recent` / `remove_recent` / `clear_recents` call
+    // `save_to_disk()`. To avoid polluting the developer's real
+    // `~/.config/dedup/recent.json` (or, on CI, making two tests race
+    // over it), every test below points `XDG_CONFIG_HOME` at a fresh
+    // tempdir before mutating. The `_guard` keeps the dir alive for
+    // the duration of the test.
+    // -----------------------------------------------------------------
+
+    /// Per-test guard: holds a unique tempdir + serializes over a
+    /// process-wide `Mutex` so two recent-MRU tests don't stomp on
+    /// each other's `XDG_CONFIG_HOME` (the env var is process-global
+    /// and `cargo test` runs tests in parallel by default). Dropping
+    /// the guard restores the previous env value.
+    struct ConfigDirGuard {
+        _dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: env mutation is unsafe in Rust 2024 due to
+            // POSIX's pthreads / signal-handler quirks, but we've
+            // serialized all env touches in this module via the
+            // mutex above.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
+            }
+        }
+    }
+
+    fn redirect_config_dir() -> ConfigDirGuard {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: `ENV_LOCK` above serializes every env mutation in
+        // this test module so no two threads touch `set_var`
+        // concurrently. See `ConfigDirGuard::drop` for the matching
+        // restore path.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", dir.path());
+        }
+        ConfigDirGuard {
+            _dir: dir,
+            _lock: lock,
+            prev,
+        }
+    }
+
+    #[test]
+    fn push_recent_updates_mru_front() {
+        let _guard = redirect_config_dir();
+        let mut s = AppState::new();
+        s.push_recent(PathBuf::from("/a"));
+        s.push_recent(PathBuf::from("/b"));
+        let paths: Vec<_> = s
+            .recent_projects
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("/b"), PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn push_recent_dedupes_existing() {
+        let _guard = redirect_config_dir();
+        let mut s = AppState::new();
+        s.push_recent(PathBuf::from("/a"));
+        s.push_recent(PathBuf::from("/b"));
+        s.push_recent(PathBuf::from("/a"));
+        let paths: Vec<_> = s
+            .recent_projects
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn push_recent_evicts_oldest_beyond_cap() {
+        let _guard = redirect_config_dir();
+        let mut s = AppState::new();
+        for i in 0..6 {
+            s.push_recent(PathBuf::from(format!("/p{i}")));
+        }
+        assert_eq!(s.recent_projects.entries.len(), crate::recent::MAX_RECENTS);
+        // Oldest entry (`/p0`) must have been evicted.
+        assert!(
+            !s.recent_projects
+                .entries
+                .iter()
+                .any(|e| e.path.as_path() == Path::new("/p0"))
+        );
+    }
+
+    #[test]
+    fn remove_recent_drops_entry() {
+        let _guard = redirect_config_dir();
+        let mut s = AppState::new();
+        s.push_recent(PathBuf::from("/a"));
+        s.push_recent(PathBuf::from("/b"));
+        s.remove_recent(&PathBuf::from("/a"));
+        assert_eq!(s.recent_projects.entries.len(), 1);
+        assert_eq!(s.recent_projects.entries[0].path, PathBuf::from("/b"));
+    }
+
+    #[test]
+    fn clear_recents_wipes_list() {
+        let _guard = redirect_config_dir();
+        let mut s = AppState::new();
+        s.push_recent(PathBuf::from("/a"));
+        s.push_recent(PathBuf::from("/b"));
+        s.clear_recents();
+        assert!(s.recent_projects.entries.is_empty());
+    }
+
+    #[test]
+    fn recent_banner_surface_and_dismiss() {
+        let mut s = AppState::new();
+        assert!(s.recent_banner.is_none());
+        s.surface_recent_banner(PathBuf::from("/missing"));
+        assert_eq!(
+            s.recent_banner.as_ref().map(|b| b.path.clone()),
+            Some(PathBuf::from("/missing"))
+        );
+        s.dismiss_recent_banner();
+        assert!(s.recent_banner.is_none());
     }
 }

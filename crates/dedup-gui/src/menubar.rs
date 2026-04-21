@@ -14,8 +14,21 @@
 //! All action handlers are stubs for this issue — they log and return.
 //! The real features wire in via issues #20 (Open), #21/#22 (Scan/Stop),
 //! #23–#27 (View), #28 (Recent Projects), #30 (Error UX / Report Issue).
+//!
+//! ## Rebuilding the menubar
+//!
+//! NSMenu is a static tree in GPUI — the `Menu` / `MenuItem` values we
+//! hand to [`gpui::App::set_menus`] are owned once and not mutated
+//! afterwards. To make "Open Recent" dynamic (issue #28), we expose
+//! [`rebuild_menus`], which takes a fresh snapshot of the current
+//! [`crate::recent::RecentProjects`] list, re-builds the entire tree,
+//! and calls `cx.set_menus` again. Callers invoke it after any mutation
+//! of the recents list. `cx.set_menus` is idempotent — no handlers are
+//! dropped, no keybindings are reshuffled.
 
 use gpui::{App, KeyBinding, Menu, MenuItem, actions};
+
+use crate::recent::RecentProject;
 
 // -------------------------------------------------------------------------
 // Action types
@@ -76,16 +89,59 @@ actions!(
         Help,
         /// Help → Report Issue…. Wires in #30.
         ReportIssue,
+        /// File → Open Recent → (entry 0). Issue #28 — clicking this
+        /// opens `AppState.recent_projects.entries[0]`. We use five
+        /// indexed unit actions instead of a single
+        /// `OpenRecent { path }` so the action types stay zero-sized
+        /// and the `actions!` macro (which doesn't take fields) keeps
+        /// working. The five-variant shape also makes it obvious that
+        /// the menu is capped at MAX_RECENTS = 5.
+        OpenRecent0,
+        /// File → Open Recent → (entry 1). See [`OpenRecent0`].
+        OpenRecent1,
+        /// File → Open Recent → (entry 2). See [`OpenRecent0`].
+        OpenRecent2,
+        /// File → Open Recent → (entry 3). See [`OpenRecent0`].
+        OpenRecent3,
+        /// File → Open Recent → (entry 4). See [`OpenRecent0`].
+        OpenRecent4,
+        /// File → Open Recent → Clear Menu. Wipes the MRU + persists.
+        /// Issue #28.
+        ClearRecents,
+        /// Inline banner action — "Remove from recents" (issue #28).
+        /// Dismisses the stale-entry banner and drops the offending
+        /// path from the MRU. Dispatched by the banner button in the
+        /// project view; no menubar entry.
+        RemoveStaleRecent,
+        /// Inline banner dismiss — hides the stale-entry banner without
+        /// touching the MRU. The user can still remove the entry later
+        /// via a fresh click. Issue #28.
+        DismissRecentBanner,
     ]
 );
 
 /// Install the NSMenu menubar + register global action handlers.
 ///
 /// Called once during app startup, before the first window opens.
-pub fn install(cx: &mut App) {
+/// `initial_recents` is the MRU loaded from `recent.json`; subsequent
+/// mutations call [`rebuild_menus`] to swap in a fresh submenu.
+pub fn install(cx: &mut App, initial_recents: &[RecentProject]) {
     register_handlers(cx);
     register_keybindings(cx);
-    cx.set_menus(build_menus());
+    cx.set_menus(build_menus(initial_recents));
+}
+
+/// Rebuild the NSMenu tree with a fresh recents snapshot.
+///
+/// Safe to call from any action handler — GPUI's `set_menus` replaces
+/// the owned `Vec<Menu>` on the `App`. Keybindings and action handlers
+/// are registered separately (see [`register_handlers`] and
+/// [`register_keybindings`]) so they survive across rebuilds.
+///
+/// Called from `project_view` after every MRU mutation (push on open,
+/// remove on stale-entry banner, clear on the Clear Menu item).
+pub fn rebuild_menus(cx: &mut App, recents: &[RecentProject]) {
+    cx.set_menus(build_menus(recents));
 }
 
 fn register_handlers(cx: &mut App) {
@@ -209,7 +265,10 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
 /// Exposed (not `pub(crate)`) rather than truly private so `#[cfg(test)]`
 /// integration checks in `tests` submodule can assert on the structure
 /// without running GPUI's main-thread-only `App` init.
-pub(crate) fn build_menus() -> Vec<Menu> {
+///
+/// `recents` drives the File → Open Recent submenu contents — see
+/// [`build_open_recent_submenu`] for the per-entry layout.
+pub(crate) fn build_menus(recents: &[RecentProject]) -> Vec<Menu> {
     vec![
         // "Dedup" (application menu — shows first on macOS).
         Menu::new("Dedup").items([
@@ -226,12 +285,9 @@ pub(crate) fn build_menus() -> Vec<Menu> {
         // "File"
         Menu::new("File").items([
             MenuItem::action("Open…", OpenFolder),
-            // Open Recent submenu — placeholder entry until #28 populates
-            // it from the global `recent.json`.
-            MenuItem::submenu(
-                Menu::new("Open Recent")
-                    .items([MenuItem::action("No Recent Projects", NoRecent).disabled(true)]),
-            ),
+            // Open Recent submenu — dynamic per #28. Rebuilt via
+            // `rebuild_menus` whenever the MRU mutates.
+            MenuItem::submenu(build_open_recent_submenu(recents)),
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
         ]),
@@ -269,3 +325,59 @@ pub(crate) fn build_menus() -> Vec<Menu> {
 // never fired (the item is disabled) but `MenuItem::action` still needs
 // an action-typed value to own.
 actions!(dedup_internal, [NoRecent]);
+
+/// Build the File → Open Recent submenu.
+///
+/// Layout (matches the PRD / issue #28):
+/// - Empty MRU → single disabled "No Recent Projects" item. The
+///   "Clear Menu" entry is omitted because it would be a no-op.
+/// - Non-empty MRU → up to [`crate::recent::MAX_RECENTS`] entries
+///   (each labelled via [`RecentProject::menu_label`]), then a
+///   separator, then "Clear Menu".
+///
+/// The per-entry click dispatches `OpenRecentN` where N is the entry's
+/// index; `project_view` reads the index back out into
+/// `AppState.recent_projects.entries[N].path` so actions stay
+/// zero-sized.
+fn build_open_recent_submenu(recents: &[RecentProject]) -> Menu {
+    if recents.is_empty() {
+        return Menu::new("Open Recent")
+            .items([MenuItem::action("No Recent Projects", NoRecent).disabled(true)]);
+    }
+
+    let mut items: Vec<MenuItem> = Vec::with_capacity(recents.len() + 2);
+    for (idx, entry) in recents.iter().enumerate().take(crate::recent::MAX_RECENTS) {
+        items.push(menu_item_for_index(idx, entry.menu_label()));
+    }
+    items.push(MenuItem::separator());
+    items.push(MenuItem::action("Clear Menu", ClearRecents));
+
+    Menu::new("Open Recent").items(items)
+}
+
+/// Map an MRU index (0..=4) to the matching `OpenRecentN` unit action.
+///
+/// Kept as a single match so adding / removing an MRU slot is a
+/// compile-time error (missing arm) rather than a silent runtime
+/// fallthrough. `MAX_RECENTS` is 5; we panic on `idx >= 5` because
+/// callers already `take(MAX_RECENTS)`.
+fn menu_item_for_index(idx: usize, label: String) -> MenuItem {
+    match idx {
+        0 => MenuItem::action(label, OpenRecent0),
+        1 => MenuItem::action(label, OpenRecent1),
+        2 => MenuItem::action(label, OpenRecent2),
+        3 => MenuItem::action(label, OpenRecent3),
+        4 => MenuItem::action(label, OpenRecent4),
+        other => unreachable!(
+            "Open Recent submenu index {other} exceeds MAX_RECENTS \
+             ({}); callers must take(MAX_RECENTS) first",
+            crate::recent::MAX_RECENTS
+        ),
+    }
+}
+
+/// How many recent entries are shown in the File → Open Recent submenu
+/// today. Mirrors [`crate::recent::MAX_RECENTS`] but re-exposed here so
+/// `project_view` can iterate indices without depending on the recent
+/// module directly.
+pub const OPEN_RECENT_SLOTS: usize = crate::recent::MAX_RECENTS;

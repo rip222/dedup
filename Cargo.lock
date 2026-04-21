@@ -1489,6 +1489,8 @@ dependencies = [
  "gpui_platform",
  "log",
  "rfd",
+ "serde",
+ "serde_json",
  "syntect",
  "tempfile",
  "tracing",

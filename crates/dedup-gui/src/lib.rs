@@ -26,16 +26,18 @@ pub mod empty_state;
 pub mod highlight;
 pub mod menubar;
 pub mod project_view;
+pub mod recent;
 pub mod tint;
 
 pub use app_state::{
-    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, Pane, ScanHandles, ScanState,
-    SortKey, SummaryCounts, SuppressionView, filter_groups, format_completion_banner,
-    format_elapsed, group_label, group_view_from_match, impact_key, language_from_path,
-    load_folder, open_in_editor, sort_groups, summary,
+    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, Pane, RecentBanner,
+    ScanHandles, ScanState, SortKey, SummaryCounts, SuppressionView, filter_groups,
+    format_completion_banner, format_elapsed, group_label, group_view_from_match, impact_key,
+    language_from_path, load_folder, open_in_editor, sort_groups, summary,
 };
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};
+pub use recent::{MAX_RECENTS, RecentProject, RecentProjects, config_dir, recent_file_path};
 
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
@@ -45,9 +47,14 @@ use gpui_platform::application;
 /// Blocks until the app terminates (e.g. user picks Dedup → Quit).
 pub fn run() {
     application().run(|cx: &mut App| {
+        // Hydrate the Open Recent MRU from disk once at startup — the
+        // menubar renders off this initial snapshot, and subsequent
+        // mutations call `menubar::rebuild_menus` (see `project_view`).
+        let initial_recents = recent::RecentProjects::load_from_disk();
+
         // Install menubar + global action handlers first so shortcuts
         // work even before a window is focused.
-        menubar::install(cx);
+        menubar::install(cx, &initial_recents.entries);
 
         let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
         let window = cx
@@ -61,7 +68,13 @@ pub fn run() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| ProjectView::new()),
+                |_, cx| {
+                    cx.new(|_| {
+                        let mut view = ProjectView::new();
+                        view.state.recent_projects = initial_recents.clone();
+                        view
+                    })
+                },
             )
             .expect("dedup-gui: failed to open project window");
 
@@ -102,7 +115,7 @@ mod tests {
     /// so it runs happily off the main thread inside `cargo test`.
     #[test]
     fn menubar_top_level_order_matches_prd() {
-        let menus = menubar::build_menus();
+        let menus = menubar::build_menus(&[]);
         let names: Vec<&str> = menus.iter().map(|m| m.name.as_ref()).collect();
         assert_eq!(names, ["Dedup", "File", "Scan", "View", "Window", "Help"]);
     }

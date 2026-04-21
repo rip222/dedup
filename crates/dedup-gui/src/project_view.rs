@@ -33,8 +33,10 @@ use crate::app_state::{
     format_completion_banner, format_elapsed, group_view_from_match, load_folder, open_in_editor,
 };
 use crate::menubar::{
-    ActivateGroup, CollapseAll, DismissCurrentGroup, ExpandAll, FindInSidebar, FocusDetail,
-    FocusSidebar, NextGroup, OpenFolder, OpenSelectedInEditor, PrevGroup, StartScan, StopScan,
+    ActivateGroup, ClearRecents, CollapseAll, DismissCurrentGroup, DismissRecentBanner, ExpandAll,
+    FindInSidebar, FocusDetail, FocusSidebar, NextGroup, OpenFolder, OpenRecent0, OpenRecent1,
+    OpenRecent2, OpenRecent3, OpenRecent4, OpenSelectedInEditor, PrevGroup, RemoveStaleRecent,
+    StartScan, StopScan,
 };
 use dedup_core::{
     Cache, Config, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, Tier,
@@ -114,9 +116,86 @@ impl ProjectView {
 
     /// Apply a freshly-loaded folder to the view and mark it dirty so the
     /// next render picks up the new sidebar rows.
+    ///
+    /// On a non-[`AppStatus::Error`] open this also pushes `folder` to
+    /// the Open Recent MRU (#28), persists `recent.json`, and rebuilds
+    /// the File → Open Recent submenu so the menubar reflects the new
+    /// entry immediately. An `Error` result (e.g. a corrupt cache) does
+    /// not pollute the MRU — the user can re-pick the folder once the
+    /// underlying issue is fixed.
     pub fn apply_folder(&mut self, folder: &Path, cx: &mut Context<Self>) {
         let result = load_folder(folder);
+        let is_error = matches!(result.status, AppStatus::Error(_));
         self.state.set_folder_result(result);
+        if !is_error {
+            self.state.push_recent(folder.to_path_buf());
+            // `Context<Self>` deref-muts to `&mut App`, which
+            // `rebuild_menus` wants. We pass a snapshot of the MRU
+            // entries so the rebuild is pure data — no shared borrow
+            // of `self.state` is captured by the callback.
+            let entries = self.state.recent_projects.entries.clone();
+            crate::menubar::rebuild_menus(cx, &entries);
+        }
+        // Dismiss any lingering stale-entry banner — the user just
+        // successfully opened something, so the banner is no longer
+        // relevant.
+        self.state.dismiss_recent_banner();
+        cx.notify();
+    }
+
+    /// Click-handler for a specific File → Open Recent entry.
+    ///
+    /// Reads `recent_projects.entries[idx]`, validates that the path is
+    /// still a directory, and either re-opens it (on success — this
+    /// also moves the entry back to the front of the MRU) or surfaces
+    /// a stale-entry banner with the `[Remove from recents]` action.
+    ///
+    /// Intentionally does *not* auto-remove stale entries — the PRD is
+    /// explicit that stale clicks must surface UX, not silently drop.
+    pub fn open_recent(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.state.recent_projects.entries.get(idx).cloned() else {
+            return;
+        };
+        if entry.is_stale() {
+            self.state.surface_recent_banner(entry.path);
+            cx.notify();
+            return;
+        }
+        // Path is live — reuse the standard open path. `apply_folder`
+        // pushes the entry back to the front of the MRU and rebuilds
+        // the submenu.
+        self.apply_folder(&entry.path, cx);
+    }
+
+    /// File → Open Recent → Clear Menu. Wipes the MRU, persists, and
+    /// rebuilds the menu so the submenu collapses back to
+    /// "No Recent Projects".
+    pub fn clear_recents(&mut self, cx: &mut Context<Self>) {
+        self.state.clear_recents();
+        self.state.dismiss_recent_banner();
+        let entries = self.state.recent_projects.entries.clone();
+        crate::menubar::rebuild_menus(cx, &entries);
+        cx.notify();
+    }
+
+    /// Banner action — drop the current stale entry from the MRU and
+    /// dismiss the banner. No-op when no banner is showing.
+    pub fn remove_stale_recent(&mut self, cx: &mut Context<Self>) {
+        let Some(banner) = self.state.recent_banner.clone() else {
+            return;
+        };
+        self.state.remove_recent(&banner.path);
+        self.state.dismiss_recent_banner();
+        let entries = self.state.recent_projects.entries.clone();
+        crate::menubar::rebuild_menus(cx, &entries);
+        cx.notify();
+    }
+
+    /// Banner action — dismiss the stale-entry banner without touching
+    /// the MRU. User can still remove the entry later by clicking it
+    /// again.
+    pub fn dismiss_recent_banner(&mut self, cx: &mut Context<Self>) {
+        self.state.dismiss_recent_banner();
         cx.notify();
     }
 
@@ -755,6 +834,53 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
             entity.update(cx, |view, cx| view.expand_all(cx));
         }
     });
+
+    // Issue #28 — File → Open Recent submenu actions.
+    //
+    // Five indexed unit actions (one per MRU slot) rather than a
+    // single parameterised action — the `actions!` macro doesn't take
+    // fields, and the #[derive(Action)] macro requires
+    // `serde::Deserialize + schemars::JsonSchema` which is overkill
+    // for five menu items. Each handler just forwards the slot index
+    // into `open_recent` and lets `AppState.recent_projects.entries`
+    // be the source of truth for the path.
+    cx.on_action(|_: &OpenRecent0, cx: &mut gpui::App| dispatch_open_recent(0, cx));
+    cx.on_action(|_: &OpenRecent1, cx: &mut gpui::App| dispatch_open_recent(1, cx));
+    cx.on_action(|_: &OpenRecent2, cx: &mut gpui::App| dispatch_open_recent(2, cx));
+    cx.on_action(|_: &OpenRecent3, cx: &mut gpui::App| dispatch_open_recent(3, cx));
+    cx.on_action(|_: &OpenRecent4, cx: &mut gpui::App| dispatch_open_recent(4, cx));
+
+    // File → Open Recent → Clear Menu.
+    cx.on_action(|_: &ClearRecents, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.clear_recents(cx));
+        }
+    });
+
+    // Stale-entry banner actions. These are dispatched by the banner's
+    // inline buttons in the project view (not from the menubar); the
+    // global `on_action` registration is still the right place because
+    // it mirrors how `OpenFolder` etc. are wired.
+    cx.on_action(|_: &RemoveStaleRecent, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.remove_stale_recent(cx));
+        }
+    });
+    cx.on_action(|_: &DismissRecentBanner, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.dismiss_recent_banner(cx));
+        }
+    });
+}
+
+/// Shared body for the five `OpenRecentN` action handlers. Pulled out
+/// so adding or removing a slot is a one-line change. The slot index
+/// comes from the caller — see `OpenRecent0..OpenRecent4` in
+/// `register_root`.
+fn dispatch_open_recent(idx: usize, cx: &mut gpui::App) {
+    if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+        entity.update(cx, |view, cx| view.open_recent(idx, cx));
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -784,15 +910,101 @@ impl Render for ProjectView {
         // TODO(#30): replace with the real toast system.
         let overlay = render_scan_overlay(&self.state);
 
+        // Issue #28 — stale-recent banner. Rendered above any other
+        // overlay so a "can't open that" warning isn't buried under a
+        // scan-progress bar. The banner ships two inline buttons:
+        // `[Remove from recents]` and `[Dismiss]`. The two buttons
+        // dispatch `RemoveStaleRecent` / `DismissRecentBanner`, which
+        // are wired in `register_root`.
+        // TODO(#30): promote to toast once the toast system lands.
+        let stale = self
+            .state
+            .recent_banner
+            .as_ref()
+            .map(render_stale_recent_banner);
+
         div()
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(BG))
             .text_color(white())
+            .children(stale)
             .children(overlay)
             .child(body)
     }
+}
+
+/// Render the inline "couldn't open this recent" banner.
+///
+/// Styled like `render_error` (same warning palette) but appears above
+/// the shell so it's visible even when the body is the Loaded state for
+/// a different folder the user had open before clicking the stale
+/// entry. See the owning `ProjectView::open_recent` for the control
+/// flow.
+///
+/// The two buttons (`[Remove from recents]` / `[Dismiss]`) dispatch
+/// their respective actions rather than mutating state inline — that
+/// keeps the render function pure and lets keyboard dispatch surface
+/// the same behaviour if we later bind a shortcut.
+fn render_stale_recent_banner(banner: &crate::app_state::RecentBanner) -> gpui::Div {
+    let path = banner.path.display().to_string();
+    div()
+        .w_full()
+        .bg(rgb(0x7f1d1d))
+        .px(px(12.0))
+        .py(px(8.0))
+        .border_b_1()
+        .border_color(black())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(
+            div().flex().flex_col().gap(px(2.0)).child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xfee2e2))
+                    .child(format!(
+                        "Couldn\u{2019}t open {path} \u{2014} it may have \
+                             been moved or deleted."
+                    )),
+            ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .bg(rgb(0xb91c1c))
+                        .text_color(white())
+                        .text_size(px(12.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            window.dispatch_action(Box::new(RemoveStaleRecent), cx);
+                        })
+                        .child("Remove from recents"),
+                )
+                .child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(4.0))
+                        .bg(rgb(0x450a0a))
+                        .text_color(white())
+                        .text_size(px(12.0))
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                            window.dispatch_action(Box::new(DismissRecentBanner), cx);
+                        })
+                        .child("Dismiss"),
+                ),
+        )
 }
 
 // ---------------------------------------------------------------------------
