@@ -32,6 +32,7 @@ use crate::tokenizer::{Token, tokenize};
 use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 /// The rolling-hash window size. Matches the Tier A `min_tokens` default.
@@ -201,6 +202,8 @@ impl Scanner {
         root: &Path,
         sink: &dyn ProgressSink,
     ) -> Result<ScanResult, ScanError> {
+        info!(root = %root.display(), "scan: starting");
+
         // --- 1. Walk and tokenize each candidate file. --------------------
         let mut per_file: Vec<(PathBuf, Vec<Token>)> = Vec::new();
 
@@ -234,8 +237,11 @@ impl Scanner {
                 Ok(e) => e,
                 // Tolerate per-entry walk errors (permission denied on a
                 // sibling, symlink loop, ...) so one bad file doesn't kill
-                // the scan. Logging lives in #16.
-                Err(_) => continue,
+                // the scan. Per-file graceful degradation lands in #17.
+                Err(e) => {
+                    warn!(error = %e, "scan: walkdir entry error, skipping");
+                    continue;
+                }
             };
             if !entry.file_type().is_file() {
                 continue;
@@ -252,18 +258,28 @@ impl Scanner {
             }
             let bytes = match std::fs::read(abs) {
                 Ok(b) => b,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(path = %abs.display(), error = %e, "scan: read failed, skipping");
+                    continue;
+                }
             };
             if looks_binary(&bytes) {
                 continue;
             }
             let text = match std::str::from_utf8(&bytes) {
                 Ok(s) => s.to_string(),
-                Err(_) => continue,
+                Err(e) => {
+                    // UTF-8 decode is routine in a mixed-encoding tree;
+                    // per the PRD this is debug-level, not warn.
+                    debug!(path = %abs.display(), error = %e, "scan: utf-8 decode failed, skipping");
+                    continue;
+                }
             };
 
             let rel = abs.strip_prefix(root).unwrap_or(abs).to_path_buf();
-            per_file.push((rel, tokenize(&text)));
+            let tokens = tokenize(&text);
+            debug!(path = %rel.display(), tokens = tokens.len(), "scan: tokenized file");
+            per_file.push((rel, tokens));
             // Report progress *after* the file is staged so sinks that
             // update a spinner see work that has actually been done.
             sink.on_file_processed(abs);
@@ -466,6 +482,8 @@ impl Scanner {
         for g in &groups {
             sink.on_match_group(g);
         }
+
+        info!(files_scanned, groups = groups.len(), "scan: complete");
 
         Ok(ScanResult {
             groups,

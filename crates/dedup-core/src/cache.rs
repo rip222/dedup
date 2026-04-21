@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
+use tracing::{debug, info, warn};
 
 use crate::rolling_hash::Span;
 use crate::scanner::{MatchGroup, Occurrence, ScanResult};
@@ -135,6 +136,15 @@ impl Cache {
         configure_connection(&conn)?;
         ensure_schema(&conn)?;
 
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap_or_default();
+        info!(
+            path = %db_path.display(),
+            journal_mode = %mode,
+            "cache: opened"
+        );
+
         Ok(Self { conn })
     }
 
@@ -162,6 +172,11 @@ impl Cache {
         // #18's job.
         let version = read_schema_version(&conn)?;
         if version > SCHEMA_VERSION {
+            warn!(
+                found = version,
+                supported = SCHEMA_VERSION,
+                "cache: schema newer than supported build"
+            );
             return Err(CacheError::FutureSchema {
                 found: version,
                 supported: SCHEMA_VERSION,
@@ -182,6 +197,11 @@ impl Cache {
     /// for now. #14 will wire real per-file content hashes into the
     /// warm-scan skip path; this issue only needs the row to exist.
     pub fn write_scan_result(&mut self, result: &ScanResult) -> Result<(), CacheError> {
+        debug!(
+            groups = result.groups.len(),
+            files_scanned = result.files_scanned,
+            "cache: write_scan_result"
+        );
         let tx = self.conn.transaction()?;
 
         // Fresh state — occurrences cascade from match_groups.
@@ -384,6 +404,11 @@ fn ensure_schema(conn: &Connection) -> Result<(), CacheError> {
     )?;
 
     if current > SCHEMA_VERSION {
+        warn!(
+            found = current,
+            supported = SCHEMA_VERSION,
+            "cache: schema newer than supported build"
+        );
         return Err(CacheError::FutureSchema {
             found: current,
             supported: SCHEMA_VERSION,
