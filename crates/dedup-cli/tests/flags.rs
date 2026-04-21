@@ -50,6 +50,8 @@ fn strict_exits_one_when_findings_present() {
     let tmp = prepare_fixture();
     let out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg("--strict")
         .arg(tmp.path())
@@ -139,6 +141,8 @@ fn tier_a_is_accepted_and_emits_groups() {
     let tmp = prepare_fixture();
     let out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg("--tier")
         .arg("a")
@@ -169,6 +173,8 @@ fn tier_b_filters_out_tier_a_groups() {
     let tmp = prepare_fixture();
     let out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg("--tier")
         .arg("b")
@@ -225,6 +231,8 @@ fn lang_rust_keeps_tier_b_rust_groups() {
     let tmp = prepare_fixture();
     let out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg("--tier")
         .arg("b")
@@ -246,6 +254,8 @@ fn lang_ts_filters_out_rust_tier_b_groups() {
     let tmp = prepare_fixture();
     let out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg("--tier")
         .arg("b")

@@ -66,8 +66,12 @@ fn list_reproduces_scan_output_without_rescanning() {
     let tmp = prepare_scanned_fixture();
 
     // Capture the scan's snapshot stdout for baseline comparison.
+    // Force `--format text` so auto-select (non-TTY → JSON per #12)
+    // doesn't change the semantics this test is guarding.
     let scan_again = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg(tmp.path())
         .output()
@@ -89,6 +93,8 @@ fn list_reproduces_scan_output_without_rescanning() {
 
     let list_out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("list")
         .arg(tmp.path())
         .output()
@@ -112,6 +118,8 @@ fn show_emits_group_detail() {
     // one group; we read the list output to discover what id it uses.
     let list_out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("list")
         .arg(tmp.path())
         .output()
@@ -123,6 +131,8 @@ fn show_emits_group_detail() {
     // write path changed, which would be worth surfacing.
     let show_out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("show")
         .arg("1")
         .arg(tmp.path())
@@ -197,6 +207,8 @@ fn cache_survives_process_restart() {
     // Second, independent process:
     let list_out = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("list")
         .arg(tmp.path())
         .output()

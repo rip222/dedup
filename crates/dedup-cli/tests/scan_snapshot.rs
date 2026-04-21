@@ -43,6 +43,8 @@ fn scan_fixture_snapshot() {
 
     let output = Command::cargo_bin("dedup")
         .expect("dedup binary")
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg(tmp.path())
         .output()

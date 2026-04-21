@@ -96,6 +96,8 @@ fn dismiss_hides_group_from_subsequent_list() {
     // Baseline: list emits at least one group.
     let before = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("list")
         .arg(tmp.path())
         .output()
@@ -111,6 +113,8 @@ fn dismiss_hides_group_from_subsequent_list() {
     // After: list hides all dismissed groups.
     let after = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("list")
         .arg(tmp.path())
         .output()
@@ -131,6 +135,8 @@ fn dismiss_persists_across_rescan() {
     // Re-scan: the suppressions should survive.
     let rescan = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg(tmp.path())
         .output()
@@ -156,6 +162,8 @@ fn suppressions_list_emits_dismissed_entry() {
 
     let list = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("suppressions")
         .arg("list")
         .arg(tmp.path())
@@ -198,6 +206,8 @@ fn suppressions_clear_empties_the_table() {
     // After clear, list is empty and the group is visible again.
     let list = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("suppressions")
         .arg("list")
         .arg(tmp.path())
@@ -209,6 +219,8 @@ fn suppressions_clear_empties_the_table() {
 
     let relist = Command::cargo_bin("dedup")
         .unwrap()
+        .arg("--format")
+        .arg("text")
         .arg("list")
         .arg(tmp.path())
         .output()

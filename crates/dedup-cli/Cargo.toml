@@ -16,11 +16,14 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dedup-core = { path = "../dedup-core" }
 indicatif = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 assert_cmd = "2"
 insta = "1"
+jsonschema = { version = "0.46", default-features = false, features = ["resolve-file"] }
 tempfile = "3"
 predicates = "3"

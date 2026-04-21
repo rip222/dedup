@@ -190,6 +190,8 @@ fn scan_with_future_schema_warns_and_uses_defaults() {
     std::fs::write(dedup_dir.join("config.toml"), "schema_version = 9999\n").unwrap();
 
     let out = dedup_with_home(home.path())
+        .arg("--format")
+        .arg("text")
         .arg("scan")
         .arg(repo.path())
         .output()

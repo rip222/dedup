@@ -56,6 +56,11 @@ use dedup_core::{
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod output;
+mod sarif;
+
+use output::OutputFormat;
+
 /// Root CLI parser. Subcommands live under [`Command`]; shared flags live
 /// on [`GlobalArgs`] and are flattened into this struct so every
 /// subcommand sees them uniformly.
@@ -135,6 +140,14 @@ pub struct GlobalArgs {
     /// regardless of findings.
     #[arg(long, global = true)]
     pub strict: bool,
+
+    /// Output format. Defaults to `text` on a TTY and `json` when
+    /// stdout is piped / redirected. Passing `--format` overrides the
+    /// auto-selection in both directions. `sarif` is meaningful on
+    /// `scan` / `list`; other subcommands fall back to their `text`
+    /// or `json` shape.
+    #[arg(long, value_enum, global = true)]
+    pub format: Option<OutputFormat>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,7 +311,7 @@ fn main() -> ExitCode {
         },
         Command::Dismiss { id, ref path } => run_dismiss(id, path),
         Command::Suppressions { action } => match action {
-            SuppressionsAction::List { path } => run_suppressions_list(&path),
+            SuppressionsAction::List { path } => run_suppressions_list(&path, &cli.globals),
             SuppressionsAction::Clear { path } => run_suppressions_clear(&path),
         },
         Command::Clean { ref path, yes } => run_clean(path, yes),
@@ -428,7 +441,19 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
 
     let had_findings = !visible.is_empty();
 
-    print_scan_groups(&visible, &mut std::io::stdout()).ok();
+    let fmt = output::resolve_format(globals.format, output::stdout_is_tty());
+    let mut stdout = std::io::stdout();
+    match fmt {
+        OutputFormat::Text => {
+            output::write_groups_text(&visible, &mut stdout).ok();
+        }
+        OutputFormat::Json => {
+            output::write_groups_ndjson(&visible, &mut stdout).ok();
+        }
+        OutputFormat::Sarif => {
+            output::write_groups_sarif(&visible, &mut stdout).ok();
+        }
+    }
 
     if had_findings && globals.strict {
         return Ok(ExitCode::from(1));
@@ -454,12 +479,18 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
 
     let allow_a = tier_allows_a(globals);
     let allow_b = tier_allows_b(globals);
+    let fmt = output::resolve_format(globals.format, output::stdout_is_tty());
 
-    // Fetch full details so we can print occurrences alongside the
-    // summary header — matches `dedup scan` output exactly.
+    // Text and NDJSON stream one group at a time; SARIF builds a single
+    // top-level envelope and therefore collects every passing group up
+    // front. The collection is not worse than the existing text path
+    // memory-wise (the same rows are already fetched one-by-one), just
+    // held slightly longer.
     let mut stdout = std::io::stdout();
+    let mut collected: Vec<(GroupDetail, Option<u64>)> = Vec::new();
     let mut emitted = 0usize;
     let mut ordinal = 0usize;
+
     for summary in groups.iter() {
         let tier_ok = match summary.tier {
             Tier::A => allow_a,
@@ -468,11 +499,10 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
         if !tier_ok {
             continue;
         }
-        // Suppression check keyed by normalized-block-hash. Looking it up
-        // per-group is cheap; `list` is already one-query-per-group.
-        if let Some(hash) = cache
+        let hash_opt = cache
             .group_hash(summary.id)
-            .with_context(|| format!("failed to read hash for group {}", summary.id))?
+            .with_context(|| format!("failed to read hash for group {}", summary.id))?;
+        if let Some(hash) = hash_opt
             && suppressed.contains(&hash)
         {
             continue;
@@ -489,11 +519,32 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
             continue;
         }
         ordinal += 1;
-        if print_cached_group_full(ordinal, &detail, &mut stdout).is_err() {
-            // Broken pipe / closed stdout — treat as clean exit.
-            return Ok(ExitCode::SUCCESS);
+        match fmt {
+            OutputFormat::Text => {
+                if output::write_cached_group_text(ordinal, &detail, &mut stdout).is_err() {
+                    // Broken pipe / closed stdout — treat as clean exit.
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+            OutputFormat::Json => {
+                // Stream one NDJSON line per group, preserving the
+                // running `ordinal` (`write_cached_groups_ndjson` on a
+                // one-element slice would reset it to 1).
+                if output::write_cached_group_ndjson_line(ordinal, &detail, hash_opt, &mut stdout)
+                    .is_err()
+                {
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
+            OutputFormat::Sarif => {
+                collected.push((detail, hash_opt));
+            }
         }
         emitted += 1;
+    }
+
+    if matches!(fmt, OutputFormat::Sarif) {
+        output::write_cached_groups_sarif(&collected, &mut stdout).ok();
     }
 
     if emitted > 0 && globals.strict {
@@ -502,7 +553,7 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_show(id: i64, path: &Path, _globals: &GlobalArgs) -> Result<ExitCode> {
+fn run_show(id: i64, path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     let cache = match Cache::open_readonly(path)
         .with_context(|| format!("failed to open cache at {}", path.display()))?
     {
@@ -523,9 +574,25 @@ fn run_show(id: i64, path: &Path, _globals: &GlobalArgs) -> Result<ExitCode> {
             return Ok(ExitCode::from(2));
         }
     };
+    let hash = cache
+        .group_hash(id)
+        .with_context(|| format!("failed to read hash for group {id}"))?;
 
+    let fmt = output::resolve_format(globals.format, output::stdout_is_tty());
     let mut stdout = std::io::stdout();
-    print_cached_group_show(&detail, &mut stdout).ok();
+    match fmt {
+        OutputFormat::Text => {
+            output::write_show_text(&detail, &mut stdout).ok();
+        }
+        OutputFormat::Json => {
+            output::write_group_object(&detail, hash, &mut stdout).ok();
+        }
+        OutputFormat::Sarif => {
+            // SARIF on `show` is still a valid report — one result for
+            // the single group, so CI tools can ingest it the same way.
+            output::write_cached_groups_sarif(&[(detail, hash)], &mut stdout).ok();
+        }
+    }
 
     Ok(ExitCode::SUCCESS)
 }
@@ -572,9 +639,12 @@ fn run_dismiss(id: i64, path: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `dedup suppressions list` — emit one row per dismissal with hex hash,
-/// ISO-8601-ish timestamp, and the originally-dismissed group id.
-fn run_suppressions_list(path: &Path) -> Result<ExitCode> {
+/// `dedup suppressions list` — emit one row per dismissal.
+///
+/// Text mode: hex hash, timestamp, last-known group id (pre-#12 layout).
+/// JSON mode: NDJSON — one JSON object per line with the same fields.
+/// SARIF mode: falls back to text (suppressions aren't a SARIF concept).
+fn run_suppressions_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     let cache = match Cache::open_readonly(path)
         .with_context(|| format!("failed to open cache at {}", path.display()))?
     {
@@ -589,21 +659,30 @@ fn run_suppressions_list(path: &Path) -> Result<ExitCode> {
         .list_suppressions()
         .context("failed to read suppressions")?;
 
-    if entries.is_empty() {
-        println!("(no suppressions)");
-        return Ok(ExitCode::SUCCESS);
-    }
+    let fmt = output::resolve_format(globals.format, output::stdout_is_tty());
+    let mut stdout = std::io::stdout();
 
-    for e in entries {
-        let gid = match e.last_group_id {
-            Some(id) => id.to_string(),
-            None => "-".to_string(),
-        };
-        println!(
-            "{hash:016x}  dismissed_at={ts}  last_group_id={gid}",
-            hash = e.hash,
-            ts = e.dismissed_at,
-        );
+    match fmt {
+        OutputFormat::Json => {
+            output::write_suppressions_ndjson(&entries, &mut stdout).ok();
+        }
+        OutputFormat::Text | OutputFormat::Sarif => {
+            if entries.is_empty() {
+                println!("(no suppressions)");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for e in entries {
+                let gid = match e.last_group_id {
+                    Some(id) => id.to_string(),
+                    None => "-".to_string(),
+                };
+                println!(
+                    "{hash:016x}  dismissed_at={ts}  last_group_id={gid}",
+                    hash = e.hash,
+                    ts = e.dismissed_at,
+                );
+            }
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -850,78 +929,8 @@ fn color_enabled_for_stderr(globals: &GlobalArgs) -> bool {
     }
 }
 
-/// Print a slice of [`MatchGroup`] references in the canonical dedup
-/// text format. Taking `&[&MatchGroup]` rather than `&ScanResult`
-/// mirrors the post-filter path so callers can drop out groups cheaply.
-///
-/// Each group header carries a `[A]` / `[B]` prefix so the tier is
-/// visible at a glance. Occurrences keep the `path:start-end` shape
-/// that downstream tools (e.g. `xargs -o nvim`) depend on.
-fn print_scan_groups<W: Write>(groups: &[&MatchGroup], out: &mut W) -> std::io::Result<()> {
-    for (i, group) in groups.iter().enumerate() {
-        writeln!(
-            out,
-            "--- [{}] group {} ({} occurrences) ---",
-            group.tier.label(),
-            i + 1,
-            group.occurrences.len()
-        )?;
-        for occ in &group.occurrences {
-            let path = path_display(&occ.path);
-            writeln!(
-                out,
-                "{}:{}-{}",
-                path, occ.span.start_line, occ.span.end_line
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Print one cached group in the same format as `scan`, but using the
-/// given ordinal (1-based) as the `group N` header number — callers are
-/// expected to enumerate in the same order `list_groups` returned.
-fn print_cached_group_full<W: Write>(
-    ordinal: usize,
-    detail: &GroupDetail,
-    out: &mut W,
-) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "--- [{}] group {} ({} occurrences) ---",
-        detail.tier.label(),
-        ordinal,
-        detail.occurrence_count
-    )?;
-    for occ in &detail.occurrences {
-        let path = path_display(&occ.path);
-        writeln!(out, "{}:{}-{}", path, occ.start_line, occ.end_line)?;
-    }
-    Ok(())
-}
-
-/// `show` emits a single group; the header uses the persisted id so it
-/// is stable across invocations. Follows with one `path:start-end` line
-/// per occurrence, indented to match the visual weight of `list`.
-fn print_cached_group_show<W: Write>(detail: &GroupDetail, out: &mut W) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "--- [{}] group {} ({} occurrences) ---",
-        detail.tier.label(),
-        detail.id,
-        detail.occurrence_count
-    )?;
-    for occ in &detail.occurrences {
-        let path = path_display(&occ.path);
-        writeln!(out, "{}:{}-{}", path, occ.start_line, occ.end_line)?;
-    }
-    Ok(())
-}
-
-/// Forward-slash a path for stable cross-platform output.
-fn path_display(p: &std::path::Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
-}
+// Text / JSON / SARIF renderers live in `crate::output`; this file
+// only dispatches to them.
 
 // --- Progress sink --------------------------------------------------------
 
