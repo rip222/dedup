@@ -7,9 +7,47 @@ authors.workspace = true
 repository.workspace = true
 description = "GPUI-based macOS frontend for dedup."
 
+[[bin]]
+name = "dedup-gui"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 
+# ---------------------------------------------------------------------------
+# GPUI pin (HITL decision — see PRD issue #1 "Process model" and issue #19)
+# ---------------------------------------------------------------------------
+# Chosen revision: da25b914c25f17ba457abc8cf75b8e42d0b899e2
+# Tag: v0.232.3
+# Date picked: 2026-04-21 (tag cut 2026-04-16)
+# Rationale:
+#   * Most recent stable (non -pre) Zed release tag at the time of this pin.
+#   * Cut from a release branch, not a random `main` HEAD, so it is
+#     battle-tested as the basis of a shipped Zed build.
+#   * Tagged commit metadata: "Bump to 0.232.3 for @eholk"
+#     (see https://github.com/zed-industries/zed/releases/tag/v0.232.3).
+#
+# Upgrade cadence: **quarterly-ish, deliberate** (per PRD §"Process model" /
+# "Further Notes"). Do NOT bump this to track Zed `main`. When bumping:
+#   1. Pick a new release tag (prefer `vX.Y.Z` stable, not `-pre`).
+#   2. Update the comment block above (SHA + tag + date + rationale).
+#   3. Run `cargo update -p gpui` and rebuild / retest on macOS.
+#   4. Commit the Cargo.lock delta alongside this Cargo.toml change.
+#
+# HITL override: the human reviewer can substitute a different revision in a
+# follow-up PR. Any Zed revision that (a) builds on the macOS CI image and
+# (b) opens a window on launch satisfies issue #19's MVP acceptance bar.
+#
+# Note on tree size: GPUI transitively pulls in a very large slice of Zed's
+# workspace (metal, core-graphics, tree-sitter, ~hundreds of crates). This
+# is expected and documented in the PR body — perf tuning isn't blocking.
+# ---------------------------------------------------------------------------
 [target.'cfg(target_os = "macos")'.dependencies]
+gpui = { git = "https://github.com/zed-industries/zed.git", rev = "da25b914c25f17ba457abc8cf75b8e42d0b899e2" }
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "da25b914c25f17ba457abc8cf75b8e42d0b899e2", features = ["font-kit"] }
+log = "0.4"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
