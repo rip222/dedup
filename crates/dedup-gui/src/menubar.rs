@@ -68,6 +68,10 @@ actions!(
         /// Sidebar keyboard-nav — `o` opens checked files in editor.
         /// Placeholder that logs paths; real launcher lands in #29.
         OpenSelectedInEditor,
+        /// Issue #27 — "Collapse all" toolbar button.
+        CollapseAll,
+        /// Issue #27 — "Expand all" toolbar button.
+        ExpandAll,
         /// Help → Dedup Help. Opens docs (post-MVP).
         Help,
         /// Help → Report Issue…. Wires in #30.

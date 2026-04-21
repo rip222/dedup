@@ -82,7 +82,14 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// v2 (#25) adds the `tier_b_alpha_spans` table so Tier B occurrences
 /// can persist per-identifier alpha-rename byte ranges. This is additive
 /// — v1 rows survive untouched and simply carry no alpha spans.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (#27) adds the `occurrence_suppressions` table so the GUI can
+/// dismiss a single occurrence of a group without suppressing the whole
+/// group. Keyed by the pair `(group_hash, file_path)` — reusing the
+/// same hash the group-level `suppressions` table keys on so a user
+/// who first dismisses one occurrence and then the whole group never
+/// needs to clean up both.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Backwards-compatible alias for [`CURRENT_SCHEMA_VERSION`]. Kept so
 /// `pub use` consumers of this crate don't break on the #18 rename.
@@ -697,6 +704,95 @@ impl Cache {
         Ok(n)
     }
 
+    /// Record a per-occurrence dismissal (#27). Idempotent — a second
+    /// call with the same `(hash, path)` pair refreshes the
+    /// `dismissed_at` timestamp via `INSERT OR REPLACE`.
+    ///
+    /// The occurrence-level suppressions are orthogonal to the group-
+    /// level [`Self::dismiss_hash`] table: dismissing one occurrence
+    /// does not dismiss the whole group, and dismissing the whole group
+    /// does not need to also wipe per-occurrence rows (the group-level
+    /// filter fires first at report time). `path` must match the form
+    /// the cache stores — i.e. repository-relative, POSIX-normalized.
+    pub fn dismiss_occurrence(
+        &mut self,
+        hash: crate::rolling_hash::Hash,
+        path: &Path,
+    ) -> Result<(), CacheError> {
+        let now = now_unix_seconds();
+        let bytes = hash.to_be_bytes();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO occurrence_suppressions \
+                (group_hash, file_path, dismissed_at) \
+             VALUES (?1, ?2, ?3)",
+            params![&bytes[..], path_to_posix_str(path), now],
+        )?;
+        Ok(())
+    }
+
+    /// List every per-occurrence dismissal, oldest first.
+    ///
+    /// Returned tuples are `(group_hash, file_path, dismissed_at)`.
+    /// Rows whose stored hash is malformed (wrong byte length) are
+    /// silently skipped — same defensive behaviour as
+    /// [`Self::list_suppressions`].
+    pub fn list_occurrence_suppressions(
+        &self,
+    ) -> Result<Vec<(crate::rolling_hash::Hash, PathBuf, i64)>, CacheError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_hash, file_path, dismissed_at \
+             FROM occurrence_suppressions \
+             ORDER BY dismissed_at ASC, group_hash ASC, file_path ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            let path: String = row.get(1)?;
+            let dismissed_at: i64 = row.get(2)?;
+            Ok((bytes, path, dismissed_at))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (bytes, path, ts) = r?;
+            if let Some(h) = blob_to_hash(&bytes) {
+                out.push((h, PathBuf::from(path), ts));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The set of dismissed `(group_hash, file_path)` pairs. Cheap
+    /// report-time helper — the scanner / GUI filter by membership in
+    /// this set without needing the timestamps.
+    pub fn suppressed_occurrences(
+        &self,
+    ) -> Result<std::collections::HashSet<(crate::rolling_hash::Hash, PathBuf)>, CacheError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT group_hash, file_path FROM occurrence_suppressions")?;
+        let rows = stmt.query_map([], |row| {
+            let bytes: Vec<u8> = row.get(0)?;
+            let path: String = row.get(1)?;
+            Ok((bytes, path))
+        })?;
+        let mut out = std::collections::HashSet::new();
+        for r in rows {
+            let (bytes, path) = r?;
+            if let Some(h) = blob_to_hash(&bytes) {
+                out.insert((h, PathBuf::from(path)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Truncate the per-occurrence suppressions table. Symmetric with
+    /// [`Self::clear_suppressions`]; returns the number of rows removed.
+    pub fn clear_occurrence_suppressions(&mut self) -> Result<usize, CacheError> {
+        let n = self
+            .conn
+            .execute("DELETE FROM occurrence_suppressions", [])?;
+        Ok(n)
+    }
+
     /// The current database schema version, as reported by
     /// `PRAGMA user_version`. Public so tests can assert on it directly;
     /// callers shouldn't normally need it.
@@ -748,7 +844,11 @@ type MigrationFn = fn(&rusqlite::Transaction<'_>) -> Result<(), CacheError>;
 /// Consolidation is safe because no real user DBs exist yet; the only
 /// pre-#18 databases are dev scratchpads regenerated on every run. A
 /// future v2 entry would add a new `(1, migrate_v1_to_v2)` row.
-const MIGRATIONS: &[(u32, MigrationFn)] = &[(0, migrate_v0_to_v1), (1, migrate_v1_to_v2)];
+const MIGRATIONS: &[(u32, MigrationFn)] = &[
+    (0, migrate_v0_to_v1),
+    (1, migrate_v1_to_v2),
+    (2, migrate_v2_to_v3),
+];
 
 /// Ensure the cache is at [`CURRENT_SCHEMA_VERSION`].
 ///
@@ -903,6 +1003,36 @@ fn migrate_v1_to_v2(tx: &rusqlite::Transaction<'_>) -> Result<(), CacheError> {
          );\
          CREATE INDEX IF NOT EXISTS tier_b_alpha_spans_occ_idx \
             ON tier_b_alpha_spans(occurrence_id);",
+    )?;
+    Ok(())
+}
+
+/// v2 → v3 (#27): add `occurrence_suppressions`, a per-(group,file)
+/// sidecar keyed by the same `group_hash` the group-level `suppressions`
+/// table uses plus the occurrence's repository-relative path.
+///
+/// Semantics: the GUI's "dismiss this occurrence" button writes one row
+/// per `(group_hash, file_path)` pair. At report time the cache caller
+/// drops any occurrence whose pair is present, and drops the whole
+/// group if its remaining occurrences fall below the 2-member floor.
+///
+/// The table is intentionally NOT foreign-keyed to `match_groups` or
+/// `occurrences`: both of those rewrite on every scan (truncate +
+/// re-insert), and the whole point of suppressions is to survive that
+/// rewrite. Keying by the stable `group_hash` (which *does* survive
+/// re-scans, see the #11 design) keeps the dismissal honest — if a
+/// block is edited the hash changes and the suppression no longer
+/// matches, mirroring the group-level behaviour.
+fn migrate_v2_to_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), CacheError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS occurrence_suppressions (\
+            group_hash    BLOB NOT NULL,\
+            file_path     TEXT NOT NULL,\
+            dismissed_at  INTEGER NOT NULL,\
+            PRIMARY KEY (group_hash, file_path)\
+         );\
+         CREATE INDEX IF NOT EXISTS occurrence_suppressions_hash_idx \
+            ON occurrence_suppressions(group_hash);",
     )?;
     Ok(())
 }
@@ -1328,6 +1458,49 @@ mod tests {
     }
 
     #[test]
+    fn occurrence_suppressions_roundtrip() {
+        // Dismiss one (hash, path) pair; the set and list helpers must
+        // see it, and a second dismiss with the same key is idempotent.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let hash = 0xdead_beef_u64;
+        let path = PathBuf::from("src/foo.rs");
+
+        cache.dismiss_occurrence(hash, &path).unwrap();
+        cache.dismiss_occurrence(hash, &path).unwrap(); // idempotent
+
+        let set = cache.suppressed_occurrences().unwrap();
+        assert!(set.contains(&(hash, path.clone())));
+        let list = cache.list_occurrence_suppressions().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, hash);
+        assert_eq!(list[0].1, path);
+
+        let n = cache.clear_occurrence_suppressions().unwrap();
+        assert_eq!(n, 1);
+        assert!(cache.suppressed_occurrences().unwrap().is_empty());
+    }
+
+    #[test]
+    fn occurrence_suppressions_keyed_by_hash_and_path() {
+        // Two different paths under the same hash yield two rows; two
+        // different hashes on the same path also yield two rows. The
+        // PRIMARY KEY is the full pair.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        cache
+            .dismiss_occurrence(0x1111, &PathBuf::from("a.rs"))
+            .unwrap();
+        cache
+            .dismiss_occurrence(0x1111, &PathBuf::from("b.rs"))
+            .unwrap();
+        cache
+            .dismiss_occurrence(0x2222, &PathBuf::from("a.rs"))
+            .unwrap();
+        assert_eq!(cache.suppressed_occurrences().unwrap().len(), 3);
+    }
+
+    #[test]
     fn clear_suppressions_truncates() {
         let dir = tempdir().unwrap();
         let mut cache = Cache::open(dir.path()).unwrap();
@@ -1528,6 +1701,64 @@ mod tests {
             bytes_before, bytes_after,
             "cache file must be preserved byte-for-byte when newer schema refused"
         );
+    }
+
+    #[test]
+    fn v2_db_upgrades_to_current_on_open() {
+        // Simulate a #25-era DB (user_version = 2, no
+        // `occurrence_suppressions` table) and open() it with the
+        // current build. The migration ladder should carry it to v3,
+        // stamp user_version, and leave the pre-existing rows alone.
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(CACHE_DIR)).unwrap();
+        let db_path = dir.path().join(CACHE_DIR).join(CACHE_FILE);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            // Apply v0→v1 + v1→v2 by hand (hand-rolled so this test
+            // doesn't depend on the public API's ability to downgrade).
+            conn.execute_batch(
+                "CREATE TABLE match_groups (\
+                    id INTEGER PRIMARY KEY, group_hash BLOB NOT NULL,\
+                    occurrence_count INTEGER, total_tokens INTEGER,\
+                    total_lines INTEGER, tier TEXT NOT NULL DEFAULT 'A');\
+                 CREATE TABLE occurrences (\
+                    id INTEGER PRIMARY KEY,\
+                    group_id INTEGER NOT NULL REFERENCES match_groups(id) \
+                        ON DELETE CASCADE,\
+                    path TEXT NOT NULL, start_line INTEGER, end_line INTEGER,\
+                    start_byte INTEGER, end_byte INTEGER);\
+                 CREATE TABLE file_hashes (\
+                    path TEXT PRIMARY KEY, content_hash BLOB NOT NULL,\
+                    scanned_at INTEGER, size INTEGER NOT NULL DEFAULT 0,\
+                    mtime INTEGER NOT NULL DEFAULT 0);\
+                 CREATE TABLE file_blocks (\
+                    path TEXT PRIMARY KEY, content_hash BLOB NOT NULL,\
+                    block_hashes BLOB NOT NULL);\
+                 CREATE TABLE suppressions (\
+                    group_hash BLOB PRIMARY KEY, dismissed_at INTEGER NOT NULL,\
+                    last_group_id INTEGER);\
+                 CREATE TABLE tier_b_alpha_spans (\
+                    id INTEGER PRIMARY KEY,\
+                    occurrence_id INTEGER NOT NULL REFERENCES occurrences(id) \
+                        ON DELETE CASCADE,\
+                    start_byte INTEGER NOT NULL, end_byte INTEGER NOT NULL,\
+                    placeholder_idx INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2u32).unwrap();
+        }
+
+        // Open with current build: expect clean upgrade to v3.
+        let mut cache = Cache::open(dir.path()).expect("v2 DB should upgrade");
+        assert_eq!(
+            cache.schema_version().unwrap() as u32,
+            CURRENT_SCHEMA_VERSION
+        );
+        // Per-occurrence helpers now usable.
+        cache
+            .dismiss_occurrence(0xcafe, &PathBuf::from("x.rs"))
+            .unwrap();
+        assert_eq!(cache.suppressed_occurrences().unwrap().len(), 1);
     }
 
     #[test]

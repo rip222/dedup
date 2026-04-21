@@ -23,15 +23,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gpui::{Context, MouseButton, Window, black, div, prelude::*, px, rgb, uniform_list, white};
+use gpui::{
+    ClipboardItem, Context, MouseButton, Window, black, div, prelude::*, px, rgb, uniform_list,
+    white,
+};
 
 use crate::app_state::{
-    AppState, AppStatus, GroupView, Pane, ScanState, SortKey, SuppressionView,
+    AppState, AppStatus, GroupView, OccurrenceView, Pane, ScanState, SortKey, SuppressionView,
     format_completion_banner, format_elapsed, group_view_from_match, load_folder, open_in_editor,
 };
 use crate::menubar::{
-    ActivateGroup, DismissCurrentGroup, FindInSidebar, FocusDetail, FocusSidebar, NextGroup,
-    OpenFolder, OpenSelectedInEditor, PrevGroup, StartScan, StopScan,
+    ActivateGroup, CollapseAll, DismissCurrentGroup, ExpandAll, FindInSidebar, FocusDetail,
+    FocusSidebar, NextGroup, OpenFolder, OpenSelectedInEditor, PrevGroup, StartScan, StopScan,
 };
 use dedup_core::{
     Cache, Config, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, Tier,
@@ -428,6 +431,131 @@ impl ProjectView {
         self.state.set_sort_key(key);
         cx.notify();
     }
+
+    // -----------------------------------------------------------------
+    // Issue #27 — group toolbar + per-occurrence action handlers.
+    //
+    // Wrappers around `AppState` methods that also (a) persist to the
+    // cache when the action has durable semantics (dismiss group / occ)
+    // and (b) write to the system clipboard for copy actions. All are
+    // best-effort on the I/O side: a cache/clipboard failure logs and
+    // leaves the in-memory state applied so the user sees immediate
+    // feedback regardless.
+    // -----------------------------------------------------------------
+
+    /// Toggle a single occurrence's checkbox.
+    pub fn toggle_occurrence(&mut self, group_id: i64, occ_idx: usize, cx: &mut Context<Self>) {
+        self.state.toggle_occurrence(group_id, occ_idx);
+        cx.notify();
+    }
+
+    /// Dismiss the whole group via the toolbar's `[Dismiss group]`
+    /// button. Ignores checkbox state per issue #27.
+    pub fn dismiss_group_toolbar(&mut self, group_id: i64, cx: &mut Context<Self>) {
+        let Some((hash, gid)) = self.state.dismiss_group(group_id) else {
+            return;
+        };
+        if let Some(folder) = self.state.current_folder.clone() {
+            match Cache::open(&folder) {
+                Ok(mut cache) => {
+                    if let Err(e) = cache.dismiss_hash(hash, Some(gid)) {
+                        log::warn!("dedup-gui: failed to persist dismissal for group {gid}: {e}");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("dedup-gui: failed to open cache to persist group dismissal: {e}")
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Dismiss a single occurrence via the per-row `[×]` button.
+    pub fn dismiss_occurrence(&mut self, group_id: i64, occ_idx: usize, cx: &mut Context<Self>) {
+        let Some((hash, path)) = self.state.dismiss_occurrence(group_id, occ_idx) else {
+            return;
+        };
+        if let Some(folder) = self.state.current_folder.clone() {
+            match Cache::open(&folder) {
+                Ok(mut cache) => {
+                    if let Err(e) = cache.dismiss_occurrence(hash, &path) {
+                        log::warn!(
+                            "dedup-gui: failed to persist occurrence dismissal for {}: {e}",
+                            path.display()
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "dedup-gui: failed to open cache to persist occurrence dismissal: {e}"
+                ),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Toolbar "Copy paths" — writes the checked paths (or all visible
+    /// paths when nothing is checked) as a newline-separated string to
+    /// the system clipboard.
+    pub fn copy_paths_for_group(
+        &mut self,
+        group_id: i64,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self.state.copy_paths_for_group(group_id);
+        if paths.is_empty() {
+            return;
+        }
+        let text = paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Per-row "Copy path" — single path → clipboard.
+    pub fn copy_single_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+    }
+
+    /// Toolbar "Open in editor" — respect checkboxes, fall back to
+    /// every visible path when none are checked. Real launcher lands
+    /// in #29; today we call the `open_in_editor` placeholder.
+    pub fn open_group_in_editor(&mut self, group_id: i64, _cx: &mut Context<Self>) {
+        let paths = self.state.copy_paths_for_group(group_id);
+        if paths.is_empty() {
+            return;
+        }
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        // TODO(#29): wire editor launcher.
+        open_in_editor(&refs);
+    }
+
+    /// Toolbar "Collapse all".
+    pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
+        self.state.collapse_all();
+        cx.notify();
+    }
+
+    /// Toolbar "Expand all".
+    pub fn expand_all(&mut self, cx: &mut Context<Self>) {
+        self.state.expand_all();
+        cx.notify();
+    }
+
+    /// Toolbar `[×]` close — clear selection so the detail pane blanks.
+    pub fn close_group_detail(&mut self, cx: &mut Context<Self>) {
+        self.state.close_group_detail();
+        cx.notify();
+    }
+
+    /// Per-group header toggle — collapse/expand a single group's
+    /// detail body.
+    pub fn toggle_group_collapse(&mut self, group_id: i64, cx: &mut Context<Self>) {
+        self.state.toggle_collapse(group_id);
+        cx.notify();
+    }
 }
 
 /// Drain every currently-buffered [`ScanEvent`] off the channel. On
@@ -611,6 +739,20 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
     cx.on_action(|_: &OpenSelectedInEditor, cx: &mut gpui::App| {
         if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
             entity.update(cx, |view, cx| view.open_selected_in_editor(cx));
+        }
+    });
+
+    // Issue #27 — toolbar "Collapse all" / "Expand all" actions. These
+    // also have keyboard-shortcut potential but the issue only asks
+    // for button wiring; the keybinding table stays unchanged.
+    cx.on_action(|_: &CollapseAll, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.collapse_all(cx));
+        }
+    });
+    cx.on_action(|_: &ExpandAll, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.expand_all(cx));
         }
     });
 }
@@ -1287,14 +1429,22 @@ fn render_detail(state: &AppState) -> gpui::AnyElement {
             .into_any_element();
     }
 
-    let rows = build_detail_rows(state, occurrences);
+    // Safe: `selected_occurrences()` is only non-empty when
+    // `selected_group` is Some.
+    let group_id = state.selected_group.unwrap_or(-1);
+    let collapsed = state.is_group_collapsed(group_id);
+
+    let rows: Vec<DetailRow> = if collapsed {
+        // Collapsed — render only the toolbar + occurrence headers
+        // (for the checkbox row shape). The `uniform_list` below still
+        // receives a trivial rows list so the detail-pane layout is
+        // unchanged; users re-expand to see the code.
+        Vec::new()
+    } else {
+        build_detail_rows(state, &occurrences)
+    };
     let rows = Rc::new(rows);
     let row_count = rows.len();
-
-    // The `uniform_list` lazy-renders only the visible slice — with 100+
-    // occurrences the flattened `rows` vec can hold thousands of
-    // `CodeLine` rows, but we only ever materialise what the viewport
-    // shows + a small buffer on either side.
     let rows_for_render = rows.clone();
     let list = uniform_list("detail-rows", row_count, move |range, _window, _cx| {
         range
@@ -1309,10 +1459,278 @@ fn render_detail(state: &AppState) -> gpui::AnyElement {
         .flex()
         .flex_col()
         .bg(rgb(BG))
-        .p(px(16.0))
         .flex_1()
-        .child(list)
+        .child(render_group_toolbar(state, group_id))
+        .child(render_occurrence_cards(state, group_id, &occurrences))
+        .child(div().flex_1().px(px(16.0)).pb(px(16.0)).child(list))
         .into_any_element()
+}
+
+/// Colours specific to the issue #27 toolbar + per-occurrence cards.
+const TOOLBAR_BG: u32 = 0x2a2a33;
+const TOOLBAR_BUTTON_BG: u32 = 0x3b3b48;
+const TOOLBAR_DANGER_BG: u32 = 0x5a2a2a;
+const TOOLBAR_BUTTON_HOVER_BG: u32 = 0x4a4a58;
+const CHECKBOX_CHECKED_BG: u32 = ACCENT;
+const CHECKBOX_UNCHECKED_BG: u32 = 0x444452;
+
+/// Build a single toolbar button (rounded, coloured rect with on-click).
+fn toolbar_button(
+    label: impl Into<String>,
+    bg: u32,
+    action: impl Fn(&mut gpui::App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    let label = label.into();
+    let id_key = label.clone();
+    div()
+        .id(("toolbar-btn", id_key.len() as u64))
+        .px(px(10.0))
+        .py(px(5.0))
+        .bg(rgb(bg))
+        .rounded(px(4.0))
+        .text_size(px(12.0))
+        .text_color(rgb(ROW_TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            action(cx)
+        })
+        .child(id_key)
+}
+
+/// Group-level toolbar (#27): info label + action buttons.
+///
+/// The buttons invoke `ProjectView` methods through the global
+/// `RootHandle`. `[Dismiss group]` ignores checkboxes; `[Copy paths]`
+/// and `[Open in editor]` respect them, falling back to every visible
+/// path when the checkbox set is empty.
+fn render_group_toolbar(state: &AppState, group_id: i64) -> gpui::Div {
+    let (files, dup_lines) = state.group_toolbar_counts(group_id);
+
+    let info_text = format!(
+        "{files} file{fplural} \u{00B7} {lines} duplicated line{lplural}",
+        fplural = if files == 1 { "" } else { "s" },
+        lines = dup_lines,
+        lplural = if dup_lines == 1 { "" } else { "s" },
+    );
+
+    let gid_open = group_id;
+    let gid_dismiss = group_id;
+    let gid_copy = group_id;
+
+    // Buttons dispatch through RootHandle so any pane can observe the
+    // resulting state change.
+    let open_btn = toolbar_button("Open in editor", TOOLBAR_BUTTON_BG, move |cx| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.open_group_in_editor(gid_open, cx));
+        }
+    });
+    let dismiss_btn = toolbar_button("Dismiss group", TOOLBAR_DANGER_BG, move |cx| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.dismiss_group_toolbar(gid_dismiss, cx));
+        }
+    });
+    // Clipboard needs a Window reference; route it through a dedicated
+    // mouse-down handler that has access to the window param.
+    let copy_btn = div()
+        .id(("toolbar-btn-copy", gid_copy as u64))
+        .px(px(10.0))
+        .py(px(5.0))
+        .bg(rgb(TOOLBAR_BUTTON_BG))
+        .rounded(px(4.0))
+        .text_size(px(12.0))
+        .text_color(rgb(ROW_TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_, window: &mut Window, cx: &mut gpui::App| {
+                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                    entity.update(cx, |view, cx| {
+                        view.copy_paths_for_group(gid_copy, window, cx)
+                    });
+                }
+            },
+        )
+        .child("Copy paths");
+    let collapse_btn = toolbar_button("Collapse all", TOOLBAR_BUTTON_BG, move |cx| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.collapse_all(cx));
+        }
+    });
+    let expand_btn = toolbar_button("Expand all", TOOLBAR_BUTTON_BG, move |cx| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.expand_all(cx));
+        }
+    });
+    let close_btn = div()
+        .id(("toolbar-close", group_id as u64))
+        .w(px(22.0))
+        .h(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(TOOLBAR_BUTTON_BG))
+        .rounded(px(4.0))
+        .text_size(px(14.0))
+        .text_color(rgb(ROW_TEXT))
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.close_group_detail(cx));
+            }
+        })
+        .child("\u{00D7}");
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(16.0))
+        .py(px(10.0))
+        .bg(rgb(TOOLBAR_BG))
+        .border_b_1()
+        .border_color(black())
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(12.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .child(info_text),
+        )
+        .child(open_btn)
+        .child(dismiss_btn)
+        .child(copy_btn)
+        .child(collapse_btn)
+        .child(expand_btn)
+        .child(close_btn)
+}
+
+/// Per-occurrence checkbox + path + hover-only `[Copy path]` + `[×]`
+/// card rendered between the toolbar and the scrolling code body.
+fn render_occurrence_cards(
+    state: &AppState,
+    group_id: i64,
+    occurrences: &[OccurrenceView],
+) -> gpui::Div {
+    let mut wrap = div()
+        .flex()
+        .flex_col()
+        .px(px(16.0))
+        .py(px(8.0))
+        .gap(px(4.0));
+    for (idx, occ) in occurrences.iter().enumerate() {
+        wrap = wrap.child(render_occurrence_card(group_id, idx, occ, state));
+    }
+    wrap
+}
+
+fn render_occurrence_card(
+    group_id: i64,
+    occ_idx: usize,
+    occ: &OccurrenceView,
+    state: &AppState,
+) -> gpui::Div {
+    let checked = state.is_occurrence_selected(group_id, occ_idx);
+    let label = occ.label();
+    let path_for_copy = occ.path.clone();
+    let group_hover_key = format!("occ-card-{group_id}-{occ_idx}");
+
+    let checkbox_bg = if checked {
+        CHECKBOX_CHECKED_BG
+    } else {
+        CHECKBOX_UNCHECKED_BG
+    };
+    let check_mark = if checked { "\u{2713}" } else { " " };
+
+    let checkbox = div()
+        .id(("occ-checkbox", (group_id as u64) << 32 | occ_idx as u64))
+        .w(px(16.0))
+        .h(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(checkbox_bg))
+        .rounded(px(3.0))
+        .text_size(px(11.0))
+        .text_color(white())
+        .cursor_pointer()
+        .child(check_mark.to_string())
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.toggle_occurrence(group_id, occ_idx, cx));
+            }
+        });
+
+    // Per-row [×] — dismisses THIS occurrence without dismissing the
+    // whole group (#27 AC).
+    let dismiss = div()
+        .id(("occ-dismiss", (group_id as u64) << 32 | occ_idx as u64))
+        .w(px(18.0))
+        .h(px(18.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(TOOLBAR_DANGER_BG))
+        .rounded(px(3.0))
+        .text_size(px(12.0))
+        .text_color(white())
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+        .child("\u{00D7}")
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| {
+                    view.dismiss_occurrence(group_id, occ_idx, cx)
+                });
+            }
+        });
+
+    // Per-row `[Copy path]` — hidden by default, revealed on row hover
+    // via GPUI's `group_hover` mechanism. The wrapper div declares a
+    // named hover group; the copy button is invisible until the group
+    // is hovered, at which point it fades into full opacity.
+    let copy_button = div()
+        .id(("occ-copy", (group_id as u64) << 32 | occ_idx as u64))
+        .px(px(8.0))
+        .py(px(3.0))
+        .bg(rgb(TOOLBAR_BUTTON_BG))
+        .rounded(px(3.0))
+        .text_size(px(11.0))
+        .text_color(rgb(ROW_TEXT))
+        .cursor_pointer()
+        .invisible()
+        .group_hover(group_hover_key.clone(), |s| s.visible())
+        .child("Copy path")
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                let p = path_for_copy.clone();
+                entity.update(cx, |view, cx| view.copy_single_path(p, cx));
+            }
+        });
+
+    div()
+        .group(group_hover_key)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .py(px(5.0))
+        .bg(rgb(SIDEBAR_BG))
+        .rounded(px(4.0))
+        .child(checkbox)
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(12.0))
+                .text_color(rgb(ROW_TEXT))
+                .child(label),
+        )
+        .child(copy_button)
+        .child(dismiss)
 }
 
 /// Render one flattened row from [`build_detail_rows`].

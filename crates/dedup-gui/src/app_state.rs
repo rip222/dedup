@@ -21,6 +21,7 @@
 //! criteria, "Re-opening an already-cached directory is instant" and
 //! "no re-scan required".
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -322,6 +323,25 @@ pub struct AppState {
     /// [`dedup_core::Cache::dismiss_hash`] (invoked by the `x` action
     /// handler in `project_view`).
     pub session_dismissed: std::collections::HashSet<u64>,
+    /// Per-occurrence (group_hash, relative_path) pairs dismissed this
+    /// session (#27). Mirrors `session_dismissed` but at occurrence
+    /// granularity. The UI filters `selected_occurrences()` against
+    /// this set so a row disappears immediately on click; the real
+    /// write is [`dedup_core::Cache::dismiss_occurrence`] (invoked by
+    /// the `[×]` button handler in `project_view`).
+    pub session_occurrence_dismissed: HashSet<(u64, PathBuf)>,
+    /// Multi-select checkbox state for the group toolbar (#27). Maps
+    /// `group_id` → set of *indices* within that group's
+    /// `visible_occurrences` list. Indices are the GUI's position
+    /// order (cache path-asc, start-line-asc) rather than cache row
+    /// ids because occurrences don't expose their own id to the view
+    /// model.
+    pub selected_occurrence_indices: HashMap<i64, HashSet<usize>>,
+    /// Groups whose detail section is collapsed (#27). Default is
+    /// "none collapsed". `collapse_all()` populates this with every
+    /// visible group id; `expand_all()` clears it; per-group header
+    /// clicks toggle membership.
+    pub collapsed_groups: HashSet<i64>,
     /// GUI detail-pane tunables (issue #26). Cached on folder open —
     /// not reloaded per frame. Currently carries just
     /// [`DetailConfig::context_lines`] (number of dimmed before/after
@@ -619,6 +639,9 @@ impl AppState {
         // Reset per-folder issue-#23 state so a re-open doesn't carry
         // stale search / selection from the previous folder.
         self.session_dismissed.clear();
+        self.session_occurrence_dismissed.clear();
+        self.selected_occurrence_indices.clear();
+        self.collapsed_groups.clear();
         self.selected_group_idx = if self.groups.is_empty() {
             None
         } else {
@@ -630,16 +653,43 @@ impl AppState {
     }
 
     /// Look up the currently selected group's occurrences, if any.
-    pub fn selected_occurrences(&self) -> &[OccurrenceView] {
+    ///
+    /// Applies the per-occurrence session-dismiss filter (#27) — any
+    /// occurrence the user dismissed via the per-row `[×]` this session
+    /// is dropped before the slice reaches the detail pane. Because
+    /// this function returns a `Vec` rather than a slice (the filter
+    /// requires a copy), callers hold the result for the render frame.
+    pub fn selected_occurrences(&self) -> Vec<OccurrenceView> {
         match self.selected_group {
             Some(id) => self
                 .groups
                 .iter()
                 .find(|g| g.id == id)
-                .map(|g| g.occurrences.as_slice())
-                .unwrap_or(&[]),
-            None => &[],
+                .map(|g| self.visible_occurrences_of(g))
+                .unwrap_or_default(),
+            None => Vec::new(),
         }
+    }
+
+    /// Return the occurrences of `group` that survive the session-
+    /// dismiss filter. Isolates the filter so both [`Self::selected_occurrences`]
+    /// and the detail-toolbar helpers share one definition.
+    pub fn visible_occurrences_of(&self, group: &GroupView) -> Vec<OccurrenceView> {
+        let Some(hash) = group.group_hash else {
+            // Streaming rows have no hash — can't be per-occurrence
+            // dismissed. Return all occurrences untouched.
+            return group.occurrences.clone();
+        };
+        group
+            .occurrences
+            .iter()
+            .filter(|o| {
+                !self
+                    .session_occurrence_dismissed
+                    .contains(&(hash, o.path.clone()))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Partition groups into the two sidebar sections: Tier B first
@@ -759,12 +809,26 @@ impl AppState {
     /// sorts from. Excludes anything the user has dismissed this session
     /// via `x`, mirroring the cache's `suppressed_hashes` filter applied
     /// on folder load.
+    ///
+    /// Also drops groups whose *visible* occurrence count (after the
+    /// per-occurrence session dismiss filter from #27) falls below the
+    /// 2-member floor — a group with one remaining occurrence isn't
+    /// really a duplicate anymore. Groups that already had fewer than
+    /// two occurrences in the source data (synthetic / streaming rows)
+    /// survive the filter unchanged — the floor only engages when
+    /// session dismissals have actually reduced the count.
     pub fn source_groups(&self) -> Vec<GroupView> {
         self.groups
             .iter()
             .filter(|g| match g.group_hash {
                 Some(h) => !self.session_dismissed.contains(&h),
                 None => true,
+            })
+            .filter(|g| {
+                let visible = self.visible_occurrences_of(g).len();
+                // Only enforce the floor when the original had >= 2 AND
+                // the session dismiss reduced that number below 2.
+                visible == g.occurrences.len() || visible >= 2
             })
             .cloned()
             .collect()
@@ -866,6 +930,190 @@ impl AppState {
     /// Change the focused pane (⌘1 / ⌘2).
     pub fn focus_pane(&mut self, pane: Pane) {
         self.focused_pane = pane;
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #27 — group toolbar + per-occurrence selection / dismissal.
+    //
+    // All methods below are GPUI-free so the test lane covers them
+    // directly. Clipboard writes + cache writes live in the GPUI layer
+    // (`project_view`); these helpers only mutate pure state.
+    // -----------------------------------------------------------------
+
+    /// Toggle whether the `occ_idx`-th occurrence of `group_id` is
+    /// checked. `occ_idx` is the position inside the group's
+    /// *visible* (post-per-occurrence-dismiss) occurrence list — the
+    /// same order the detail view renders them in.
+    pub fn toggle_occurrence(&mut self, group_id: i64, occ_idx: usize) {
+        let set = self
+            .selected_occurrence_indices
+            .entry(group_id)
+            .or_default();
+        if !set.insert(occ_idx) {
+            set.remove(&occ_idx);
+        }
+        if set.is_empty() {
+            self.selected_occurrence_indices.remove(&group_id);
+        }
+    }
+
+    /// True iff the given `(group_id, occ_idx)` checkbox is checked.
+    pub fn is_occurrence_selected(&self, group_id: i64, occ_idx: usize) -> bool {
+        self.selected_occurrence_indices
+            .get(&group_id)
+            .is_some_and(|s| s.contains(&occ_idx))
+    }
+
+    /// Paths to copy / open for `group_id` given the current checkbox
+    /// state. Returns the checked paths when any are checked; returns
+    /// every visible occurrence's path when none are checked (the
+    /// "whole group, no selection" default per issue copy).
+    pub fn copy_paths_for_group(&self, group_id: i64) -> Vec<PathBuf> {
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+            return Vec::new();
+        };
+        let occurrences = self.visible_occurrences_of(group);
+        let checked = self.selected_occurrence_indices.get(&group_id);
+        match checked {
+            Some(set) if !set.is_empty() => occurrences
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| set.contains(i))
+                .map(|(_, o)| o.path.clone())
+                .collect(),
+            _ => occurrences.iter().map(|o| o.path.clone()).collect(),
+        }
+    }
+
+    /// Dismiss the entire group identified by `group_id` regardless of
+    /// checkbox state (per issue #27 "Dismiss group ignores checkboxes").
+    /// Updates `session_dismissed` + appends a row to `dismissed` so
+    /// `visible_groups()` drops it immediately. The caller persists
+    /// to the cache via [`dedup_core::Cache::dismiss_hash`].
+    ///
+    /// Returns the `(hash, group_id)` pair on success, or `None` if
+    /// the group is missing or its hash is unresolvable (streaming
+    /// rows). Clears any checkbox / collapse state tied to the id.
+    pub fn dismiss_group(&mut self, group_id: i64) -> Option<(u64, i64)> {
+        let group = self.groups.iter().find(|g| g.id == group_id)?.clone();
+        let hash = group.group_hash?;
+        self.session_dismissed.insert(hash);
+        self.dismissed.push(SuppressionView {
+            hash_hex: format!("{hash:016x}"),
+            last_group_id: Some(group.id),
+        });
+        self.selected_occurrence_indices.remove(&group_id);
+        self.collapsed_groups.remove(&group_id);
+        if self.selected_group == Some(group_id) {
+            self.selected_group = None;
+        }
+        self.reclamp_selection();
+        Some((hash, group.id))
+    }
+
+    /// Dismiss a single occurrence of `group_id` (per issue #27 "Dismiss
+    /// this occurrence preserves rest of group"). `occ_idx` is the
+    /// visible-list index; the corresponding path is tracked in
+    /// `session_occurrence_dismissed` so future `visible_occurrences_of`
+    /// calls skip it. The caller persists to the cache via
+    /// [`dedup_core::Cache::dismiss_occurrence`].
+    ///
+    /// Returns `(hash, path)` on success. `None` when the group or
+    /// occurrence is missing, or when the group lacks a stable hash
+    /// (streaming rows — can't durably persist the dismissal). Also
+    /// clears `selected_occurrence_indices[group_id][occ_idx]` and
+    /// shifts any higher-index selections down so the indices stay
+    /// valid after the remove.
+    ///
+    /// Groups whose visible occurrence count falls below 2 after the
+    /// dismissal are *not* mutated here — the count falls out of
+    /// [`Self::visible_occurrences_of`] naturally; the sidebar's
+    /// `visible_groups()` filter continues to surface a singleton
+    /// group until the filter hides it organically.
+    pub fn dismiss_occurrence(&mut self, group_id: i64, occ_idx: usize) -> Option<(u64, PathBuf)> {
+        let group = self.groups.iter().find(|g| g.id == group_id)?.clone();
+        let hash = group.group_hash?;
+        let visible = self.visible_occurrences_of(&group);
+        let occ = visible.get(occ_idx)?.clone();
+        self.session_occurrence_dismissed
+            .insert((hash, occ.path.clone()));
+        // Remove that index from the selection set and shift any
+        // higher indices down — indices are into the *post-dismiss*
+        // visible list, so a dismiss at index k means all indices > k
+        // now point one slot to the left.
+        if let Some(set) = self.selected_occurrence_indices.get_mut(&group_id) {
+            let mut updated: HashSet<usize> = HashSet::new();
+            for i in set.iter() {
+                if *i == occ_idx {
+                    continue;
+                }
+                if *i > occ_idx {
+                    updated.insert(*i - 1);
+                } else {
+                    updated.insert(*i);
+                }
+            }
+            if updated.is_empty() {
+                self.selected_occurrence_indices.remove(&group_id);
+            } else {
+                *set = updated;
+            }
+        }
+        Some((hash, occ.path))
+    }
+
+    /// Toggle whether `group_id`'s detail section is collapsed.
+    pub fn toggle_collapse(&mut self, group_id: i64) {
+        if !self.collapsed_groups.insert(group_id) {
+            self.collapsed_groups.remove(&group_id);
+        }
+    }
+
+    /// Whether the given group's detail section is currently collapsed.
+    pub fn is_group_collapsed(&self, group_id: i64) -> bool {
+        self.collapsed_groups.contains(&group_id)
+    }
+
+    /// Collapse every currently-visible group.
+    pub fn collapse_all(&mut self) {
+        for g in self.visible_groups() {
+            self.collapsed_groups.insert(g.id);
+        }
+    }
+
+    /// Expand every group (clears the collapsed set).
+    pub fn expand_all(&mut self) {
+        self.collapsed_groups.clear();
+    }
+
+    /// Close the group-detail pane — clears the selection. Reached by
+    /// the toolbar's `[×]` close button.
+    pub fn close_group_detail(&mut self) {
+        self.selected_group = None;
+        self.selected_group_idx = None;
+        self.focused_pane = Pane::Sidebar;
+    }
+
+    /// Counts used by the group toolbar's
+    /// `[N files · N duplicated lines]` info label (#27).
+    /// `files` counts distinct paths across visible occurrences;
+    /// `duplicated_lines` mirrors `summary()` — lines per occurrence
+    /// times `(count - 1)`, i.e. the removable line count if the
+    /// duplicates were deduplicated to one copy.
+    pub fn group_toolbar_counts(&self, group_id: i64) -> (usize, usize) {
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id) else {
+            return (0, 0);
+        };
+        let visible = self.visible_occurrences_of(group);
+        let files: HashSet<&Path> = visible.iter().map(|o| o.path.as_path()).collect();
+        let duplicated_lines = if visible.len() >= 2 {
+            let first = &visible[0];
+            let span = (first.end_line - first.start_line + 1).max(0) as usize;
+            span.saturating_mul(visible.len() - 1)
+        } else {
+            0
+        };
+        (files.len(), duplicated_lines)
     }
 
     /// After a filter / sort / dismiss change, snap the selection back
@@ -1101,6 +1349,22 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         }
     };
 
+    // Per-occurrence suppressions (#27) are applied alongside the
+    // group-level set: dismiss any (group_hash, path) pair that's in
+    // the table, and drop the whole group if the remaining count
+    // falls below 2.
+    let occurrence_suppressed = match cache.suppressed_occurrences() {
+        Ok(s) => s,
+        Err(e) => {
+            return FolderLoadResult {
+                folder,
+                groups: Vec::new(),
+                dismissed: Vec::new(),
+                status: AppStatus::Error(format!("failed to read occurrence suppressions: {e}")),
+            };
+        }
+    };
+
     let mut groups = Vec::with_capacity(summaries.len());
     for summary in summaries {
         // Filter suppressed groups out of the main sidebar; they'll show
@@ -1141,6 +1405,10 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         let occurrences: Vec<OccurrenceView> = detail
             .occurrences
             .iter()
+            .filter(|o| match hash {
+                Some(h) => !occurrence_suppressed.contains(&(h, o.path.clone())),
+                None => true,
+            })
             .map(|o| OccurrenceView {
                 path: o.path.clone(),
                 start_line: o.start_line,
@@ -1164,6 +1432,11 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
                     .collect(),
             })
             .collect();
+
+        // #27 — drop groups whose remaining occurrences fall below 2.
+        if occurrences.len() < 2 {
+            continue;
+        }
 
         // Tier B display-name + kind are not yet plumbed through the
         // cache — see `group_label`'s doc comment. For now every Tier B
@@ -2046,5 +2319,320 @@ mod tests {
         assert_eq!(s.focused_pane, Pane::Detail);
         s.focus_pane(Pane::Sidebar);
         assert_eq!(s.focused_pane, Pane::Sidebar);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #27 — group toolbar + per-occurrence selection / dismissal.
+    // All pure-state assertions; no GPUI types are constructed.
+    // -------------------------------------------------------------------
+
+    fn loaded_with_multi_occ() -> AppState {
+        // Two groups, the first with three occurrences (so per-occurrence
+        // dismiss can drop one without falling below the 2-member floor).
+        loaded_state_with(vec![
+            mkgroup(
+                1,
+                Tier::A,
+                "three-occs",
+                vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5), occ("c.rs", 1, 5)],
+                Some(0xAA),
+            ),
+            mkgroup(
+                2,
+                Tier::A,
+                "two-occs",
+                vec![occ("x.rs", 1, 5), occ("y.rs", 1, 5)],
+                Some(0xBB),
+            ),
+        ])
+    }
+
+    #[test]
+    fn toggle_occurrence_adds_and_removes() {
+        let mut s = loaded_with_multi_occ();
+        assert!(!s.is_occurrence_selected(1, 0));
+        s.toggle_occurrence(1, 0);
+        assert!(s.is_occurrence_selected(1, 0));
+        s.toggle_occurrence(1, 0);
+        assert!(!s.is_occurrence_selected(1, 0));
+        // Empty set is cleaned up so the HashMap doesn't grow unbounded.
+        assert!(!s.selected_occurrence_indices.contains_key(&1));
+    }
+
+    #[test]
+    fn copy_paths_returns_checked_when_any_checked() {
+        let mut s = loaded_with_multi_occ();
+        s.toggle_occurrence(1, 0);
+        s.toggle_occurrence(1, 2);
+        let paths = s.copy_paths_for_group(1);
+        let set: std::collections::HashSet<_> = paths.iter().cloned().collect();
+        let expected: std::collections::HashSet<_> =
+            vec![PathBuf::from("a.rs"), PathBuf::from("c.rs")]
+                .into_iter()
+                .collect();
+        assert_eq!(set, expected);
+    }
+
+    #[test]
+    fn copy_paths_falls_back_to_all_when_none_checked() {
+        let s = loaded_with_multi_occ();
+        let paths = s.copy_paths_for_group(1);
+        assert_eq!(paths.len(), 3);
+    }
+
+    #[test]
+    fn dismiss_group_removes_from_visible_and_records_hash() {
+        let mut s = loaded_with_multi_occ();
+        let out = s.dismiss_group(1);
+        assert_eq!(out, Some((0xAA, 1)));
+        assert!(s.session_dismissed.contains(&0xAA));
+        let ids: Vec<i64> = s.visible_groups().iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec![2]);
+        // Dismissed row appended for the sidebar's dismissed section.
+        assert_eq!(s.dismissed.len(), 1);
+    }
+
+    #[test]
+    fn dismiss_group_ignores_checkboxes() {
+        // Even with one checkbox selected, "Dismiss group" drops the
+        // whole group — the per-acceptance-criterion invariant.
+        let mut s = loaded_with_multi_occ();
+        s.toggle_occurrence(1, 0);
+        let out = s.dismiss_group(1);
+        assert!(out.is_some());
+        assert!(!s.selected_occurrence_indices.contains_key(&1));
+    }
+
+    #[test]
+    fn dismiss_occurrence_preserves_rest_of_group() {
+        let mut s = loaded_with_multi_occ();
+        // Group 1 has 3 occurrences. Dismiss the first — 2 should remain
+        // and the group should stay in the visible list.
+        let out = s.dismiss_occurrence(1, 0);
+        assert_eq!(out, Some((0xAA, PathBuf::from("a.rs"))));
+        // Group 1 still surfaces; remaining occurrences are b.rs + c.rs.
+        let visible: Vec<i64> = s.visible_groups().iter().map(|g| g.id).collect();
+        assert_eq!(visible, vec![1, 2]);
+        let g1 = s.visible_groups().into_iter().find(|g| g.id == 1).unwrap();
+        let remaining_paths: Vec<PathBuf> = s
+            .visible_occurrences_of(&g1)
+            .into_iter()
+            .map(|o| o.path)
+            .collect();
+        assert_eq!(
+            remaining_paths,
+            vec![PathBuf::from("b.rs"), PathBuf::from("c.rs")]
+        );
+    }
+
+    #[test]
+    fn dismiss_occurrence_drops_group_when_count_below_two() {
+        // Group 2 has 2 occurrences. Dismissing one leaves a singleton,
+        // so the group should disappear from visible_groups.
+        let mut s = loaded_with_multi_occ();
+        let _ = s.dismiss_occurrence(2, 0);
+        let visible: Vec<i64> = s.visible_groups().iter().map(|g| g.id).collect();
+        assert_eq!(visible, vec![1]);
+    }
+
+    #[test]
+    fn dismiss_occurrence_is_noop_when_hash_missing() {
+        // Streaming rows have `group_hash = None`; a dismiss on them
+        // must not crash and must return None.
+        let mut s = loaded_state_with(vec![mkgroup(
+            -1,
+            Tier::A,
+            "streaming",
+            vec![occ("a.rs", 1, 2), occ("b.rs", 1, 2)],
+            None,
+        )]);
+        assert_eq!(s.dismiss_occurrence(-1, 0), None);
+    }
+
+    #[test]
+    fn collapse_all_and_expand_all_toggle_state() {
+        let mut s = loaded_with_multi_occ();
+        assert!(s.collapsed_groups.is_empty());
+        s.collapse_all();
+        assert!(s.is_group_collapsed(1));
+        assert!(s.is_group_collapsed(2));
+        s.expand_all();
+        assert!(!s.is_group_collapsed(1));
+        assert!(s.collapsed_groups.is_empty());
+    }
+
+    #[test]
+    fn toggle_collapse_flips_single_group() {
+        let mut s = loaded_with_multi_occ();
+        s.toggle_collapse(1);
+        assert!(s.is_group_collapsed(1));
+        assert!(!s.is_group_collapsed(2));
+        s.toggle_collapse(1);
+        assert!(!s.is_group_collapsed(1));
+    }
+
+    #[test]
+    fn close_group_detail_clears_selection() {
+        let mut s = loaded_with_multi_occ();
+        assert_eq!(s.selected_group, Some(1));
+        s.close_group_detail();
+        assert!(s.selected_group.is_none());
+    }
+
+    #[test]
+    fn group_toolbar_counts_reflect_visible_occurrences() {
+        let mut s = loaded_with_multi_occ();
+        // Before any dismiss: 3 files · (5 - 5 + 1) * (3 - 1) = 5 * 2 = 10
+        // lines. (occurrences are occ("a.rs", 1, 5): 5 lines.)
+        let (files, lines) = s.group_toolbar_counts(1);
+        assert_eq!(files, 3);
+        assert_eq!(lines, 10);
+        // After one dismiss: 2 files · 5 lines (5 * 1).
+        let _ = s.dismiss_occurrence(1, 0);
+        let (files, lines) = s.group_toolbar_counts(1);
+        assert_eq!(files, 2);
+        assert_eq!(lines, 5);
+    }
+
+    #[test]
+    fn selected_occurrences_filters_out_dismissed() {
+        let mut s = loaded_with_multi_occ();
+        assert_eq!(s.selected_occurrences().len(), 3);
+        let _ = s.dismiss_occurrence(1, 0);
+        let occs = s.selected_occurrences();
+        assert_eq!(occs.len(), 2);
+        let paths: Vec<_> = occs.iter().map(|o| o.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from("b.rs"), PathBuf::from("c.rs")]);
+    }
+
+    #[test]
+    fn dismiss_occurrence_shifts_higher_checkbox_indices_down() {
+        // Indices reference the *post-dismiss* visible list, so if the
+        // user had occurrence 2 checked and dismisses occurrence 0,
+        // the old index-2 is now index-1 and must remain checked.
+        let mut s = loaded_with_multi_occ();
+        s.toggle_occurrence(1, 2);
+        let _ = s.dismiss_occurrence(1, 0);
+        assert!(
+            s.is_occurrence_selected(1, 1),
+            "higher checkbox index must shift down after dismiss"
+        );
+        assert!(!s.is_occurrence_selected(1, 2));
+    }
+
+    #[test]
+    fn load_folder_applies_occurrence_suppressions() {
+        // Integration with cache: write a scan, dismiss one occurrence,
+        // reload via `load_folder`. The dismissed occurrence must not
+        // reach the GroupView.
+        use dedup_core::rolling_hash::Span;
+        use dedup_core::{MatchGroup as CoreGroup, Occurrence as CoreOcc, ScanResult, Tier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = ScanResult {
+            groups: vec![CoreGroup {
+                hash: 0xfeed_u64,
+                tier: Tier::A,
+                occurrences: vec![
+                    CoreOcc {
+                        path: PathBuf::from("a.rs"),
+                        span: Span {
+                            start_line: 1,
+                            end_line: 10,
+                            start_byte: 0,
+                            end_byte: 100,
+                        },
+                        alpha_rename_spans: Vec::new(),
+                    },
+                    CoreOcc {
+                        path: PathBuf::from("b.rs"),
+                        span: Span {
+                            start_line: 1,
+                            end_line: 10,
+                            start_byte: 0,
+                            end_byte: 100,
+                        },
+                        alpha_rename_spans: Vec::new(),
+                    },
+                    CoreOcc {
+                        path: PathBuf::from("c.rs"),
+                        span: Span {
+                            start_line: 1,
+                            end_line: 10,
+                            start_byte: 0,
+                            end_byte: 100,
+                        },
+                        alpha_rename_spans: Vec::new(),
+                    },
+                ],
+            }],
+            files_scanned: 3,
+            issues: Vec::new(),
+        };
+        let mut cache = dedup_core::Cache::open(tmp.path()).unwrap();
+        cache.write_scan_result(&scan).unwrap();
+        cache
+            .dismiss_occurrence(0xfeed_u64, &PathBuf::from("a.rs"))
+            .unwrap();
+        drop(cache);
+
+        let r = load_folder(tmp.path());
+        assert_eq!(r.status, AppStatus::Loaded);
+        assert_eq!(r.groups.len(), 1);
+        let paths: Vec<_> = r.groups[0]
+            .occurrences
+            .iter()
+            .map(|o| o.path.clone())
+            .collect();
+        assert_eq!(paths, vec![PathBuf::from("b.rs"), PathBuf::from("c.rs")]);
+    }
+
+    #[test]
+    fn load_folder_drops_group_when_occ_suppressions_bring_below_two() {
+        use dedup_core::rolling_hash::Span;
+        use dedup_core::{MatchGroup as CoreGroup, Occurrence as CoreOcc, ScanResult, Tier};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let scan = ScanResult {
+            groups: vec![CoreGroup {
+                hash: 0xfeed_u64,
+                tier: Tier::A,
+                occurrences: vec![
+                    CoreOcc {
+                        path: PathBuf::from("a.rs"),
+                        span: Span {
+                            start_line: 1,
+                            end_line: 10,
+                            start_byte: 0,
+                            end_byte: 100,
+                        },
+                        alpha_rename_spans: Vec::new(),
+                    },
+                    CoreOcc {
+                        path: PathBuf::from("b.rs"),
+                        span: Span {
+                            start_line: 1,
+                            end_line: 10,
+                            start_byte: 0,
+                            end_byte: 100,
+                        },
+                        alpha_rename_spans: Vec::new(),
+                    },
+                ],
+            }],
+            files_scanned: 2,
+            issues: Vec::new(),
+        };
+        let mut cache = dedup_core::Cache::open(tmp.path()).unwrap();
+        cache.write_scan_result(&scan).unwrap();
+        cache
+            .dismiss_occurrence(0xfeed_u64, &PathBuf::from("a.rs"))
+            .unwrap();
+        drop(cache);
+
+        let r = load_folder(tmp.path());
+        // Only one occurrence remains → group dropped entirely.
+        assert!(r.groups.is_empty());
+        assert_eq!(r.status, AppStatus::NoDuplicates);
     }
 }

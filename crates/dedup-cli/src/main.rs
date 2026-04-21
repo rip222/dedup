@@ -476,6 +476,8 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     // failure downgrades to "no suppressions" so the scan still prints.
     let mut suppressed: std::collections::HashSet<dedup_core::Hash> =
         std::collections::HashSet::new();
+    let mut occ_suppressed: std::collections::HashSet<(dedup_core::Hash, PathBuf)> =
+        std::collections::HashSet::new();
     match Cache::open(path) {
         Ok(mut cache) => {
             if let Err(e) = cache.write_scan_result(&result) {
@@ -487,11 +489,39 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
                     eprintln!("dedup: warning: failed to read suppressions: {e}");
                 }
             }
+            match cache.suppressed_occurrences() {
+                Ok(s) => occ_suppressed = s,
+                Err(e) => {
+                    eprintln!("dedup: warning: failed to read occurrence suppressions: {e}");
+                }
+            }
         }
         Err(e) => {
             eprintln!("dedup: warning: failed to open cache: {e}");
         }
     }
+
+    // Apply per-occurrence suppressions (#27): mutate a local copy of
+    // each group so the print path never sees dismissed occurrences,
+    // and drop the group entirely if <2 remain.
+    let filtered_groups: Vec<MatchGroup> = result
+        .groups
+        .iter()
+        .filter_map(|g| {
+            let occurrences: Vec<_> = g
+                .occurrences
+                .iter()
+                .filter(|o| !occ_suppressed.contains(&(g.hash, o.path.clone())))
+                .cloned()
+                .collect();
+            if occurrences.len() < 2 {
+                return None;
+            }
+            let mut clone = g.clone();
+            clone.occurrences = occurrences;
+            Some(clone)
+        })
+        .collect();
 
     // Apply the tier / lang / suppression filters to produce the
     // user-visible group slice. Tier A groups pass the lang filter
@@ -499,8 +529,7 @@ fn run_scan(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     // additionally clear the `--lang` filter when one is specified.
     // Suppressions key by the group's normalized-block-hash, so any edit
     // that changes the hash will surface the group again.
-    let visible: Vec<&MatchGroup> = result
-        .groups
+    let visible: Vec<&MatchGroup> = filtered_groups
         .iter()
         .filter(|g| !suppressed.contains(&g.hash))
         .filter(|g| match g.tier {
@@ -606,6 +635,9 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
     let suppressed = cache
         .suppressed_hashes()
         .context("failed to read suppressions")?;
+    let occ_suppressed = cache
+        .suppressed_occurrences()
+        .context("failed to read occurrence suppressions")?;
 
     let allow_a = tier_allows_a(globals);
     let allow_b = tier_allows_b(globals);
@@ -644,6 +676,17 @@ fn run_list(path: &Path, globals: &GlobalArgs) -> Result<ExitCode> {
             Some(d) => d,
             None => continue, // group vanished mid-read; skip.
         };
+        // Per-occurrence suppressions (#27): drop dismissed
+        // occurrences; skip the group entirely if <2 remain.
+        let mut detail = detail;
+        if let Some(hash) = hash_opt {
+            detail
+                .occurrences
+                .retain(|o| !occ_suppressed.contains(&(hash, o.path.clone())));
+            if detail.occurrences.len() < 2 {
+                continue;
+            }
+        }
         // `--lang` only applies to Tier B (Tier A is language-oblivious).
         if detail.tier == Tier::B && !lang_allows_cached(globals, &detail) {
             continue;
