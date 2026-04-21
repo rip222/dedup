@@ -25,11 +25,13 @@
 
 pub mod normalize;
 pub mod profile;
+pub mod python;
 pub mod rust;
 pub mod typescript;
 
 pub use normalize::{NormalizedToken, SyntacticUnit, extract_units, hash_tokens, normalize};
 pub use profile::{LanguageProfile, RenameClass};
+pub use python::{PYTHON_PROFILE, PythonProfile};
 pub use rust::{RUST_PROFILE, RustProfile};
 pub use typescript::{TSX_PROFILE, TYPESCRIPT_PROFILE, TsxProfile, TypeScriptProfile};
 
@@ -40,7 +42,12 @@ pub use typescript::{TSX_PROFILE, TYPESCRIPT_PROFILE, TsxProfile, TypeScriptProf
 /// by the caller. Adding a new profile only requires appending to this
 /// function.
 pub fn all_profiles() -> Vec<&'static dyn LanguageProfile> {
-    vec![&RUST_PROFILE, &TYPESCRIPT_PROFILE, &TSX_PROFILE]
+    vec![
+        &RUST_PROFILE,
+        &TYPESCRIPT_PROFILE,
+        &TSX_PROFILE,
+        &PYTHON_PROFILE,
+    ]
 }
 
 /// Look up the profile that claims `ext` (the extension without a
