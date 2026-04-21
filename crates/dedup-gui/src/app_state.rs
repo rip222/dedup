@@ -48,6 +48,18 @@ pub struct GroupView {
     /// All file-local occurrences, sorted path-asc then start-line-asc
     /// (mirrors [`dedup_core::Cache::get_group`]'s ordering).
     pub occurrences: Vec<OccurrenceView>,
+    /// Detected language label — derived from the first occurrence's file
+    /// extension ([`language_from_path`]). Used by the sidebar search box
+    /// (issue #23) as one of the substring haystacks alongside `label` and
+    /// `occurrence.path`. `None` when the extension is unknown.
+    pub language: Option<String>,
+    /// Stable content-hash for the group (rolling-hash normalized block),
+    /// populated from the cache for loaded rows. Used by the sort
+    /// tiebreaker so equal sort keys produce a deterministic order, and
+    /// by the `x` → dismiss flow (#23) to pass the right key into
+    /// [`dedup_core::Cache::dismiss_hash`]. `None` for streaming rows
+    /// (Tier A inflight) — they get a synthetic tiebreaker via `id`.
+    pub group_hash: Option<u64>,
 }
 
 /// View-model for one occurrence in the detail pane.
@@ -279,6 +291,289 @@ pub struct AppState {
     /// [`impact_key`] — see [`AppState::merge_streaming_groups`] for
     /// the binary-search insert that preserves stability.
     pub groups_streaming: Vec<GroupView>,
+    /// Sidebar substring search query (issue #23). Empty string disables
+    /// filtering. Matched case-insensitively against each group's
+    /// `label`, every `occurrence.path`, and its `language`.
+    pub search_query: String,
+    /// Sidebar sort key (issue #23). Defaults to [`SortKey::Impact`].
+    pub sort_key: SortKey,
+    /// Which pane currently has logical focus — drives ⌘1 / ⌘2 from
+    /// issue #23 and mirrors the View menu items. Keyboard-nav actions
+    /// (`j`/`k`, `Enter`, `x`, `o`) only fire when the sidebar is
+    /// focused so text input elsewhere isn't hijacked.
+    pub focused_pane: Pane,
+    /// Cursor into the filtered+sorted sidebar list (issue #23). `None`
+    /// when the list is empty. `NextGroup` / `PrevGroup` clamp this to
+    /// `[0, visible_groups().len())` and update `selected_group`
+    /// alongside so the detail pane follows.
+    pub selected_group_idx: Option<usize>,
+    /// Hashes of groups dismissed this session — merged into the
+    /// "already suppressed" set so an `x` → dismiss action immediately
+    /// removes the row from the sidebar without waiting for a cache
+    /// reload. Persists only in memory; the real write is
+    /// [`dedup_core::Cache::dismiss_hash`] (invoked by the `x` action
+    /// handler in `project_view`).
+    pub session_dismissed: std::collections::HashSet<u64>,
+}
+
+/// Which pane currently has logical focus.
+///
+/// Used by issue #23's keyboard shortcuts: `j` / `k` / `Enter` / `x` /
+/// `o` are ignored unless [`Pane::Sidebar`] is focused, and `⌘1` / `⌘2`
+/// flip this value. We don't tie the GPUI focus system in here — this is
+/// a plain-data flag the view layer reads during render.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    #[default]
+    Sidebar,
+    Detail,
+}
+
+/// Sidebar sort key (issue #23). Default is [`SortKey::Impact`] — the same
+/// "match size × occurrence count" ordering the streaming buffer uses so
+/// switching from streaming → cache-backed preserves ordering.
+///
+/// All five keys use the group's `group_hash` (or `id` for streaming rows)
+/// as the deterministic tiebreaker so `sort_groups` is stable for equal
+/// keys across runs (acceptance criterion).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    /// Match size × occurrence count. Higher impact sorts first.
+    #[default]
+    Impact,
+    /// Number of distinct file paths across the group's occurrences.
+    /// Higher counts sort first.
+    FileCount,
+    /// Total duplicated line count across the group's occurrences.
+    /// Longer blocks sort first.
+    LineCount,
+    /// A → Z by label.
+    Alphabetical,
+    /// Places the set that matches `search_query` first, then puts
+    /// recently dismissed groups at the bottom. For the main (non-
+    /// dismissed) list this behaves like `Alphabetical` but within the
+    /// "Dismissed" section it reverses the cache's oldest-first order
+    /// (most recent dismissal last → matches the acceptance criterion).
+    RecentlyDismissed,
+}
+
+impl SortKey {
+    /// All five variants, in the order shown in the dropdown. Kept as
+    /// a slice so tests can iterate without depending on an
+    /// `IntoEnumIterator`-style derive.
+    pub const ALL: &'static [SortKey] = &[
+        SortKey::Impact,
+        SortKey::FileCount,
+        SortKey::LineCount,
+        SortKey::Alphabetical,
+        SortKey::RecentlyDismissed,
+    ];
+
+    /// Human-readable label used in the sort dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortKey::Impact => "Impact",
+            SortKey::FileCount => "File count",
+            SortKey::LineCount => "Line count",
+            SortKey::Alphabetical => "Alphabetical",
+            SortKey::RecentlyDismissed => "Recently dismissed last",
+        }
+    }
+}
+
+/// Counts shown in the sidebar summary header (issue #23).
+///
+/// All fields are post-filter — the summary reflects the currently-visible
+/// list, so `filter_groups` → `summary` is the usual composition.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryCounts {
+    pub groups: usize,
+    pub functions: usize,
+    pub blocks: usize,
+    pub files: usize,
+    pub duplicated_lines: usize,
+}
+
+impl SummaryCounts {
+    /// Render the acceptance-criterion summary string:
+    /// `"N groups · N functions · N blocks · N files · N duplicated lines"`.
+    pub fn format(self) -> String {
+        format!(
+            "{g} groups \u{00B7} {fns} functions \u{00B7} {blks} blocks \u{00B7} {files} files \u{00B7} {lines} duplicated lines",
+            g = self.groups,
+            fns = self.functions,
+            blks = self.blocks,
+            files = self.files,
+            lines = self.duplicated_lines,
+        )
+    }
+}
+
+/// Stable tiebreaker key for a group. Prefers the content hash (unique
+/// per normalized block) with the id as a backup for streaming rows.
+fn tiebreak_key(g: &GroupView) -> (u64, i64) {
+    (g.group_hash.unwrap_or(0), g.id)
+}
+
+/// Sort `groups` by `key`, returning a fresh `Vec`. Stable under any
+/// tie: groups with equal primary keys fall back to [`tiebreak_key`]
+/// (content hash + id) so repeated calls are deterministic.
+///
+/// This is a pure function — no GPUI types, no `AppState` — so the
+/// `cargo test` lane can exercise every sort order without touching
+/// the main-thread-only GUI runtime.
+pub fn sort_groups(groups: &[GroupView], key: SortKey) -> Vec<GroupView> {
+    let mut out: Vec<GroupView> = groups.to_vec();
+    match key {
+        SortKey::Impact => {
+            out.sort_by(|a, b| {
+                impact_key(a)
+                    .cmp(&impact_key(b))
+                    .then_with(|| tiebreak_key(a).cmp(&tiebreak_key(b)))
+            });
+        }
+        SortKey::FileCount => {
+            out.sort_by(|a, b| {
+                // Descending by file count, then tiebreaker.
+                distinct_file_count(b)
+                    .cmp(&distinct_file_count(a))
+                    .then_with(|| tiebreak_key(a).cmp(&tiebreak_key(b)))
+            });
+        }
+        SortKey::LineCount => {
+            out.sort_by(|a, b| {
+                total_line_count(b)
+                    .cmp(&total_line_count(a))
+                    .then_with(|| tiebreak_key(a).cmp(&tiebreak_key(b)))
+            });
+        }
+        SortKey::Alphabetical => {
+            out.sort_by(|a, b| {
+                a.label
+                    .to_lowercase()
+                    .cmp(&b.label.to_lowercase())
+                    .then_with(|| tiebreak_key(a).cmp(&tiebreak_key(b)))
+            });
+        }
+        SortKey::RecentlyDismissed => {
+            // Main list behaves like Alphabetical — "recently dismissed
+            // last" is an ordering over the *dismissed* section (handled
+            // separately in the view layer via the session-dismissed
+            // append order). This keeps the main list in a stable,
+            // predictable order when the user picks this sort mode.
+            out.sort_by(|a, b| {
+                a.label
+                    .to_lowercase()
+                    .cmp(&b.label.to_lowercase())
+                    .then_with(|| tiebreak_key(a).cmp(&tiebreak_key(b)))
+            });
+        }
+    }
+    out
+}
+
+/// Case-insensitive substring filter over a group's `label`, every
+/// `occurrence.path`, and its `language`. An empty query matches
+/// everything (returns a clone of `groups`).
+pub fn filter_groups(groups: &[GroupView], query: &str) -> Vec<GroupView> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return groups.to_vec();
+    }
+    groups
+        .iter()
+        .filter(|g| group_matches(g, &needle))
+        .cloned()
+        .collect()
+}
+
+fn group_matches(g: &GroupView, needle_lower: &str) -> bool {
+    if g.label.to_lowercase().contains(needle_lower) {
+        return true;
+    }
+    if let Some(lang) = &g.language
+        && lang.to_lowercase().contains(needle_lower)
+    {
+        return true;
+    }
+    g.occurrences.iter().any(|o| {
+        o.path
+            .display()
+            .to_string()
+            .to_lowercase()
+            .contains(needle_lower)
+    })
+}
+
+/// Compute the summary counts shown above the sidebar.
+///
+/// Duplicated lines formula: `sum((end_line - start_line + 1) *
+/// (occurrence_count - 1))` across every group — i.e. the *removable*
+/// line count if deduplication were applied. Each group keeps one copy,
+/// so we subtract 1 from the occurrence count. `occurrence_count == 1`
+/// contributes 0 (no duplication).
+pub fn summary(groups: &[GroupView]) -> SummaryCounts {
+    use std::collections::HashSet;
+    let mut files: HashSet<PathBuf> = HashSet::new();
+    let mut functions = 0usize;
+    let mut blocks = 0usize;
+    let mut duplicated_lines = 0usize;
+
+    for g in groups {
+        match g.tier {
+            Tier::B => functions += 1,
+            Tier::A => blocks += 1,
+        }
+        let occ_count = g.occurrences.len();
+        // Distinct file paths across all groups.
+        for o in &g.occurrences {
+            files.insert(o.path.clone());
+        }
+        if occ_count >= 2 {
+            // All occurrences of a group have the same line span, but
+            // the cache stores them individually — use the first.
+            if let Some(first) = g.occurrences.first() {
+                let span = (first.end_line - first.start_line + 1).max(0) as usize;
+                duplicated_lines = duplicated_lines.saturating_add(span * (occ_count - 1));
+            }
+        }
+    }
+
+    SummaryCounts {
+        groups: groups.len(),
+        functions,
+        blocks,
+        files: files.len(),
+        duplicated_lines,
+    }
+}
+
+fn distinct_file_count(g: &GroupView) -> usize {
+    use std::collections::HashSet;
+    g.occurrences
+        .iter()
+        .map(|o| o.path.as_path())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn total_line_count(g: &GroupView) -> i64 {
+    g.occurrences
+        .iter()
+        .map(|o| (o.end_line - o.start_line + 1).max(0))
+        .sum()
+}
+
+/// Placeholder editor launcher for the `o` keyboard shortcut
+/// (issue #23). Logs the paths and returns — the real launcher lands
+/// with issue #29.
+// TODO(#29): wire editor launcher.
+pub fn open_in_editor(paths: &[&Path]) {
+    tracing::info!(
+        count = paths.len(),
+        paths = ?paths,
+        "open_in_editor (no-op placeholder — issue #29 wires real launcher)"
+    );
 }
 
 impl AppState {
@@ -300,6 +595,17 @@ impl AppState {
         // Keep the Dismissed section collapsed by default on every open,
         // including re-opens — the user can expand it if they want.
         self.dismissed_expanded = false;
+        // Reset per-folder issue-#23 state so a re-open doesn't carry
+        // stale search / selection from the previous folder.
+        self.session_dismissed.clear();
+        self.selected_group_idx = if self.groups.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.search_query.clear();
+        // Keep `sort_key` — it's a user preference that should persist.
+        self.focused_pane = Pane::Sidebar;
     }
 
     /// Look up the currently selected group's occurrences, if any.
@@ -423,6 +729,151 @@ impl AppState {
             self.scan_state = ScanState::Idle;
         }
     }
+
+    // -----------------------------------------------------------------
+    // Issue #23 — sidebar sort / filter / search / keyboard nav.
+    // -----------------------------------------------------------------
+
+    /// Current (post-session-dismiss) source list the sidebar filters +
+    /// sorts from. Excludes anything the user has dismissed this session
+    /// via `x`, mirroring the cache's `suppressed_hashes` filter applied
+    /// on folder load.
+    pub fn source_groups(&self) -> Vec<GroupView> {
+        self.groups
+            .iter()
+            .filter(|g| match g.group_hash {
+                Some(h) => !self.session_dismissed.contains(&h),
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The filtered + sorted sidebar list (issue #23). Composition is
+    /// `filter_groups(sort_groups(source_groups, sort_key), search_query)`
+    /// so the order-then-filter behaviour is consistent with how the
+    /// streaming buffer is rendered.
+    pub fn visible_groups(&self) -> Vec<GroupView> {
+        let sorted = sort_groups(&self.source_groups(), self.sort_key);
+        filter_groups(&sorted, &self.search_query)
+    }
+
+    /// Current summary counts — always over the filtered list so the
+    /// header updates as the user types (acceptance criterion).
+    pub fn summary(&self) -> SummaryCounts {
+        summary(&self.visible_groups())
+    }
+
+    /// Update the substring search query, recomputing the selection
+    /// cursor so it stays in range of the filtered list.
+    pub fn set_search_query(&mut self, query: String) {
+        self.search_query = query;
+        self.reclamp_selection();
+    }
+
+    /// Swap the sort key, keeping the selection on the same group-id
+    /// when possible (so re-sort doesn't feel like a teleport).
+    pub fn set_sort_key(&mut self, key: SortKey) {
+        self.sort_key = key;
+        self.reclamp_selection();
+    }
+
+    /// Move the sidebar cursor forward. Clamps at the bottom of the
+    /// list (no wraparound — matches the issue-text choice). Updates
+    /// `selected_group` so the detail pane follows.
+    pub fn next_group(&mut self) {
+        let visible = self.visible_groups();
+        if visible.is_empty() {
+            self.selected_group_idx = None;
+            self.selected_group = None;
+            return;
+        }
+        let next_idx = match self.selected_group_idx {
+            None => 0,
+            Some(i) if i + 1 < visible.len() => i + 1,
+            Some(i) => i, // already at the bottom — clamp.
+        };
+        self.selected_group_idx = Some(next_idx);
+        self.selected_group = visible.get(next_idx).map(|g| g.id);
+    }
+
+    /// Move the sidebar cursor backward. Clamps at the top.
+    pub fn prev_group(&mut self) {
+        let visible = self.visible_groups();
+        if visible.is_empty() {
+            self.selected_group_idx = None;
+            self.selected_group = None;
+            return;
+        }
+        let prev_idx = match self.selected_group_idx {
+            None => 0,
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.selected_group_idx = Some(prev_idx);
+        self.selected_group = visible.get(prev_idx).map(|g| g.id);
+    }
+
+    /// `Enter` handler — focus the detail pane without moving the cursor.
+    pub fn activate_group(&mut self) {
+        self.focused_pane = Pane::Detail;
+    }
+
+    /// `x` handler — dismiss the currently-selected group locally.
+    ///
+    /// Returns the `group_hash` of the dismissed row (if any) so the
+    /// caller can persist it to [`dedup_core::Cache::dismiss_hash`].
+    /// Locally we push a fresh [`SuppressionView`] onto `dismissed` and
+    /// record the hash in `session_dismissed` so `visible_groups()`
+    /// drops the row immediately. Selection clamps down to the new
+    /// list length.
+    pub fn dismiss_current_group(&mut self) -> Option<(u64, i64)> {
+        let visible = self.visible_groups();
+        let idx = self.selected_group_idx?;
+        let group = visible.get(idx)?.clone();
+        let hash = group.group_hash?;
+        self.session_dismissed.insert(hash);
+        // Append to dismissed so "recently dismissed" ends up last.
+        self.dismissed.push(SuppressionView {
+            hash_hex: format!("{hash:016x}"),
+            last_group_id: Some(group.id),
+        });
+        self.reclamp_selection();
+        Some((hash, group.id))
+    }
+
+    /// Change the focused pane (⌘1 / ⌘2).
+    pub fn focus_pane(&mut self, pane: Pane) {
+        self.focused_pane = pane;
+    }
+
+    /// After a filter / sort / dismiss change, snap the selection back
+    /// into `[0, visible.len())`. Keeps the cursor on the same group-id
+    /// if it's still in the list.
+    fn reclamp_selection(&mut self) {
+        let visible = self.visible_groups();
+        if visible.is_empty() {
+            self.selected_group_idx = None;
+            self.selected_group = None;
+            return;
+        }
+        // Prefer to track the currently-selected id if it's still in
+        // the visible list.
+        if let Some(id) = self.selected_group
+            && let Some(pos) = visible.iter().position(|g| g.id == id)
+        {
+            self.selected_group_idx = Some(pos);
+            return;
+        }
+        // Otherwise clamp to the last valid index.
+        let new_idx = match self.selected_group_idx {
+            Some(i) if i < visible.len() => i,
+            Some(_) => visible.len() - 1,
+            None => 0,
+        };
+        self.selected_group_idx = Some(new_idx);
+        self.selected_group = visible.get(new_idx).map(|g| g.id);
+    }
 }
 
 /// Shared handles handed to the scanner worker thread.
@@ -476,6 +927,9 @@ pub fn group_view_from_match(group: &MatchGroup, index: usize) -> GroupView {
         })
         .collect();
     let label = group_label(group.tier, None, None, occurrences.first());
+    let language = occurrences
+        .first()
+        .and_then(|o| language_from_path(&o.path));
     GroupView {
         // Negative sentinel ids keep streaming rows distinguishable from
         // cache-backed rows. The index keeps each streaming id unique
@@ -484,7 +938,46 @@ pub fn group_view_from_match(group: &MatchGroup, index: usize) -> GroupView {
         tier: group.tier,
         label,
         occurrences,
+        language,
+        // Streaming rows don't carry the cache `group_hash` — the post-
+        // scan cache reload replaces them with rows that do.
+        group_hash: None,
     }
+}
+
+/// Best-effort language label from a file extension.
+///
+/// Covers the languages the PRD / CLI already knows about (Rust + friends
+/// from `LanguageProfile`). Returned string is a stable, human-readable
+/// label (`"Rust"`, `"Python"`, etc.) — we compare it case-insensitively
+/// in [`filter_groups`], but keeping the canonical form here is cheaper
+/// than doing it on every keystroke.
+///
+/// Returns `None` for unknown or missing extensions; filter + summary
+/// callers treat `None` the same as `Some("")` for search purposes.
+pub fn language_from_path(path: &Path) -> Option<String> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let label = match ext.as_str() {
+        "rs" => "Rust",
+        "py" | "pyi" => "Python",
+        "js" | "mjs" | "cjs" => "JavaScript",
+        "jsx" => "JSX",
+        "ts" => "TypeScript",
+        "tsx" => "TSX",
+        "go" => "Go",
+        "java" => "Java",
+        "kt" | "kts" => "Kotlin",
+        "c" | "h" => "C",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => "C++",
+        "cs" => "C#",
+        "rb" => "Ruby",
+        "swift" => "Swift",
+        "php" => "PHP",
+        "scala" => "Scala",
+        "sh" | "bash" | "zsh" => "Shell",
+        _ => return None,
+    };
+    Some(label.to_string())
 }
 
 /// Compute the sidebar label for a group.
@@ -633,12 +1126,17 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         // cache — see `group_label`'s doc comment. For now every Tier B
         // group falls back to path:lines.
         let label = group_label(detail.tier, None, None, occurrences.first());
+        let language = occurrences
+            .first()
+            .and_then(|o| language_from_path(&o.path));
 
         groups.push(GroupView {
             id: detail.id,
             tier: detail.tier,
             label,
             occurrences,
+            language,
+            group_hash: hash,
         });
     }
 
@@ -765,12 +1263,16 @@ mod tests {
                     tier: Tier::A,
                     label: "a".into(),
                     occurrences: vec![occ("a.rs", 1, 2)],
+                    language: Some("Rust".into()),
+                    group_hash: Some(0xAA),
                 },
                 GroupView {
                     id: 8,
                     tier: Tier::B,
                     label: "b".into(),
                     occurrences: vec![occ("b.rs", 3, 4)],
+                    language: Some("Rust".into()),
+                    group_hash: Some(0xBB),
                 },
             ],
             dismissed: vec![],
@@ -808,18 +1310,24 @@ mod tests {
                 tier: Tier::A,
                 label: "a".into(),
                 occurrences: vec![],
+                language: None,
+                group_hash: None,
             },
             GroupView {
                 id: 2,
                 tier: Tier::B,
                 label: "b".into(),
                 occurrences: vec![],
+                language: None,
+                group_hash: None,
             },
             GroupView {
                 id: 3,
                 tier: Tier::A,
                 label: "a2".into(),
                 occurrences: vec![],
+                language: None,
+                group_hash: None,
             },
         ];
         let tier_a: Vec<i64> = s.tier_a_groups().map(|g| g.id).collect();
@@ -836,6 +1344,8 @@ mod tests {
             tier: Tier::A,
             label: "a".into(),
             occurrences: vec![occ("x.rs", 1, 2), occ("x.rs", 10, 12)],
+            language: Some("Rust".into()),
+            group_hash: None,
         }];
         s.selected_group = Some(9);
         assert_eq!(s.selected_occurrences().len(), 2);
@@ -927,6 +1437,8 @@ mod tests {
             tier: Tier::A,
             label: "leftover".into(),
             occurrences: vec![occ("x.rs", 1, 2)],
+            language: Some("Rust".into()),
+            group_hash: None,
         }];
         let _ = s.begin_scan().unwrap();
         assert!(s.groups_streaming.is_empty());
@@ -956,6 +1468,8 @@ mod tests {
             tier: Tier::A,
             label: "x".into(),
             occurrences: vec![occ("x.rs", 1, 10)],
+            language: Some("Rust".into()),
+            group_hash: None,
         }]);
         s.request_cancel();
         s.cancel_completed();
@@ -1017,6 +1531,9 @@ mod tests {
     // -------------------------------------------------------------------
 
     fn streaming_group(id: i64, occurrences: Vec<OccurrenceView>) -> GroupView {
+        let language = occurrences
+            .first()
+            .and_then(|o| language_from_path(&o.path));
         GroupView {
             id,
             tier: Tier::A,
@@ -1024,6 +1541,8 @@ mod tests {
             // the ordering deterministic when impact collides.
             label: format!("g{id}"),
             occurrences,
+            language,
+            group_hash: None,
         }
     }
 
@@ -1120,5 +1639,368 @@ mod tests {
             banner,
             "Scan complete \u{2014} 7 groups across 42 files in 3.4s."
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #23 — sort / filter / search / summary + keyboard nav.
+    //
+    // All tests here exercise the pure functions in this module. No
+    // GPUI types are constructed; every assertion is on plain data.
+    // -------------------------------------------------------------------
+
+    /// Construct a `GroupView` with explicit knobs for the sort/filter
+    /// tests. Kept local so the production constructor stays minimal.
+    fn mkgroup(
+        id: i64,
+        tier: Tier,
+        label: &str,
+        occurrences: Vec<OccurrenceView>,
+        group_hash: Option<u64>,
+    ) -> GroupView {
+        let language = occurrences
+            .first()
+            .and_then(|o| language_from_path(&o.path));
+        GroupView {
+            id,
+            tier,
+            label: label.to_string(),
+            occurrences,
+            language,
+            group_hash,
+        }
+    }
+
+    #[test]
+    fn language_from_path_covers_known_extensions() {
+        assert_eq!(
+            language_from_path(Path::new("src/a.rs")),
+            Some("Rust".into())
+        );
+        assert_eq!(language_from_path(Path::new("A.PY")), Some("Python".into()));
+        assert_eq!(language_from_path(Path::new("foo.tsx")), Some("TSX".into()));
+        assert_eq!(language_from_path(Path::new("README")), None);
+    }
+
+    #[test]
+    fn sort_groups_impact_puts_bigger_groups_first() {
+        let small = mkgroup(
+            1,
+            Tier::A,
+            "small",
+            vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5)],
+            Some(0x11),
+        );
+        let big = mkgroup(
+            2,
+            Tier::A,
+            "big",
+            vec![occ("a.rs", 1, 50), occ("b.rs", 1, 50), occ("c.rs", 1, 50)],
+            Some(0x22),
+        );
+        let out = sort_groups(&[small.clone(), big.clone()], SortKey::Impact);
+        assert_eq!(out[0].id, 2, "big impact sorts first");
+        assert_eq!(out[1].id, 1);
+    }
+
+    #[test]
+    fn sort_groups_file_count_descending() {
+        let one = mkgroup(
+            1,
+            Tier::A,
+            "one",
+            vec![occ("a.rs", 1, 5), occ("a.rs", 10, 14)],
+            Some(0x11),
+        );
+        let three = mkgroup(
+            2,
+            Tier::A,
+            "three",
+            vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5), occ("c.rs", 1, 5)],
+            Some(0x22),
+        );
+        let out = sort_groups(&[one, three], SortKey::FileCount);
+        let ids: Vec<i64> = out.iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec![2, 1]);
+    }
+
+    #[test]
+    fn sort_groups_line_count_descending() {
+        let short = mkgroup(1, Tier::A, "short", vec![occ("a.rs", 1, 4)], Some(0x11));
+        let long = mkgroup(2, Tier::A, "long", vec![occ("a.rs", 1, 100)], Some(0x22));
+        let out = sort_groups(&[short, long], SortKey::LineCount);
+        assert_eq!(out[0].id, 2);
+    }
+
+    #[test]
+    fn sort_groups_alphabetical_case_insensitive() {
+        let z = mkgroup(1, Tier::A, "Zebra", vec![occ("z.rs", 1, 2)], Some(0x11));
+        let a = mkgroup(2, Tier::A, "apple", vec![occ("a.rs", 1, 2)], Some(0x22));
+        let m = mkgroup(3, Tier::A, "Mango", vec![occ("m.rs", 1, 2)], Some(0x33));
+        let out = sort_groups(&[z, a, m], SortKey::Alphabetical);
+        let labels: Vec<&str> = out.iter().map(|g| g.label.as_str()).collect();
+        assert_eq!(labels, vec!["apple", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn sort_groups_stable_tiebreak_on_hash() {
+        // Two groups with identical impact + file count + line count +
+        // label. The hash is the final tiebreaker — the smaller hash
+        // must come first under any sort key.
+        let a = mkgroup(
+            1,
+            Tier::A,
+            "same",
+            vec![occ("a.rs", 1, 10)],
+            Some(0x0000_00AA),
+        );
+        let b = mkgroup(
+            2,
+            Tier::A,
+            "same",
+            vec![occ("b.rs", 1, 10)],
+            Some(0x0000_00BB),
+        );
+        for key in SortKey::ALL {
+            let out = sort_groups(&[b.clone(), a.clone()], *key);
+            assert_eq!(
+                out[0].id, 1,
+                "key {key:?}: tiebreaker must be deterministic on hash"
+            );
+        }
+    }
+
+    #[test]
+    fn filter_groups_empty_query_matches_everything() {
+        let g = mkgroup(1, Tier::A, "label", vec![occ("a.rs", 1, 2)], Some(0));
+        let out = filter_groups(std::slice::from_ref(&g), "");
+        assert_eq!(out.len(), 1);
+        let out = filter_groups(std::slice::from_ref(&g), "   ");
+        assert_eq!(out.len(), 1, "whitespace-only query is also a no-op");
+    }
+
+    #[test]
+    fn filter_groups_matches_label_case_insensitive() {
+        let g = mkgroup(
+            1,
+            Tier::A,
+            "validate_email",
+            vec![occ("auth.rs", 1, 2)],
+            Some(0),
+        );
+        assert_eq!(filter_groups(std::slice::from_ref(&g), "VALIDATE").len(), 1);
+        assert_eq!(filter_groups(std::slice::from_ref(&g), "nomatch").len(), 0);
+    }
+
+    #[test]
+    fn filter_groups_matches_path_substring() {
+        let g = mkgroup(
+            1,
+            Tier::A,
+            "x",
+            vec![occ("src/auth/login.rs", 1, 2)],
+            Some(0),
+        );
+        assert_eq!(filter_groups(std::slice::from_ref(&g), "auth").len(), 1);
+        assert_eq!(filter_groups(std::slice::from_ref(&g), "missing/").len(), 0);
+    }
+
+    #[test]
+    fn filter_groups_matches_language_case_insensitive() {
+        let g = mkgroup(1, Tier::A, "x", vec![occ("a.rs", 1, 2)], Some(0));
+        assert_eq!(filter_groups(std::slice::from_ref(&g), "rust").len(), 1);
+        assert_eq!(filter_groups(std::slice::from_ref(&g), "RUST").len(), 1);
+    }
+
+    #[test]
+    fn summary_counts_groups_functions_blocks_files_lines() {
+        let groups = vec![
+            // Tier B (function), 10 lines, 3 occurrences → 10 * 2 = 20
+            // duplicated lines. 2 distinct paths (a.rs, b.rs — c.rs too).
+            mkgroup(
+                1,
+                Tier::B,
+                "fn f",
+                vec![occ("a.rs", 1, 10), occ("b.rs", 1, 10), occ("c.rs", 1, 10)],
+                Some(0x1),
+            ),
+            // Tier A (block), 5 lines, 2 occurrences → 5 * 1 = 5
+            // duplicated lines. `b.rs` already counted above — only
+            // `d.rs` is new.
+            mkgroup(
+                2,
+                Tier::A,
+                "block",
+                vec![occ("b.rs", 20, 24), occ("d.rs", 1, 5)],
+                Some(0x2),
+            ),
+            // Singleton — not really a duplicate; 0 duplicated lines.
+            mkgroup(3, Tier::A, "lonely", vec![occ("e.rs", 1, 3)], Some(0x3)),
+        ];
+        let s = summary(&groups);
+        assert_eq!(s.groups, 3);
+        assert_eq!(s.functions, 1);
+        assert_eq!(s.blocks, 2);
+        // Distinct paths: a.rs, b.rs, c.rs, d.rs, e.rs = 5.
+        assert_eq!(s.files, 5);
+        assert_eq!(s.duplicated_lines, 20 + 5);
+    }
+
+    #[test]
+    fn summary_format_uses_middle_dots() {
+        let s = SummaryCounts {
+            groups: 3,
+            functions: 1,
+            blocks: 2,
+            files: 5,
+            duplicated_lines: 25,
+        };
+        assert_eq!(
+            s.format(),
+            "3 groups \u{00B7} 1 functions \u{00B7} 2 blocks \u{00B7} 5 files \u{00B7} 25 duplicated lines"
+        );
+    }
+
+    // ---- AppState cursor + dismiss -----------------------------------
+
+    fn loaded_state_with(groups: Vec<GroupView>) -> AppState {
+        let mut s = AppState::new();
+        let result = FolderLoadResult {
+            folder: PathBuf::from("/tmp/x"),
+            groups,
+            dismissed: vec![],
+            status: AppStatus::Loaded,
+        };
+        s.set_folder_result(result);
+        s
+    }
+
+    #[test]
+    fn visible_groups_respects_sort_and_filter() {
+        let s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "apple", vec![occ("a.rs", 1, 5)], Some(0x1)),
+            mkgroup(2, Tier::A, "banana", vec![occ("b.py", 1, 5)], Some(0x2)),
+            mkgroup(3, Tier::A, "cherry", vec![occ("c.rs", 1, 5)], Some(0x3)),
+        ]);
+        // Default: Impact sort + empty query → all three visible.
+        assert_eq!(s.visible_groups().len(), 3);
+
+        // Switch sort + apply a Python-only filter.
+        let mut s2 = s.clone();
+        s2.set_sort_key(SortKey::Alphabetical);
+        s2.set_search_query("python".into());
+        let got: Vec<i64> = s2.visible_groups().iter().map(|g| g.id).collect();
+        assert_eq!(got, vec![2]);
+    }
+
+    #[test]
+    fn summary_updates_with_filter() {
+        let mut s = loaded_state_with(vec![
+            mkgroup(
+                1,
+                Tier::A,
+                "apple",
+                vec![occ("a.rs", 1, 5), occ("a2.rs", 1, 5)],
+                Some(0x1),
+            ),
+            mkgroup(
+                2,
+                Tier::A,
+                "banana",
+                vec![occ("b.py", 1, 5), occ("b2.py", 1, 5)],
+                Some(0x2),
+            ),
+        ]);
+        assert_eq!(s.summary().groups, 2);
+        s.set_search_query("python".into());
+        assert_eq!(s.summary().groups, 1);
+        assert_eq!(s.summary().files, 2);
+    }
+
+    #[test]
+    fn next_and_prev_group_clamp_at_ends() {
+        let mut s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "a", vec![occ("a.rs", 1, 2)], Some(0x1)),
+            mkgroup(2, Tier::A, "b", vec![occ("b.rs", 1, 2)], Some(0x2)),
+            mkgroup(3, Tier::A, "c", vec![occ("c.rs", 1, 2)], Some(0x3)),
+        ]);
+        // Default selection = first.
+        assert_eq!(s.selected_group_idx, Some(0));
+        s.next_group();
+        assert_eq!(s.selected_group_idx, Some(1));
+        s.next_group();
+        assert_eq!(s.selected_group_idx, Some(2));
+        // Clamp at bottom — no wraparound.
+        s.next_group();
+        assert_eq!(s.selected_group_idx, Some(2));
+        // Walk backwards.
+        s.prev_group();
+        s.prev_group();
+        s.prev_group();
+        assert_eq!(s.selected_group_idx, Some(0), "clamp at top");
+    }
+
+    #[test]
+    fn activate_group_focuses_detail_pane() {
+        let mut s = loaded_state_with(vec![mkgroup(
+            1,
+            Tier::A,
+            "a",
+            vec![occ("a.rs", 1, 2)],
+            Some(0x1),
+        )]);
+        assert_eq!(s.focused_pane, Pane::Sidebar);
+        s.activate_group();
+        assert_eq!(s.focused_pane, Pane::Detail);
+    }
+
+    #[test]
+    fn dismiss_current_group_moves_it_out_of_visible_list() {
+        let mut s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "a", vec![occ("a.rs", 1, 2)], Some(0xAA)),
+            mkgroup(2, Tier::A, "b", vec![occ("b.rs", 1, 2)], Some(0xBB)),
+        ]);
+        // Sort by Alphabetical so order is deterministic.
+        s.set_sort_key(SortKey::Alphabetical);
+        let before = s.visible_groups();
+        assert_eq!(before.len(), 2);
+        assert_eq!(s.selected_group, Some(1));
+
+        let out = s.dismiss_current_group();
+        assert_eq!(out, Some((0xAA, 1)));
+
+        let after = s.visible_groups();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, 2);
+        // Dismissed row appended to the dismissed list.
+        assert_eq!(s.dismissed.len(), 1);
+        assert_eq!(s.dismissed.last().unwrap().last_group_id, Some(1));
+        // Selection clamps to the remaining group.
+        assert_eq!(s.selected_group, Some(2));
+        assert_eq!(s.selected_group_idx, Some(0));
+    }
+
+    #[test]
+    fn dismiss_current_group_is_noop_when_hash_missing() {
+        // Streaming rows have `group_hash = None` and therefore can't
+        // be dismissed — the action should return `None` rather than
+        // panicking.
+        let mut s = loaded_state_with(vec![mkgroup(
+            -1,
+            Tier::A,
+            "streaming",
+            vec![occ("a.rs", 1, 2)],
+            None,
+        )]);
+        assert_eq!(s.dismiss_current_group(), None);
+        assert_eq!(s.visible_groups().len(), 1);
+    }
+
+    #[test]
+    fn focus_pane_flips_between_panes() {
+        let mut s = AppState::new();
+        s.focus_pane(Pane::Detail);
+        assert_eq!(s.focused_pane, Pane::Detail);
+        s.focus_pane(Pane::Sidebar);
+        assert_eq!(s.focused_pane, Pane::Sidebar);
     }
 }

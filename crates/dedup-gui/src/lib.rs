@@ -26,9 +26,10 @@ pub mod menubar;
 pub mod project_view;
 
 pub use app_state::{
-    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, ScanHandles, ScanState,
-    SuppressionView, format_completion_banner, format_elapsed, group_label, group_view_from_match,
-    impact_key, load_folder,
+    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, Pane, ScanHandles, ScanState,
+    SortKey, SummaryCounts, SuppressionView, filter_groups, format_completion_banner,
+    format_elapsed, group_label, group_view_from_match, impact_key, language_from_path,
+    load_folder, open_in_editor, sort_groups, summary,
 };
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};
@@ -111,7 +112,10 @@ mod tests {
         let present: std::collections::HashSet<&str> =
             menubar::SHORTCUTS.iter().map(|&(k, _)| k).collect();
         for required in [
+            // Issue #19 acceptance criteria.
             "cmd-,", "cmd-o", "cmd-w", "cmd-r", "cmd-.", "cmd-b", "cmd-1", "cmd-2",
+            // Issue #23 acceptance criteria — search + keyboard nav.
+            "cmd-f", "j", "k", "up", "down", "enter", "x", "o",
         ] {
             assert!(
                 present.contains(required),

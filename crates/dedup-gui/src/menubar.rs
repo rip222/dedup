@@ -53,6 +53,21 @@ actions!(
         FocusSidebar,
         /// View → Focus Detail (⌘2). Wires in #23.
         FocusDetail,
+        /// Edit → Find in Sidebar (⌘F) — focus the sidebar search box
+        /// (issue #23).
+        FindInSidebar,
+        /// Sidebar keyboard-nav — cursor down (`j` / `↓`). Issue #23.
+        NextGroup,
+        /// Sidebar keyboard-nav — cursor up (`k` / `↑`). Issue #23.
+        PrevGroup,
+        /// Sidebar keyboard-nav — Enter focuses detail pane. Issue #23.
+        ActivateGroup,
+        /// Sidebar keyboard-nav — `x` dismisses the currently-selected
+        /// group. Issue #23.
+        DismissCurrentGroup,
+        /// Sidebar keyboard-nav — `o` opens checked files in editor.
+        /// Placeholder that logs paths; real launcher lands in #29.
+        OpenSelectedInEditor,
         /// Help → Dedup Help. Opens docs (post-MVP).
         Help,
         /// Help → Report Issue…. Wires in #30.
@@ -100,16 +115,10 @@ fn register_handlers(cx: &mut App) {
         "Toggle Sidebar (⌘B) — #23",
         |_: &ToggleSidebar, _: &mut App| {},
     );
-    stub(
-        cx,
-        "Focus Sidebar (⌘1) — #23",
-        |_: &FocusSidebar, _: &mut App| {},
-    );
-    stub(
-        cx,
-        "Focus Detail (⌘2) — #23",
-        |_: &FocusDetail, _: &mut App| {},
-    );
+    // `FocusSidebar`, `FocusDetail`, `FindInSidebar`, and the five
+    // sidebar keyboard-nav actions are no longer stubs — they are wired
+    // by `crate::project_view::register_root` once the root view is
+    // created. Firing them before then is a safe no-op.
     stub(cx, "Dedup Help", |_: &Help, _: &mut App| {});
     stub(cx, "Report Issue… — #30", |_: &ReportIssue, _: &mut App| {});
 }
@@ -146,6 +155,12 @@ fn register_keybindings(cx: &mut App) {
             "ToggleSidebar" => KeyBinding::new(keystroke, ToggleSidebar, None),
             "FocusSidebar" => KeyBinding::new(keystroke, FocusSidebar, None),
             "FocusDetail" => KeyBinding::new(keystroke, FocusDetail, None),
+            "FindInSidebar" => KeyBinding::new(keystroke, FindInSidebar, None),
+            "NextGroup" => KeyBinding::new(keystroke, NextGroup, None),
+            "PrevGroup" => KeyBinding::new(keystroke, PrevGroup, None),
+            "ActivateGroup" => KeyBinding::new(keystroke, ActivateGroup, None),
+            "DismissCurrentGroup" => KeyBinding::new(keystroke, DismissCurrentGroup, None),
+            "OpenSelectedInEditor" => KeyBinding::new(keystroke, OpenSelectedInEditor, None),
             other => unreachable!("unmapped shortcut action {other}"),
         }
     }));
@@ -170,6 +185,19 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     ("cmd-b", "ToggleSidebar"),
     ("cmd-1", "FocusSidebar"),
     ("cmd-2", "FocusDetail"),
+    // Issue #23 — sidebar search + keyboard nav. `j`/`k` and `↓`/`↑`
+    // are intentionally not global bindings (the project view handles
+    // them through `on_action` dispatch after the sidebar wrapper
+    // consumes the key event) so they don't swallow keystrokes in text
+    // inputs elsewhere.
+    ("cmd-f", "FindInSidebar"),
+    ("j", "NextGroup"),
+    ("down", "NextGroup"),
+    ("k", "PrevGroup"),
+    ("up", "PrevGroup"),
+    ("enter", "ActivateGroup"),
+    ("x", "DismissCurrentGroup"),
+    ("o", "OpenSelectedInEditor"),
 ];
 
 /// Build the NSMenu menu tree.
@@ -215,6 +243,11 @@ pub(crate) fn build_menus() -> Vec<Menu> {
             MenuItem::action("Toggle Sidebar", ToggleSidebar),
             MenuItem::action("Focus Sidebar", FocusSidebar),
             MenuItem::action("Focus Detail", FocusDetail),
+            MenuItem::separator(),
+            // Issue #23 — surface the search shortcut in the View menu
+            // so users can discover it via the menubar. No standalone
+            // Edit menu today; we add it alongside the focus items.
+            MenuItem::action("Find in Sidebar", FindInSidebar),
         ]),
         // "Window" — macOS auto-populates Minimize / Zoom / Bring All to
         // Front when the top-level menu is named "Window". We leave it

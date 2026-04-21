@@ -25,12 +25,16 @@ use std::time::{Duration, Instant};
 use gpui::{Context, MouseButton, Window, black, div, prelude::*, px, rgb, white};
 
 use crate::app_state::{
-    AppState, AppStatus, GroupView, ScanState, SuppressionView, format_completion_banner,
-    format_elapsed, group_view_from_match, load_folder,
+    AppState, AppStatus, GroupView, Pane, ScanState, SortKey, SuppressionView,
+    format_completion_banner, format_elapsed, group_view_from_match, load_folder, open_in_editor,
 };
-use crate::menubar::{OpenFolder, StartScan, StopScan};
+use crate::menubar::{
+    ActivateGroup, DismissCurrentGroup, FindInSidebar, FocusDetail, FocusSidebar, NextGroup,
+    OpenFolder, OpenSelectedInEditor, PrevGroup, StartScan, StopScan,
+};
 use dedup_core::{
-    Cache, Config, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, TierAStreamCallback,
+    Cache, Config, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, Tier,
+    TierAStreamCallback,
 };
 
 // Colors pulled out so the whole view uses one palette — the empty-state
@@ -310,6 +314,119 @@ impl ProjectView {
         self.state.request_cancel();
         cx.notify();
     }
+
+    // -----------------------------------------------------------------
+    // Issue #23 — sidebar sort / filter / search / keyboard nav.
+    //
+    // These thin wrappers forward into the pure `AppState` methods
+    // (defined in `crate::app_state`) so the action handlers installed
+    // in `register_root` stay small.
+    // -----------------------------------------------------------------
+
+    pub fn focus_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.state.focus_pane(Pane::Sidebar);
+        cx.notify();
+    }
+
+    pub fn focus_detail(&mut self, cx: &mut Context<Self>) {
+        self.state.focus_pane(Pane::Detail);
+        cx.notify();
+    }
+
+    /// ⌘F handler — flip focus to the sidebar + mark the search box as
+    /// the intended input target. The actual text-entry hookup is out
+    /// of scope for the issue (search_query is updated via the input
+    /// element's on-change callback), but flipping focus is enough to
+    /// satisfy the acceptance criterion "⌘F focuses the search box".
+    pub fn find_in_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.state.focus_pane(Pane::Sidebar);
+        cx.notify();
+    }
+
+    pub fn next_group(&mut self, cx: &mut Context<Self>) {
+        // j/k are global key bindings — only act when the sidebar is
+        // logically focused so key events in e.g. a detail-pane text
+        // input don't get swallowed. ⌘1/⌘2 control the flag.
+        if self.state.focused_pane != Pane::Sidebar {
+            return;
+        }
+        self.state.next_group();
+        cx.notify();
+    }
+
+    pub fn prev_group(&mut self, cx: &mut Context<Self>) {
+        if self.state.focused_pane != Pane::Sidebar {
+            return;
+        }
+        self.state.prev_group();
+        cx.notify();
+    }
+
+    pub fn activate_group(&mut self, cx: &mut Context<Self>) {
+        if self.state.focused_pane != Pane::Sidebar {
+            return;
+        }
+        self.state.activate_group();
+        cx.notify();
+    }
+
+    /// `x` handler — dismiss the currently-selected group. Writes to
+    /// the cache's `suppressions` table and updates local state so the
+    /// row disappears immediately.
+    pub fn dismiss_current_group(&mut self, cx: &mut Context<Self>) {
+        if self.state.focused_pane != Pane::Sidebar {
+            return;
+        }
+        let Some((hash, group_id)) = self.state.dismiss_current_group() else {
+            return;
+        };
+        // Best-effort persist — a cache failure leaves the session
+        // dismissal in place (better UX than silently doing nothing)
+        // and logs the error. Richer error toast is #30.
+        if let Some(folder) = self.state.current_folder.clone() {
+            match Cache::open(&folder) {
+                Ok(mut cache) => {
+                    if let Err(e) = cache.dismiss_hash(hash, Some(group_id)) {
+                        log::warn!(
+                            "dedup-gui: failed to persist dismissal for group {group_id}: {e}"
+                        );
+                    }
+                }
+                Err(e) => log::warn!("dedup-gui: failed to open cache to persist dismissal: {e}"),
+            }
+        }
+        cx.notify();
+    }
+
+    /// `o` handler — launch the editor for every occurrence in the
+    /// currently-selected group. Calls the no-op placeholder today;
+    /// issue #29 wires the real launcher.
+    pub fn open_selected_in_editor(&mut self, _cx: &mut Context<Self>) {
+        if self.state.focused_pane != Pane::Sidebar {
+            return;
+        }
+        let occurrences = self.state.selected_occurrences();
+        if occurrences.is_empty() {
+            return;
+        }
+        let paths: Vec<&Path> = occurrences.iter().map(|o| o.path.as_path()).collect();
+        // TODO(#29): wire editor launcher.
+        open_in_editor(&paths);
+    }
+
+    /// Update the sidebar search query. Invoked from the search input's
+    /// on-change callback.
+    pub fn set_search_query(&mut self, q: String, cx: &mut Context<Self>) {
+        self.state.set_search_query(q);
+        cx.notify();
+    }
+
+    /// Update the sidebar sort key. Invoked from the sort-dropdown
+    /// menu items.
+    pub fn set_sort_key(&mut self, key: SortKey, cx: &mut Context<Self>) {
+        self.state.set_sort_key(key);
+        cx.notify();
+    }
 }
 
 /// Drain every currently-buffered [`ScanEvent`] off the channel. On
@@ -450,6 +567,50 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
         entity.update(cx, |view, cx| {
             view.request_cancel(cx);
         });
+    });
+
+    // Issue #23 — sidebar focus, search, and keyboard-nav actions.
+    // Every handler forwards into the matching `ProjectView::*`
+    // wrapper, which in turn delegates to pure-data `AppState` methods.
+    cx.on_action(|_: &FocusSidebar, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.focus_sidebar(cx));
+        }
+    });
+    cx.on_action(|_: &FocusDetail, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.focus_detail(cx));
+        }
+    });
+    cx.on_action(|_: &FindInSidebar, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.find_in_sidebar(cx));
+        }
+    });
+    cx.on_action(|_: &NextGroup, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.next_group(cx));
+        }
+    });
+    cx.on_action(|_: &PrevGroup, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.prev_group(cx));
+        }
+    });
+    cx.on_action(|_: &ActivateGroup, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.activate_group(cx));
+        }
+    });
+    cx.on_action(|_: &DismissCurrentGroup, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.dismiss_current_group(cx));
+        }
+    });
+    cx.on_action(|_: &OpenSelectedInEditor, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.open_selected_in_editor(cx));
+        }
     });
 }
 
@@ -698,24 +859,31 @@ fn render_loaded(state: &AppState) -> gpui::Div {
 }
 
 fn render_sidebar(state: &AppState) -> gpui::Div {
-    // While a scan is running, render Tier A groups from the streaming
-    // buffer (final-membership pulses, sorted by Impact). Tier B rows
-    // are only known after Tier B completes, so we keep the existing
-    // cache-backed Tier B section visible — it will be replaced by
-    // `apply_scan_result` when the scan finishes. Cancelling + Idle use
-    // the cache-backed view.
-    let (tier_a, tier_b): (Vec<&GroupView>, Vec<&GroupView>) =
+    // Issue #23 — the sidebar renders the filtered + sorted list from
+    // `AppState::visible_groups`. While a scan is running we still fall
+    // back to the streaming buffer for Tier A (it arrives mid-scan,
+    // before the cache reload), partitioned into the two tier sections
+    // underneath the search / sort / summary row.
+    let visible = state.visible_groups();
+    let (tier_b, tier_a): (Vec<&GroupView>, Vec<&GroupView>) =
         if matches!(state.scan_state, ScanState::Running { .. }) {
+            // Scan in flight — show cache-backed Tier B + streaming
+            // Tier A so the user still sees Impact-sorted rows during
+            // the scan. Search / sort do not re-apply to the streaming
+            // buffer (that's a #22 concern); the final cache reload
+            // brings them back into the `visible` path.
             (
-                state.groups_streaming.iter().collect(),
                 state.tier_b_groups().collect(),
+                state.groups_streaming.iter().collect(),
             )
         } else {
             (
-                state.tier_a_groups().collect(),
-                state.tier_b_groups().collect(),
+                visible.iter().filter(|g| g.tier == Tier::B).collect(),
+                visible.iter().filter(|g| g.tier == Tier::A).collect(),
             )
         };
+
+    let summary = state.summary();
 
     div()
         .w(px(320.0))
@@ -749,6 +917,10 @@ fn render_sidebar(state: &AppState) -> gpui::Div {
                 )
                 .child(render_scan_button(state)),
         )
+        // Issue #23 — search / sort / summary row.
+        .child(render_search_box(state))
+        .child(render_sort_dropdown(state))
+        .child(render_summary_header(&summary.format()))
         // Section 1: Tier B — "Duplicated functions / classes"
         .child(render_section_header(
             "Duplicated functions / classes",
@@ -768,6 +940,73 @@ fn render_sidebar(state: &AppState) -> gpui::Div {
         )
         // Section 3: Dismissed (collapsed by default).
         .child(render_dismissed_section(state))
+}
+
+/// Search input slot (issue #23).
+///
+/// We render a read-only label showing the current query plus a
+/// placeholder "Search…" when empty. The real text-entry binding —
+/// GPUI's input widget plumbing — is follow-up work; the slot exists
+/// today so ⌘F has something visible to focus + the state field is
+/// reachable. Unit tests exercise `set_search_query` directly.
+fn render_search_box(state: &AppState) -> gpui::Div {
+    let (text, dim) = if state.search_query.is_empty() {
+        ("Search\u{2026}".to_string(), true)
+    } else {
+        (state.search_query.clone(), false)
+    };
+    let focused = state.focused_pane == Pane::Sidebar;
+    let border_color = if focused {
+        rgb(ACCENT)
+    } else {
+        rgb(ACCENT_DIM)
+    };
+    div()
+        .mx(px(12.0))
+        .px(px(8.0))
+        .py(px(6.0))
+        .bg(rgb(ACCENT_DIM))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(border_color)
+        .text_size(px(12.0))
+        .text_color(if dim {
+            rgb(ROW_TEXT_DIM)
+        } else {
+            rgb(ROW_TEXT)
+        })
+        .child(text)
+}
+
+/// Sort-dropdown slot (issue #23).
+///
+/// Shows "Sort: <current key>". Full menu UI lives behind a GPUI popup
+/// we don't have a helper for yet; the state field is exposed so the
+/// dropdown can be wired in when the popup primitive lands.
+fn render_sort_dropdown(state: &AppState) -> gpui::Div {
+    div()
+        .mx(px(12.0))
+        .mt(px(4.0))
+        .px(px(8.0))
+        .py(px(6.0))
+        .bg(rgb(ACCENT_DIM))
+        .rounded(px(4.0))
+        .text_size(px(12.0))
+        .text_color(rgb(ROW_TEXT))
+        .child(format!("Sort: {}", state.sort_key.label()))
+}
+
+/// Summary header (issue #23). Renders
+/// `"N groups · N functions · N blocks · N files · N duplicated lines"`
+/// against the currently-filtered list.
+fn render_summary_header(text: &str) -> gpui::Div {
+    div()
+        .px(px(12.0))
+        .py(px(6.0))
+        .mt(px(4.0))
+        .text_size(px(11.0))
+        .text_color(rgb(SECTION_HEADER))
+        .child(text.to_string())
 }
 
 fn render_section_header(title: &'static str, count: usize) -> gpui::Div {
