@@ -26,5 +26,7 @@ pub mod tokenizer;
 
 pub use cache::{Cache, CacheError, CachedOccurrence, GroupDetail, GroupSummary};
 pub use rolling_hash::{Hash, Span};
-pub use scanner::{MatchGroup, Occurrence, ScanConfig, ScanError, ScanResult, Scanner};
+pub use scanner::{
+    MatchGroup, NoopSink, Occurrence, ProgressSink, ScanConfig, ScanError, ScanResult, Scanner,
+};
 pub use tokenizer::{Token, TokenKind};
