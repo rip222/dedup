@@ -22,8 +22,9 @@
 //! "no re-scan required".
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use dedup_core::{Cache, CacheError, Tier};
+use dedup_core::{AtomicProgressSink, Cache, CacheError, Tier};
 
 /// View-model for one duplicate group as shown in the sidebar.
 ///
@@ -126,6 +127,88 @@ pub enum AppStatus {
     Error(String),
 }
 
+/// State of the background scan pipeline (issue #21).
+///
+/// Orthogonal to [`AppStatus`]: `AppStatus` tracks *what the cache
+/// contains*, `ScanState` tracks *whether a live scan is running*. Both
+/// are read by the project view to decide what to render at the top of
+/// the sidebar.
+///
+/// Cancel + streaming updates are deferred to issue #22; the only
+/// transitions that exist today are:
+///
+/// - `Idle` → `Running` — the user clicked Scan.
+/// - `Running` → `Completed` — the worker thread returned a result.
+/// - `Completed` → `Idle` — the post-scan banner auto-dismissed.
+#[derive(Debug, Clone, Default)]
+pub enum ScanState {
+    /// No scan has been requested (or the completion banner was
+    /// dismissed). Default for a fresh `AppState`.
+    #[default]
+    Idle,
+    /// A scan thread is running.
+    Running {
+        /// Wall-clock start time. Used to compute the live "elapsed"
+        /// counter in the progress bar.
+        started_at: Instant,
+        /// Shared counters bumped by the scanner's [`AtomicProgressSink`]
+        /// and read by the GUI's 250 ms timer.
+        progress: AtomicProgressSink,
+    },
+    /// Scan finished; the completion banner is showing (auto-dismisses).
+    Completed {
+        /// Number of duplicate groups produced by the scan.
+        group_count: usize,
+        /// Number of files tokenized.
+        file_count: usize,
+        /// End-to-end scan duration.
+        duration: Duration,
+    },
+}
+
+impl ScanState {
+    /// Convenience predicate used by the Scan button's enable/disable
+    /// logic — we don't want two scans in flight at once.
+    pub fn is_running(&self) -> bool {
+        matches!(self, ScanState::Running { .. })
+    }
+}
+
+/// Format a [`Duration`] for the live progress bar / completion banner.
+///
+/// Kept cheap: one-decimal seconds up to a minute (so the sidebar doesn't
+/// flicker between `9.9s` and `10s`), then integer seconds. This mirrors
+/// the indicatif spinner format used by the CLI — when both surfaces
+/// report the same numbers the user's mental model stays intact.
+pub fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}s", secs as u64)
+    }
+}
+
+/// Format the post-scan completion banner per issue #21 acceptance
+/// criteria:
+///
+/// ```text
+/// Scan complete — 7 groups across 42 files in 3.4s.
+/// ```
+///
+/// Singular / plural nouns are kept as-is ("1 groups", "1 files") to keep
+/// the formatter deterministic — English pluralization is out of scope.
+pub fn format_completion_banner(
+    group_count: usize,
+    file_count: usize,
+    duration: Duration,
+) -> String {
+    format!(
+        "Scan complete \u{2014} {group_count} groups across {file_count} files in {}.",
+        format_elapsed(duration)
+    )
+}
+
 /// Output of [`load_folder`] — everything the GUI needs to paint a newly-
 /// opened project.
 ///
@@ -158,6 +241,10 @@ pub struct AppState {
     /// per issue #20 acceptance criteria ("Dismissed section collapsed by
     /// default; expandable").
     pub dismissed_expanded: bool,
+    /// Live scan pipeline state (issue #21). Independent of [`AppStatus`]
+    /// — the sidebar can be `Loaded` while a fresh scan runs to refresh
+    /// it.
+    pub scan_state: ScanState,
 }
 
 impl AppState {
@@ -204,6 +291,46 @@ impl AppState {
 
     pub fn tier_a_groups(&self) -> impl Iterator<Item = &GroupView> {
         self.groups.iter().filter(|g| g.tier == Tier::A)
+    }
+
+    /// Transition to [`ScanState::Running`] with a fresh
+    /// [`AtomicProgressSink`]. Returns a clone of the sink so the caller
+    /// can hand it to the worker thread.
+    ///
+    /// This is a no-op (and returns `None`) when a scan is already in
+    /// flight — the Scan button is supposed to be disabled in that case,
+    /// but we guard defensively so a double-click can't fork two scans.
+    pub fn begin_scan(&mut self) -> Option<AtomicProgressSink> {
+        if self.scan_state.is_running() {
+            return None;
+        }
+        let progress = AtomicProgressSink::new();
+        self.scan_state = ScanState::Running {
+            started_at: Instant::now(),
+            progress: progress.clone(),
+        };
+        Some(progress)
+    }
+
+    /// Transition to [`ScanState::Completed`] with the given counts.
+    ///
+    /// The GUI calls this once the worker thread's result arrives; after
+    /// the banner's auto-dismiss timer fires, [`Self::dismiss_completion`]
+    /// drops back to `Idle`.
+    pub fn finish_scan(&mut self, group_count: usize, file_count: usize, duration: Duration) {
+        self.scan_state = ScanState::Completed {
+            group_count,
+            file_count,
+            duration,
+        };
+    }
+
+    /// Drop the completion banner and return to the idle state. Called
+    /// from the auto-dismiss timer in the project view.
+    pub fn dismiss_completion(&mut self) {
+        if matches!(self.scan_state, ScanState::Completed { .. }) {
+            self.scan_state = ScanState::Idle;
+        }
     }
 }
 
@@ -591,5 +718,106 @@ mod tests {
         let r = load_folder(tmp.path());
         assert_eq!(r.status, AppStatus::NoDuplicates);
         assert!(r.groups.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Scan-state transitions (issue #21). These are pure, no GPUI —
+    // they drive the project view's Scan button + progress bar logic.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn default_scan_state_is_idle() {
+        let s = AppState::new();
+        assert!(matches!(s.scan_state, ScanState::Idle));
+        assert!(!s.scan_state.is_running());
+    }
+
+    #[test]
+    fn begin_scan_transitions_idle_to_running() {
+        let mut s = AppState::new();
+        let sink = s.begin_scan().expect("idle → running must succeed");
+        assert!(s.scan_state.is_running());
+        // Sink handed back to the caller must be the same one held in
+        // state — otherwise the worker thread bumps one set of counters
+        // and the UI polls a different set.
+        match &s.scan_state {
+            ScanState::Running { progress, .. } => {
+                progress
+                    .files_scanned
+                    .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(sink.files_scanned(), 3);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn begin_scan_is_noop_while_running() {
+        let mut s = AppState::new();
+        let _ = s.begin_scan().unwrap();
+        // Second call while still running must refuse to clobber state.
+        assert!(s.begin_scan().is_none());
+        assert!(s.scan_state.is_running());
+    }
+
+    #[test]
+    fn finish_scan_moves_running_to_completed() {
+        let mut s = AppState::new();
+        let _ = s.begin_scan();
+        s.finish_scan(7, 42, Duration::from_millis(3400));
+        match s.scan_state {
+            ScanState::Completed {
+                group_count,
+                file_count,
+                duration,
+            } => {
+                assert_eq!(group_count, 7);
+                assert_eq!(file_count, 42);
+                assert_eq!(duration, Duration::from_millis(3400));
+            }
+            _ => panic!("expected Completed"),
+        }
+    }
+
+    #[test]
+    fn dismiss_completion_returns_to_idle() {
+        let mut s = AppState::new();
+        s.finish_scan(1, 1, Duration::from_secs(1));
+        s.dismiss_completion();
+        assert!(matches!(s.scan_state, ScanState::Idle));
+    }
+
+    #[test]
+    fn dismiss_completion_from_running_is_noop() {
+        // Defensive: if the auto-dismiss timer fires after a fresh scan
+        // was started, the Running state must survive.
+        let mut s = AppState::new();
+        let _ = s.begin_scan();
+        s.dismiss_completion();
+        assert!(s.scan_state.is_running());
+    }
+
+    #[test]
+    fn format_elapsed_under_one_minute_is_one_decimal() {
+        assert_eq!(format_elapsed(Duration::from_millis(300)), "0.3s");
+        assert_eq!(format_elapsed(Duration::from_millis(1200)), "1.2s");
+        assert_eq!(format_elapsed(Duration::from_millis(4500)), "4.5s");
+        assert_eq!(format_elapsed(Duration::from_millis(59_900)), "59.9s");
+    }
+
+    #[test]
+    fn format_elapsed_over_one_minute_is_integer() {
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "60s");
+        assert_eq!(format_elapsed(Duration::from_secs(125)), "125s");
+    }
+
+    #[test]
+    fn completion_banner_matches_acceptance_criterion() {
+        // AC copy: "Scan complete — N groups across N files in Ns."
+        let banner = format_completion_banner(7, 42, Duration::from_millis(3400));
+        assert_eq!(
+            banner,
+            "Scan complete \u{2014} 7 groups across 42 files in 3.4s."
+        );
     }
 }

@@ -37,7 +37,7 @@ pub use config::{
 pub use ignore::{IgnoreRules, IgnoreRulesOptions};
 pub use rolling_hash::{Hash, Span};
 pub use scanner::{
-    FileIssue, FileIssueCounts, FileIssueKind, MatchGroup, NoopSink, Occurrence, ProgressSink,
-    ScanConfig, ScanError, ScanResult, Scanner, Tier,
+    AtomicProgressSink, FileIssue, FileIssueCounts, FileIssueKind, MatchGroup, NoopSink,
+    Occurrence, ProgressSink, ScanConfig, ScanError, ScanResult, Scanner, Tier,
 };
 pub use tokenizer::{Token, TokenKind};

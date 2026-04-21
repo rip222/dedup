@@ -346,6 +346,55 @@ impl ProgressSink for NoopSink {
     fn on_match_group(&self, _group: &MatchGroup) {}
 }
 
+/// Lock-free [`ProgressSink`] backed by two [`AtomicUsize`] counters.
+///
+/// Designed for the GUI (issue #21): the scanner runs on a worker thread
+/// and bumps the counters as it progresses; the GUI polls them from a
+/// separate 250 ms timer and re-renders. Cloning the handles is cheap —
+/// the inner `Arc`s are shared across both threads.
+///
+/// This is deliberately minimal. Streaming / cancel / richer progress
+/// events (per-file paths, phase labels) are tracked in #22, which will
+/// either extend this type or replace it with a proper channel sink.
+#[derive(Debug, Default, Clone)]
+pub struct AtomicProgressSink {
+    pub files_scanned: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub matches: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AtomicProgressSink {
+    /// Fresh sink with both counters at zero.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Current file-processed count (monotonic).
+    pub fn files_scanned(&self) -> usize {
+        self.files_scanned
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Current match-group count. Only ever updated once — right before
+    /// the scanner returns — because clustering / promotion is a whole-
+    /// corpus step. The GUI treats the pre-completion value as "0 or
+    /// more so far" and replaces it with the final count on completion.
+    pub fn matches(&self) -> usize {
+        self.matches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl ProgressSink for AtomicProgressSink {
+    fn on_file_processed(&self, _path: &Path) {
+        self.files_scanned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn on_match_group(&self, _group: &MatchGroup) {
+        self.matches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Public scanner handle. Cheap to construct; holds only configuration
 /// plus the Tier B language-profile registry.
 ///
@@ -1637,5 +1686,48 @@ mod tests {
         assert_eq!(panic_message(&payload_string), "bang");
         let payload_other: Box<dyn std::any::Any + Send> = Box::new(7u64);
         assert!(!panic_message(&payload_other).is_empty());
+    }
+
+    #[test]
+    fn atomic_progress_sink_counts_files_and_matches() {
+        // Drives issue #21's GUI progress bar: the sink is polled from a
+        // timer while `Scanner::scan_with_progress` runs on a worker
+        // thread. If this test's counters don't advance, the bar freezes.
+        let dir = tempdir().unwrap();
+        // Two identical files — guarantees at least one Tier A match
+        // group so the `matches` counter actually moves.
+        let body: String = (0..80)
+            .map(|i| format!("let always_shared_{i} = {i};\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        fs::write(dir.path().join("a.txt"), &body).unwrap();
+        fs::write(dir.path().join("b.txt"), &body).unwrap();
+
+        let sink = AtomicProgressSink::new();
+        assert_eq!(sink.files_scanned(), 0);
+        assert_eq!(sink.matches(), 0);
+
+        let scanner = Scanner::with_profiles(ScanConfig::default(), vec![]);
+        let result = scanner.scan_with_progress(dir.path(), &sink).unwrap();
+
+        assert_eq!(sink.files_scanned(), result.files_scanned);
+        assert!(sink.files_scanned() >= 2, "both files should be counted");
+        assert_eq!(sink.matches(), result.groups.len());
+        assert!(sink.matches() >= 1, "identical files produce ≥ 1 group");
+    }
+
+    #[test]
+    fn atomic_progress_sink_clones_share_state() {
+        // The GUI clones the sink so the worker thread bumps one handle
+        // while the timer reads the other. This only works if `Arc`
+        // cloning keeps both handles pointing at the same counters.
+        let a = AtomicProgressSink::new();
+        let b = a.clone();
+        <AtomicProgressSink as ProgressSink>::on_file_processed(
+            &a,
+            std::path::Path::new("ignored"),
+        );
+        assert_eq!(a.files_scanned(), 1);
+        assert_eq!(b.files_scanned(), 1);
     }
 }

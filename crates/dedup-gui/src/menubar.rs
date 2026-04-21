@@ -87,7 +87,9 @@ fn register_handlers(cx: &mut App) {
     // created. Dispatching the action with no project view yet (before
     // `register_root` runs) is a no-op, which is fine at startup.
     stub(cx, "Close Window (⌘W)", |_: &CloseWindow, _: &mut App| {});
-    stub(cx, "Start Scan (⌘R) — #21", |_: &StartScan, _: &mut App| {});
+    // `StartScan` is no longer a stub — `crate::project_view::register_root`
+    // wires it to the real scan pipeline once the root view is created.
+    // Firing the action before `register_root` runs is a safe no-op.
     stub(cx, "Stop Scan (⌘.) — #22", |_: &StopScan, _: &mut App| {});
     stub(cx, "Clear Cache…", |_: &ClearCache, _: &mut App| {});
     stub(

@@ -26,8 +26,8 @@ pub mod menubar;
 pub mod project_view;
 
 pub use app_state::{
-    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, SuppressionView, group_label,
-    load_folder,
+    AppState, AppStatus, FolderLoadResult, GroupView, OccurrenceView, ScanState, SuppressionView,
+    format_completion_banner, format_elapsed, group_label, load_folder,
 };
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};
