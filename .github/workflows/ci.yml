@@ -42,6 +42,98 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  dogfood:
+    # Build release binary and run `dedup scan` against this repo.
+    # Asserts exit code 0 so we catch crashes or nonzero exits on
+    # real-world input (the scanner's own source tree). Runs on both
+    # push-to-main and PRs — cheap enough and catches regressions on
+    # main before any PR sees them.
+    name: dogfood (dedup scan .)
+    runs-on: ubuntu-latest
+    needs: build-test-clippy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build --release -p dedup-cli
+        run: cargo build --release -p dedup-cli
+      - name: dedup scan . (exit 0 on crash-free run)
+        # Duplicates are expected; we only assert the process exits
+        # cleanly. `--strict` would turn "duplicates found" into a
+        # nonzero exit — we don't want that here.
+        run: ./target/release/dedup scan .
+
+  bench:
+    # Criterion benchmarks comparing PR HEAD against the PR's base.
+    # The bench job only runs on pull_request events; running on every
+    # push-to-main would double CI minutes for no added signal.
+    # We deliberately do NOT fail the workflow on a >10% regression —
+    # criterion noise on shared runners makes a hard threshold
+    # unreliable. Regressions are surfaced as a PR comment for review.
+    name: criterion benchmarks (PR vs base)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: build-test-clippy
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so we can check out the base ref.
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.base.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Share the cache across base/PR runs within this job.
+          shared-key: bench
+      - name: run benches on base
+        run: |
+          cargo bench --bench tokenize_hash -p dedup-core -- --save-baseline base
+          cargo bench --bench bucket_intersection -p dedup-core -- --save-baseline base
+          cargo bench --bench full_scan -p dedup-core -- --save-baseline base
+          cargo bench --bench tree_sitter_parse_hash -p dedup-lang -- --save-baseline base
+      - name: checkout PR HEAD (keep target/ intact)
+        run: |
+          git fetch origin '${{ github.event.pull_request.head.sha }}'
+          git checkout --force '${{ github.event.pull_request.head.sha }}'
+      - name: run benches on PR HEAD
+        run: |
+          cargo bench --bench tokenize_hash -p dedup-core
+          cargo bench --bench bucket_intersection -p dedup-core
+          cargo bench --bench full_scan -p dedup-core
+          cargo bench --bench tree_sitter_parse_hash -p dedup-lang
+      - name: generate comparison report
+        run: |
+          python3 .github/scripts/bench_compare.py \
+            --criterion-dir target/criterion \
+            --threshold-pct 10 \
+            --out bench_report.md
+      - name: post PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Prepend a machine-readable marker so the next run can find
+          # and replace the previous comment instead of piling up a new
+          # one per push. `gh pr comment` doesn't support edit-in-place,
+          # but we can delete the prior marker-bearing comment first.
+          MARKER='<!-- dedup-bench-report -->'
+          {
+            echo "$MARKER"
+            cat bench_report.md
+          } > bench_report_full.md
+          # Delete any previous bench-report comment(s) on this PR.
+          gh api \
+            "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.body | startswith("<!-- dedup-bench-report -->")) | .id' \
+          | while read -r cid; do
+            gh api --method DELETE \
+              "repos/${{ github.repository }}/issues/comments/${cid}" || true
+          done
+          gh pr comment "${PR_NUMBER}" --body-file bench_report_full.md
+
   gui-smoke-test:
     name: dedup-gui smoke test (macos-latest)
     runs-on: macos-latest

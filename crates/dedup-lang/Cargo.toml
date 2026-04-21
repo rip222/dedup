@@ -15,5 +15,10 @@ tree-sitter-rust = "0.23"
 tree-sitter-typescript = "0.23"
 
 [dev-dependencies]
+criterion = "0.5"
 insta = "1"
 proptest = "1"
+
+[[bench]]
+name = "tree_sitter_parse_hash"
+harness = false

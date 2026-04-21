@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Compare criterion `base/` and `new/` estimates in a single
+`target/criterion/` tree and emit a markdown report.
+
+The GitHub Actions `bench` job runs criterion twice against the same
+`target/` directory:
+
+1. Check out the PR's base ref, run `cargo bench -- --save-baseline base`.
+   This writes per-benchmark `base/estimates.json` files under
+   `target/criterion/<group>/<name>/base/`.
+2. Check out the PR HEAD, run `cargo bench` (no `--save-baseline`).
+   Criterion writes the fresh measurement to `new/estimates.json`
+   alongside the previously-saved `base/` tree.
+
+For each benchmark that has both a `base/estimates.json` and a
+`new/estimates.json`, we compute the median point-estimate delta and
+flag regressions above `--threshold-pct`.
+
+We intentionally do NOT fail the job on regressions — criterion's noise
+floor on a shared CI runner is much higher than a single-digit percent,
+so a red X based on one sample would be useless. The threshold just
+decides which rows get a warning emoji in the comment.
+
+Usage:
+  bench_compare.py --criterion-dir <dir> [--threshold-pct 10] [--out report.md]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+@dataclass
+class BenchPair:
+    full_id: str  # e.g. "tokenize_hash/tokenize_1k_lines"
+    base_ns: float | None
+    pr_ns: float | None
+
+
+def read_median_ns(estimates_path: Path) -> float | None:
+    try:
+        data = json.loads(estimates_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    median = data.get("median", {}).get("point_estimate")
+    if median is None:
+        return None
+    return float(median)
+
+
+def load_pairs(root: Path) -> list[BenchPair]:
+    """Walk every `benchmark.json` under `root` and collect the
+    `base/` + `new/` median point estimates for that bench."""
+    pairs: list[BenchPair] = []
+    for bench_json in root.rglob("benchmark.json"):
+        # Criterion lays out each benchmark as
+        #   target/criterion/<group>/<name>/{base,new}/benchmark.json
+        # so benchmark.json is two levels below the bench directory.
+        leaf = bench_json.parent.name
+        if leaf not in ("base", "new"):
+            continue
+        bench_dir = bench_json.parent.parent
+        try:
+            meta = json.loads(bench_json.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        full_id = meta.get("full_id")
+        if not full_id:
+            continue
+        base_ns = read_median_ns(bench_dir / "base" / "estimates.json")
+        pr_ns = read_median_ns(bench_dir / "new" / "estimates.json")
+        # Avoid reporting the same benchmark twice when we encounter
+        # both base/ and new/ siblings during the walk.
+        if any(p.full_id == full_id for p in pairs):
+            continue
+        pairs.append(BenchPair(full_id=full_id, base_ns=base_ns, pr_ns=pr_ns))
+    pairs.sort(key=lambda p: p.full_id)
+    return pairs
+
+
+def format_ns(value_ns: float) -> str:
+    """Render a nanosecond count in the same scaled units criterion uses."""
+    if value_ns >= 1e9:
+        return f"{value_ns / 1e9:.2f} s"
+    if value_ns >= 1e6:
+        return f"{value_ns / 1e6:.2f} ms"
+    if value_ns >= 1e3:
+        return f"{value_ns / 1e3:.2f} µs"
+    return f"{value_ns:.0f} ns"
+
+
+def render_report(pairs: list[BenchPair], threshold_pct: float) -> str:
+    lines: list[str] = [
+        "## Criterion benchmark comparison",
+        "",
+        "Median point-estimate, PR vs base. Regressions above the "
+        f"{threshold_pct:.0f}% threshold are flagged with :warning: — "
+        "they are reported for review, not enforced as a hard fail "
+        "(criterion noise on shared CI runners regularly exceeds this).",
+        "",
+        "| Benchmark | Base | PR | Δ | Status |",
+        "|---|---:|---:|---:|:---:|",
+    ]
+
+    if not pairs:
+        lines.append("| _(no benchmarks found)_ | | | | |")
+    for pair in pairs:
+        base_cell = format_ns(pair.base_ns) if pair.base_ns is not None else "—"
+        pr_cell = format_ns(pair.pr_ns) if pair.pr_ns is not None else "—"
+        if (
+            pair.base_ns is not None
+            and pair.pr_ns is not None
+            and pair.base_ns > 0
+        ):
+            delta_pct = (pair.pr_ns - pair.base_ns) / pair.base_ns * 100.0
+            delta_cell = f"{delta_pct:+.1f}%"
+            if delta_pct > threshold_pct:
+                status_cell = ":warning: regression"
+            elif delta_pct < -threshold_pct:
+                status_cell = ":rocket: speedup"
+            else:
+                status_cell = "ok"
+        else:
+            delta_cell = "—"
+            status_cell = "new" if pair.base_ns is None else "missing"
+        lines.append(
+            f"| `{pair.full_id}` | {base_cell} | {pr_cell} | {delta_cell} | {status_cell} |"
+        )
+
+    lines.append("")
+    lines.append(
+        "<sub>Generated by `.github/scripts/bench_compare.py` — see issue "
+        "#15 for the bench charter.</sub>"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--criterion-dir",
+        required=True,
+        type=Path,
+        help="Path to the combined `target/criterion` directory.",
+    )
+    parser.add_argument(
+        "--threshold-pct",
+        type=float,
+        default=10.0,
+        help="Flag regressions slower than this percentage (default: 10).",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=Path("bench_report.md"),
+        help="Where to write the markdown report.",
+    )
+    args = parser.parse_args()
+
+    pairs = load_pairs(args.criterion_dir)
+    report = render_report(pairs, args.threshold_pct)
+    args.out.write_text(report)
+    # Echo the report to stdout so the CI log captures it even if the
+    # PR comment step fails.
+    sys.stdout.write(report)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
