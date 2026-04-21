@@ -32,7 +32,8 @@ fn copy_tree(src: &Path, dst: &Path) {
 }
 
 /// Build an `assert_cmd::Command` wired to a sandboxed HOME and empty
-/// XDG_CONFIG_HOME so `dirs::config_dir()` resolves below `home`.
+/// XDG_CONFIG_HOME so `Config::global_path()` resolves to
+/// `<home>/.config/dedup/config.toml`.
 fn dedup_with_home(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("dedup").unwrap();
     cmd.env("HOME", home).env_remove("XDG_CONFIG_HOME");

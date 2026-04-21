@@ -247,14 +247,21 @@ impl PartialConfig {
 }
 
 impl Config {
-    /// Resolve the global config path: `$XDG_CONFIG_HOME/dedup/config.toml`
-    /// or `~/.config/dedup/config.toml` on POSIX, and the analogous
-    /// platform-specific path everywhere else (via the `dirs` crate).
+    /// Resolve the global config path.
+    ///
+    /// Per the PRD (GitHub issue #1), dedup stores its global state under
+    /// `~/.config/dedup/` on all platforms — this is literal and
+    /// load-bearing across the codebase (tracing logs and other future
+    /// features follow the same convention). On Unix we honor
+    /// `$XDG_CONFIG_HOME` when set, else fall back to
+    /// `$HOME/.config/dedup/config.toml`. On Windows (not in the CI
+    /// matrix) we fall back to `dirs::config_dir()` for lack of a sane
+    /// `~/.config` equivalent.
     pub fn global_path() -> PathBuf {
-        match dirs::config_dir() {
-            Some(p) => p.join(GLOBAL_CONFIG_SUBDIR).join(CONFIG_FILE),
-            None => PathBuf::from(CONFIG_FILE),
-        }
+        global_config_dir()
+            .unwrap_or_else(|| PathBuf::from(""))
+            .join(GLOBAL_CONFIG_SUBDIR)
+            .join(CONFIG_FILE)
     }
 
     /// Resolve the project config path for `repo_root`:
@@ -289,6 +296,25 @@ impl Config {
         }
 
         Ok(cfg)
+    }
+}
+
+/// Resolve the directory that contains the `dedup/` subdirectory for the
+/// global config. See [`Config::global_path`] for the platform rules.
+fn global_config_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+            let xdg = PathBuf::from(xdg);
+            if !xdg.as_os_str().is_empty() {
+                return Some(xdg);
+            }
+        }
+        dirs::home_dir().map(|h| h.join(".config"))
+    }
+    #[cfg(not(unix))]
+    {
+        dirs::config_dir()
     }
 }
 
@@ -329,11 +355,10 @@ mod tests {
     }
 
     /// Write a global config under the sandboxed `home`. Resolves the
-    /// actual global path (which varies by platform — `dirs::config_dir`
-    /// returns `~/Library/Application Support/` on macOS,
-    /// `~/.config/` on Linux). The env-override helper below has already
-    /// set HOME, so call this inside `with_test_home`'s closure if you
-    /// want the resolver and the writer to agree.
+    /// actual global path (`$HOME/.config/dedup/config.toml` on Unix per
+    /// the PRD). The env-override helper below has already set HOME, so
+    /// call this inside `with_test_home`'s closure if you want the
+    /// resolver and the writer to agree.
     fn write_global_under_home(home: &Path, body: &str) {
         with_test_home(home, || {
             let path = Config::global_path();
@@ -492,6 +517,50 @@ include_submodules = true
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn global_path_prefers_xdg_config_home_when_set() {
+        let home = tempdir().unwrap();
+        let xdg = tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: test-only env mutation; restored below.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+        }
+        let resolved = Config::global_path();
+        // Cleanup before assertions so failures don't leak state.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        assert_eq!(
+            resolved,
+            xdg.path().join(GLOBAL_CONFIG_SUBDIR).join(CONFIG_FILE)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_path_falls_back_to_home_dot_config_without_xdg() {
+        let home = tempdir().unwrap();
+        let resolved = with_test_home(home.path(), Config::global_path);
+        assert_eq!(
+            resolved,
+            home.path()
+                .join(".config")
+                .join(GLOBAL_CONFIG_SUBDIR)
+                .join(CONFIG_FILE)
+        );
+    }
+
     #[test]
     fn absent_schema_version_is_treated_as_current() {
         let home = tempdir().unwrap();
@@ -509,9 +578,10 @@ min_lines = 7
         assert_eq!(cfg.thresholds.tier_a.min_lines, 7);
     }
 
-    /// Execute `f` with `$HOME` / `$XDG_CONFIG_HOME` set to `home` so
-    /// `dirs::config_dir()` resolves to `<home>/.config/` regardless of
-    /// the developer's real environment. Restores the environment after.
+    /// Execute `f` with `$HOME` set to `home` and `$XDG_CONFIG_HOME`
+    /// cleared so [`Config::global_path`] resolves to
+    /// `<home>/.config/dedup/config.toml` regardless of the developer's
+    /// real environment. Restores the environment after.
     ///
     /// Tests in this module are single-threaded within the module by
     /// convention (no explicit `#[serial]`) — these env mutations are
