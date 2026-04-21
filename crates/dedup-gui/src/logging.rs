@@ -129,7 +129,7 @@ pub fn prune_old_logs(dir: &Path, keep: usize) -> io::Result<usize> {
     }
 
     // Newest first.
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
 
     let mut removed = 0usize;
     for (path, _) in candidates.into_iter().skip(keep) {
