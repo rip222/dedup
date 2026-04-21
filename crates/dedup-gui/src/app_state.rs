@@ -28,7 +28,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use dedup_core::editor::{EditorConfig, EditorError, EnvPathLookup};
-use dedup_core::{AtomicProgressSink, Cache, CacheError, Config, DetailConfig, MatchGroup, Tier};
+use dedup_core::{
+    AtomicProgressSink, Cache, CacheError, Config, ConfigError, DetailConfig, FileIssue,
+    MatchGroup, Tier,
+};
+
+use crate::toast::{
+    ACTION_CACHE_DELETE_AND_RESCAN, ACTION_CACHE_RESCAN, ACTION_REMOVE_STALE_RECENT,
+    ACTION_SHOW_ISSUES, CacheErrorClass, ToastAction, ToastKind, ToastStack, classify_cache_error,
+};
 
 /// View-model for one duplicate group as shown in the sidebar.
 ///
@@ -373,6 +381,55 @@ pub struct AppState {
     /// is an inline modal overlay rather than a native window — see
     /// the PR body for the GPUI-primitives compromise.
     pub preferences_open: bool,
+    /// Live toast queue (issue #30). Pushed to by error classifiers,
+    /// the scan-complete flow, and background-panic propagation. The
+    /// 500ms tick timer in `ProjectView::start_toast_ticker` drops
+    /// expired auto-dismiss toasts.
+    pub toasts: ToastStack,
+    /// Startup-error modal state (issue #30). Non-`None` when
+    /// `Config::load` failed at launch: the app runs in "degraded"
+    /// mode with a modal offering `[Fix config]` / `[Reset to
+    /// defaults]`. Cleared on successful retry.
+    pub startup_error: Option<StartupError>,
+    /// Issues from the most recent scan (issue #30). Mirrors
+    /// `ScanResult::issues` so the post-scan sidebar link has
+    /// something to render a count off, and the issues dialog has
+    /// detail rows to populate.
+    pub scan_issues: Vec<FileIssue>,
+    /// Whether the post-scan issues dialog is open (issue #30). Toggled
+    /// by the sidebar "N files had issues" link.
+    pub scan_issues_open: bool,
+}
+
+/// Startup-error payload surfaced when `Config::load` fails at launch.
+///
+/// The GUI cannot proceed normally without a config, but we also don't
+/// want to crash — instead the window paints an inline modal with
+/// `[Fix config]` (opens the offending file in `$EDITOR`) and
+/// `[Reset to defaults]` (overwrites the file with a defaults-only
+/// TOML and retries). `path` points at the file that failed to load
+/// (for "Fix config"); `message` is the human-readable error string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupError {
+    pub path: PathBuf,
+    pub message: String,
+}
+
+impl StartupError {
+    /// Build a [`StartupError`] from a [`ConfigError`]. Picks the best
+    /// `path` the variant carries (falling back to the global config
+    /// path) so the "Fix config" button always has a file to open.
+    pub fn from_config_error(err: &ConfigError) -> Self {
+        let path = match err {
+            ConfigError::Parse { path, .. } => path.clone(),
+            ConfigError::SchemaVersionMismatch { path, .. } => path.clone(),
+            _ => Config::global_path(),
+        };
+        Self {
+            path,
+            message: err.to_string(),
+        }
+    }
 }
 
 /// Inline banner used to surface a stale Open Recent entry. The
@@ -734,6 +791,172 @@ impl AppState {
     pub fn clear_recents(&mut self) {
         self.recent_projects.clear();
         self.persist_recents();
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #30 — toast + startup-error helpers.
+    //
+    // All GPUI-free so the test lane can drive the state machine
+    // without spinning up the runloop. The project-view layer owns
+    // rendering + the 500ms tick timer.
+    // -----------------------------------------------------------------
+
+    /// Push an Error toast with a title + action button. Used by the
+    /// cache-corruption / cache-newer-schema / editor-launch-failure
+    /// flows. Returns the id so callers can dismiss on action.
+    pub fn push_error_toast(
+        &mut self,
+        title: impl Into<String>,
+        body: Option<String>,
+        action: Option<ToastAction>,
+    ) -> u64 {
+        self.toasts
+            .push_full(ToastKind::Error, title.into(), body, action)
+    }
+
+    /// Push a Warning toast (yellow, 5s auto-dismiss).
+    pub fn push_warning_toast(&mut self, title: impl Into<String>) -> u64 {
+        self.toasts.push(ToastKind::Warning, title)
+    }
+
+    /// Push an Info toast (neutral, 3s auto-dismiss). Used by the
+    /// scan-complete flow to surface the "Scan complete — …" message
+    /// that previously lived in the green inline banner.
+    pub fn push_info_toast(&mut self, title: impl Into<String>) -> u64 {
+        self.toasts.push(ToastKind::Info, title)
+    }
+
+    /// Push an Info toast with a body and optional action. Used by the
+    /// post-scan "N files had issues" surface.
+    pub fn push_info_toast_full(
+        &mut self,
+        title: impl Into<String>,
+        body: Option<String>,
+        action: Option<ToastAction>,
+    ) -> u64 {
+        self.toasts
+            .push_full(ToastKind::Info, title.into(), body, action)
+    }
+
+    /// Advance the toast auto-dismiss clock. Called by the project
+    /// view's 500ms timer; wraps [`ToastStack::tick`].
+    pub fn tick_toasts(&mut self, now: Instant) {
+        self.toasts.tick(now);
+    }
+
+    /// Dismiss a specific toast by id.
+    pub fn dismiss_toast(&mut self, id: u64) {
+        self.toasts.dismiss(id);
+    }
+
+    /// Classify `err` and push the matching toast for the newer-schema
+    /// / corrupted / other buckets. Kept as a single entry point so
+    /// `load_folder` and `start_scan` fall into the same code path.
+    ///
+    /// Returns the classification for callers that still need to
+    /// influence other state (e.g. `load_folder` keeps the
+    /// `AppStatus::NewerCache` view alongside the toast).
+    pub fn surface_cache_error(&mut self, err: &CacheError) -> CacheErrorClass {
+        let class = classify_cache_error(err);
+        match class {
+            CacheErrorClass::NewerSchema => {
+                self.push_error_toast(
+                    "Cache created by newer Dedup version. Rescan?",
+                    Some(err.to_string()),
+                    Some(ToastAction {
+                        label: "Rescan (overwrites cache)".to_string(),
+                        action_name: ACTION_CACHE_RESCAN,
+                    }),
+                );
+            }
+            CacheErrorClass::Corrupted => {
+                self.push_error_toast(
+                    "Cache is corrupted. Delete .dedup/ and rescan?",
+                    Some(err.to_string()),
+                    Some(ToastAction {
+                        label: "Delete .dedup/ and rescan".to_string(),
+                        action_name: ACTION_CACHE_DELETE_AND_RESCAN,
+                    }),
+                );
+            }
+            CacheErrorClass::Other => {
+                self.push_error_toast("Cache error", Some(err.to_string()), None);
+            }
+        }
+        class
+    }
+
+    /// Enter "startup error" mode — the GUI shell renders a modal
+    /// asking the user to fix or reset the invalid config. Called by
+    /// [`crate::run`] before any folder can be opened.
+    pub fn set_startup_error(&mut self, err: &ConfigError) {
+        self.startup_error = Some(StartupError::from_config_error(err));
+    }
+
+    /// Clear the startup-error modal (e.g. after Reset-to-defaults
+    /// succeeds).
+    pub fn clear_startup_error(&mut self) {
+        self.startup_error = None;
+    }
+
+    /// Open the post-scan issues dialog. No-op when the issues list is
+    /// empty (defensive — the sidebar link only renders with
+    /// `scan_issues.len() > 0`).
+    pub fn open_scan_issues(&mut self) {
+        if !self.scan_issues.is_empty() {
+            self.scan_issues_open = true;
+        }
+    }
+
+    /// Close the post-scan issues dialog.
+    pub fn close_scan_issues(&mut self) {
+        self.scan_issues_open = false;
+    }
+
+    /// Replace the stored scan-issues list. Called by the project view
+    /// after a scan completes so the sidebar link + dialog have data
+    /// to render.
+    pub fn set_scan_issues(&mut self, issues: Vec<FileIssue>) {
+        self.scan_issues = issues;
+    }
+
+    /// Push a stale-recents Error toast with the "Remove from recents"
+    /// action (replaces the inline banner from #28).
+    pub fn push_stale_recent_toast(&mut self, path: &Path) {
+        self.push_error_toast(
+            format!(
+                "Couldn\u{2019}t open {} \u{2014} it may have been \
+                 moved or deleted.",
+                path.display()
+            ),
+            None,
+            Some(ToastAction {
+                label: "Remove from recents".to_string(),
+                action_name: ACTION_REMOVE_STALE_RECENT,
+            }),
+        );
+    }
+
+    /// Push a post-scan info toast with a "View issues" button. The
+    /// action opens the issues dialog via [`Self::open_scan_issues`].
+    /// No-op when no issues were recorded.
+    pub fn push_post_scan_issues_toast(&mut self) {
+        if self.scan_issues.is_empty() {
+            return;
+        }
+        let count = self.scan_issues.len();
+        let title = format!(
+            "{count} file{s} had issues during the scan",
+            s = if count == 1 { "" } else { "s" }
+        );
+        self.push_info_toast_full(
+            title,
+            Some("Click View issues for details and a GitHub-ready block.".to_string()),
+            Some(ToastAction {
+                label: "View issues".to_string(),
+                action_name: ACTION_SHOW_ISSUES,
+            }),
+        );
     }
 
     /// Surface a banner with `message`. Replaces any existing editor
@@ -2985,5 +3208,127 @@ mod tests {
         );
         s.dismiss_recent_banner();
         assert!(s.recent_banner.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #30 — AppState-level toast / startup-error / issues tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn surface_cache_error_newer_schema_uses_rescan_action() {
+        let mut s = AppState::new();
+        let err = CacheError::NewerSchema {
+            found: 9,
+            supported: 3,
+        };
+        let class = s.surface_cache_error(&err);
+        assert_eq!(class, CacheErrorClass::NewerSchema);
+        assert_eq!(s.toasts.len(), 1);
+        let t = &s.toasts.toasts[0];
+        assert_eq!(t.kind, ToastKind::Error);
+        assert_eq!(
+            t.action.as_ref().map(|a| a.action_name),
+            Some(ACTION_CACHE_RESCAN)
+        );
+    }
+
+    #[test]
+    fn surface_cache_error_corrupted_uses_delete_action() {
+        let mut s = AppState::new();
+        let io = std::io::Error::other("database disk image is malformed");
+        let err = CacheError::Io {
+            path: PathBuf::from("/tmp/x"),
+            source: io,
+        };
+        let class = s.surface_cache_error(&err);
+        assert_eq!(class, CacheErrorClass::Corrupted);
+        assert_eq!(
+            s.toasts.toasts[0].action.as_ref().map(|a| a.action_name),
+            Some(ACTION_CACHE_DELETE_AND_RESCAN)
+        );
+    }
+
+    #[test]
+    fn set_startup_error_captures_path_and_message() {
+        // Route through the real loader — it's the production path
+        // that produces `ConfigError::Parse` and we don't need a
+        // hand-constructed `toml::de::Error` (which would add a
+        // dev-dep). `parse_malformed_toml_classifies_as_startup_error`
+        // covers the same code path end-to-end.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_cfg = tmp
+            .path()
+            .join(dedup_core::config::PROJECT_CONFIG_DIR)
+            .join(dedup_core::config::CONFIG_FILE);
+        std::fs::create_dir_all(project_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&project_cfg, "nope[ malformed").unwrap();
+        let cfg_err = Config::load(Some(tmp.path())).expect_err("malformed toml must fail");
+        let mut s = AppState::new();
+        s.set_startup_error(&cfg_err);
+        let se = s.startup_error.as_ref().unwrap();
+        assert_eq!(se.path, project_cfg);
+        assert!(!se.message.is_empty());
+        s.clear_startup_error();
+        assert!(s.startup_error.is_none());
+    }
+
+    #[test]
+    fn parse_malformed_toml_classifies_as_startup_error() {
+        // Drive the same route `run()` takes: `Config::load` on
+        // malformed TOML returns a `Parse` error, which the app wraps
+        // into a `StartupError`. No GPUI here — the classification is
+        // pure `ConfigError -> StartupError`.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_cfg = tmp
+            .path()
+            .join(dedup_core::config::PROJECT_CONFIG_DIR)
+            .join(dedup_core::config::CONFIG_FILE);
+        std::fs::create_dir_all(project_cfg.parent().unwrap()).unwrap();
+        std::fs::write(&project_cfg, "this is [[[ not valid toml").unwrap();
+        let err = Config::load(Some(tmp.path())).expect_err("malformed toml must fail");
+        let se = StartupError::from_config_error(&err);
+        assert_eq!(se.path, project_cfg);
+        assert!(!se.message.is_empty());
+    }
+
+    #[test]
+    fn open_scan_issues_requires_non_empty_list() {
+        let mut s = AppState::new();
+        s.open_scan_issues();
+        assert!(!s.scan_issues_open);
+        s.set_scan_issues(vec![FileIssue {
+            path: PathBuf::from("src/a.rs"),
+            kind: dedup_core::FileIssueKind::ReadError,
+            message: "denied".to_string(),
+        }]);
+        s.open_scan_issues();
+        assert!(s.scan_issues_open);
+        s.close_scan_issues();
+        assert!(!s.scan_issues_open);
+    }
+
+    #[test]
+    fn push_post_scan_issues_toast_is_noop_when_empty() {
+        let mut s = AppState::new();
+        s.push_post_scan_issues_toast();
+        assert_eq!(s.toasts.len(), 0);
+    }
+
+    #[test]
+    fn push_post_scan_issues_toast_includes_view_action() {
+        let mut s = AppState::new();
+        s.set_scan_issues(vec![FileIssue {
+            path: PathBuf::from("src/a.rs"),
+            kind: dedup_core::FileIssueKind::ReadError,
+            message: "denied".to_string(),
+        }]);
+        s.push_post_scan_issues_toast();
+        assert_eq!(s.toasts.len(), 1);
+        let t = &s.toasts.toasts[0];
+        assert_eq!(t.kind, ToastKind::Info);
+        assert_eq!(
+            t.action.as_ref().map(|a| a.action_name),
+            Some(ACTION_SHOW_ISSUES)
+        );
     }
 }

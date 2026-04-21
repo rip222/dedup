@@ -29,8 +29,9 @@ use gpui::{
 };
 
 use crate::app_state::{
-    AppState, AppStatus, GroupView, OccurrenceView, Pane, ScanState, SortKey, SuppressionView,
-    format_completion_banner, format_elapsed, group_view_from_match, launch_editor, load_folder,
+    AppState, AppStatus, GroupView, OccurrenceView, Pane, ScanState, SortKey, StartupError,
+    SuppressionView, format_completion_banner, format_elapsed, group_view_from_match,
+    launch_editor, load_folder,
 };
 use crate::menubar::{
     ActivateGroup, ClearRecents, ClosePreferences, CollapseAll, DismissCurrentGroup,
@@ -39,8 +40,13 @@ use crate::menubar::{
     OpenRecent4, OpenSelectedInEditor, Preferences, PrevGroup, RemoveStaleRecent, StartScan,
     StopScan,
 };
+use crate::toast::{
+    ACTION_CACHE_DELETE_AND_RESCAN, ACTION_CACHE_RESCAN, ACTION_CONFIG_FIX, ACTION_CONFIG_RESET,
+    ACTION_REMOVE_STALE_RECENT, ACTION_SHOW_ISSUES, Toast, ToastKind, format_issues_clipboard,
+    panic_message,
+};
 use dedup_core::{
-    Cache, Config, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, Tier,
+    Cache, Config, FileIssue, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, Tier,
     TierAStreamCallback,
 };
 
@@ -76,6 +82,14 @@ enum ScanEvent {
     /// Scanner returned [`ScanError::Cancelled`] in response to the
     /// shared cancel flag.
     Cancelled,
+    /// Scanner returned a non-cancel error (e.g. walk failure, cache
+    /// open failure). The `String` is the human-readable error message
+    /// the poll loop surfaces as an Error toast. Issue #30.
+    ScanFailed(String),
+    /// The background worker thread panicked. The `String` is the
+    /// panic payload (extracted via `catch_unwind`), forwarded to the
+    /// GUI as an Error toast + state reset to Idle. Issue #30.
+    BackgroundPanic(String),
 }
 
 /// Scan-thread → GUI-thread handoff channel.
@@ -127,6 +141,46 @@ impl ProjectView {
     pub fn apply_folder(&mut self, folder: &Path, cx: &mut Context<Self>) {
         let result = load_folder(folder);
         let is_error = matches!(result.status, AppStatus::Error(_));
+        // Issue #30 — classify the load result and raise the matching
+        // toast before we overwrite state. `NewerCache` still uses the
+        // inline body renderer (so the sidebar panel is replaced with
+        // the upgrade message), but we also push a toast with the
+        // "Rescan (overwrites cache)" action so the user has a
+        // dismissable cue. Generic `Error` flows raise a plain Error
+        // toast.
+        match &result.status {
+            AppStatus::NewerCache { .. } => {
+                self.state.push_error_toast(
+                    "Cache created by newer Dedup version. Rescan?",
+                    None,
+                    Some(crate::toast::ToastAction {
+                        label: "Rescan (overwrites cache)".to_string(),
+                        action_name: ACTION_CACHE_RESCAN,
+                    }),
+                );
+            }
+            AppStatus::Error(msg) => {
+                // Heuristic corruption detection: the generic Error
+                // path already has a stringified error; if it looks
+                // like SQLite corruption we offer the destructive
+                // delete-and-rescan action. Otherwise a plain toast.
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("corrupt") || lower.contains("database disk image is malformed") {
+                    self.state.push_error_toast(
+                        "Cache is corrupted. Delete .dedup/ and rescan?",
+                        Some(msg.clone()),
+                        Some(crate::toast::ToastAction {
+                            label: "Delete .dedup/ and rescan".to_string(),
+                            action_name: ACTION_CACHE_DELETE_AND_RESCAN,
+                        }),
+                    );
+                } else {
+                    self.state
+                        .push_error_toast("Could not open cache", Some(msg.clone()), None);
+                }
+            }
+            _ => {}
+        }
         self.state.set_folder_result(result);
         if !is_error {
             self.state.push_recent(folder.to_path_buf());
@@ -158,6 +212,12 @@ impl ProjectView {
             return;
         };
         if entry.is_stale() {
+            // Issue #30 — promote the stale-entry surface from an
+            // inline banner to an Error toast carrying the "Remove
+            // from recents" action. The inline banner stays in place
+            // for now so the transition is low-risk; both surfaces
+            // point at the same handler via `RemoveStaleRecent`.
+            self.state.push_stale_recent_toast(&entry.path);
             self.state.surface_recent_banner(entry.path);
             cx.notify();
             return;
@@ -204,6 +264,191 @@ impl ProjectView {
     pub fn dismiss_editor_banner(&mut self, cx: &mut Context<Self>) {
         self.state.dismiss_editor_banner();
         cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #30 — toast dismissal, action routing, and modal handlers.
+    // -----------------------------------------------------------------
+
+    /// Dismiss a specific toast by id. Wired from each toast's `[×]`
+    /// close button.
+    pub fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.state.dismiss_toast(id);
+        cx.notify();
+    }
+
+    /// Dismiss the top (most recent) toast. Safety net in case the id
+    /// flow becomes unreachable.
+    pub fn dismiss_top_toast(&mut self, cx: &mut Context<Self>) {
+        if let Some(last) = self.state.toasts.toasts.last().cloned() {
+            self.state.dismiss_toast(last.id);
+            cx.notify();
+        }
+    }
+
+    /// Route a toast action by its `action_name` string key. Clicking
+    /// a toast button invokes this with the action's name; every
+    /// branch also dismisses the triggering toast so the user gets
+    /// immediate feedback regardless of whether the downstream handler
+    /// has a visible side-effect.
+    pub fn dispatch_toast_action(
+        &mut self,
+        action_name: &str,
+        toast_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        // Dismiss first — every action either opens a modal or kicks
+        // off a follow-up flow; leaving the toast up would be
+        // confusing.
+        self.state.dismiss_toast(toast_id);
+        match action_name {
+            ACTION_CACHE_DELETE_AND_RESCAN => self.delete_cache_and_rescan(cx),
+            ACTION_CACHE_RESCAN => self.rescan_current_folder(cx),
+            ACTION_REMOVE_STALE_RECENT => self.remove_stale_recent(cx),
+            ACTION_SHOW_ISSUES => {
+                self.state.open_scan_issues();
+            }
+            ACTION_CONFIG_FIX => self.startup_fix_config(cx),
+            ACTION_CONFIG_RESET => self.startup_reset_config(cx),
+            other => {
+                log::warn!("dedup-gui: unknown toast action {other}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// Open the post-scan issues dialog. Safe to call when the issue
+    /// list is empty — the state helper no-ops.
+    pub fn open_scan_issues(&mut self, cx: &mut Context<Self>) {
+        self.state.open_scan_issues();
+        cx.notify();
+    }
+
+    /// Close the post-scan issues dialog.
+    pub fn close_scan_issues(&mut self, cx: &mut Context<Self>) {
+        self.state.close_scan_issues();
+        cx.notify();
+    }
+
+    /// "Copy details" handler on the post-scan issues dialog. Writes
+    /// the GitHub-issue-ready markdown block to the clipboard.
+    pub fn copy_scan_issues(&mut self, cx: &mut Context<Self>) {
+        if self.state.scan_issues.is_empty() {
+            return;
+        }
+        let block = format_issues_clipboard(&self.state.scan_issues);
+        cx.write_to_clipboard(ClipboardItem::new_string(block));
+        // Brief Info toast so the user has feedback — the clipboard
+        // write is otherwise invisible.
+        self.state.push_info_toast("Copied issues to clipboard.");
+        cx.notify();
+    }
+
+    /// "Fix config" action on the startup-error modal. Opens the
+    /// offending config file in `$EDITOR` / `$VISUAL` / `vi`; the
+    /// modal stays up until the user dismisses it (they may still
+    /// need to restart the app to pick up changes).
+    pub fn startup_fix_config(&mut self, cx: &mut Context<Self>) {
+        let Some(se) = self.state.startup_error.clone() else {
+            return;
+        };
+        if let Some(parent) = se.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let editor = std::env::var("EDITOR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("VISUAL").ok().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| "vi".to_string());
+        match std::process::Command::new(&editor).arg(&se.path).spawn() {
+            Ok(_) => {
+                self.state.push_info_toast(format!(
+                    "Opened {} in {editor}. Restart dedup to reload.",
+                    se.path.display()
+                ));
+            }
+            Err(e) => {
+                self.state
+                    .push_error_toast(format!("Failed to launch {editor}: {e}"), None, None);
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Reset to defaults" action on the startup-error modal. Writes
+    /// an empty TOML (the defaults-only case) to the failing path,
+    /// retries `Config::load`, and clears the modal on success.
+    pub fn startup_reset_config(&mut self, cx: &mut Context<Self>) {
+        let Some(se) = self.state.startup_error.clone() else {
+            return;
+        };
+        if let Some(parent) = se.path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            self.state.push_error_toast(
+                format!("Failed to create {}: {e}", parent.display()),
+                None,
+                None,
+            );
+            cx.notify();
+            return;
+        }
+        // Empty file → `Config::load` falls back to baked-in defaults.
+        if let Err(e) = std::fs::write(&se.path, "") {
+            self.state.push_error_toast(
+                format!("Failed to reset {}: {e}", se.path.display()),
+                None,
+                None,
+            );
+            cx.notify();
+            return;
+        }
+        match Config::load(None) {
+            Ok(_) => {
+                self.state.clear_startup_error();
+                self.state.push_info_toast("Reset config to defaults.");
+            }
+            Err(err) => {
+                // Retry failed — update the modal with the new error.
+                self.state.set_startup_error(&err);
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Rescan (overwrites cache)" toast action. Starts a scan on the
+    /// currently-open folder. Equivalent to clicking the sidebar Scan
+    /// button; no-op when no folder is open or a scan is already in
+    /// flight.
+    pub fn rescan_current_folder(&mut self, cx: &mut Context<Self>) {
+        self.start_scan(cx);
+    }
+
+    /// "Delete .dedup/ and rescan" toast action. Removes the cache
+    /// directory entirely (so the next open/scan writes a fresh
+    /// schema) and re-triggers `apply_folder` on the current
+    /// directory. On failure a new Error toast surfaces the I/O
+    /// error; the folder is untouched.
+    pub fn delete_cache_and_rescan(&mut self, cx: &mut Context<Self>) {
+        let Some(folder) = self.state.current_folder.clone() else {
+            return;
+        };
+        let dedup_dir = folder.join(".dedup");
+        if dedup_dir.exists()
+            && let Err(e) = std::fs::remove_dir_all(&dedup_dir)
+        {
+            self.state.push_error_toast(
+                format!("Failed to delete {}: {e}", dedup_dir.display()),
+                None,
+                None,
+            );
+            cx.notify();
+            return;
+        }
+        // Re-open — this re-materialises the folder with a fresh
+        // cache and pushes any new toasts the open flow would normally
+        // produce (e.g. Empty state). The user can then click Scan.
+        self.apply_folder(&folder, cx);
     }
 
     /// Open the Preferences dialog overlay (issue #29, ⌘,). The
@@ -303,77 +548,26 @@ impl ProjectView {
         let worker_cancel = handles.cancel.clone();
         let worker_tx = tx.clone();
         thread::spawn(move || {
-            // Build a ScanConfig that matches the CLI's defaults: honour
-            // any `.dedup/config.toml` the user has in place, then pin the
-            // cache root so warm scans + persistence work.
-            let config = Config::load(Some(&worker_folder)).unwrap_or_default();
-            let mut scan_cfg = ScanConfig::from(&config);
-            scan_cfg.cache_root = Some(worker_folder.clone());
-            scan_cfg.cancel = Some(worker_cancel.clone());
-
-            // Wire the Tier A streaming callback to the GUI channel.
-            // The callback fires exactly once on the worker thread
-            // (after bucket-fill, before Tier B) and forwards the
-            // finalized Tier A set as `GroupView` rows ready for the
-            // sidebar's impact-sorted merge.
-            let stream_tx = worker_tx.clone();
-            let cb: TierAStreamCallback = std::sync::Arc::new(move |groups: &[MatchGroup]| {
-                let views: Vec<GroupView> = groups
-                    .iter()
-                    .enumerate()
-                    .map(|(i, g)| group_view_from_match(g, i))
-                    .collect();
-                // Best-effort — if the poll loop has already dropped
-                // the rx we just swallow the send.
-                let _ = stream_tx.send(ScanEvent::TierAStream(views));
-            });
-            scan_cfg.on_tier_a_groups = Some(cb);
-
-            let scanner = Scanner::new(scan_cfg);
-            let result = match scanner.scan_with_progress(&worker_folder, &worker_progress) {
-                Ok(r) => r,
-                Err(ScanError::Cancelled) => {
-                    log::info!("dedup-gui: scan cancelled for {}", worker_folder.display());
-                    let _ = worker_tx.send(ScanEvent::Cancelled);
-                    return;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "dedup-gui: scan failed for {}: {e}",
-                        worker_folder.display()
-                    );
-                    // Drop `tx`; the polling task sees a disconnected
-                    // channel and transitions state back to Idle. Richer
-                    // error UX lands in #30.
-                    return;
-                }
-            };
-
-            // Persist before signaling completion so the main thread's
-            // `load_folder` call sees fully-written cache rows. Best-
-            // effort: a cache write failure does not abort the scan —
-            // the user still gets an in-memory result but the sidebar
-            // will show the old contents. TODO(#30): surface this.
-            match Cache::open(&worker_folder) {
-                Ok(mut c) => {
-                    if let Err(e) = c.write_scan_result(&result) {
-                        log::warn!(
-                            "dedup-gui: failed to persist scan result for {}: {e}",
-                            worker_folder.display()
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "dedup-gui: failed to open cache for {}: {e}",
-                        worker_folder.display()
-                    );
-                }
+            // Issue #30 — wrap the entire worker body in `catch_unwind`
+            // so a panic inside the scanner (e.g. a tree-sitter grammar
+            // crash we didn't already contain in `scanner::run_tier_b`)
+            // surfaces as a toast rather than tearing down the process.
+            // The payload's message is extracted via `panic_message`
+            // (shared helper in `toast.rs`) and forwarded on the scan
+            // channel as `BackgroundPanic`, which the poll loop turns
+            // into an Error toast + state reset to Idle.
+            let panic_tx = worker_tx.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_scan_worker(&worker_folder, &worker_progress, &worker_cancel, &worker_tx);
+            }));
+            if let Err(payload) = result {
+                let msg = panic_message(&payload);
+                log::error!(
+                    "dedup-gui: scan worker panicked for {}: {msg}",
+                    worker_folder.display()
+                );
+                let _ = panic_tx.send(ScanEvent::BackgroundPanic(msg));
             }
-
-            // Send is best-effort — if the GUI already swapped the rx
-            // out (e.g. user closed the window) we drop the result.
-            let _ = worker_tx.send(ScanEvent::Completed(result));
         });
         drop(tx);
 
@@ -416,6 +610,37 @@ impl ProjectView {
                         }
                         ScanEvent::Cancelled => {
                             let _ = this.update(cx, |view, cx| {
+                                view.state.cancel_completed();
+                                cx.notify();
+                            });
+                            terminated = true;
+                            break;
+                        }
+                        ScanEvent::ScanFailed(msg) => {
+                            // Non-panic scanner failure → Error toast
+                            // + reset state to Idle so the Scan button
+                            // re-enables.
+                            let _ = this.update(cx, |view, cx| {
+                                view.state
+                                    .push_error_toast("Scan failed", Some(msg.clone()), None);
+                                view.state.cancel_completed();
+                                cx.notify();
+                            });
+                            terminated = true;
+                            break;
+                        }
+                        ScanEvent::BackgroundPanic(msg) => {
+                            // Background-thread panic → Error toast +
+                            // reset state to Idle so the app stays
+                            // alive (issue #30 AC: "Background-thread
+                            // panic surfaces as toast; app stays
+                            // alive").
+                            let _ = this.update(cx, |view, cx| {
+                                view.state.push_error_toast(
+                                    "Scan crashed (background panic)",
+                                    Some(msg.clone()),
+                                    None,
+                                );
                                 view.state.cancel_completed();
                                 cx.notify();
                             });
@@ -688,7 +913,14 @@ impl ProjectView {
             // already matches the AC ("No editor found — run dedup
             // config edit to pick one.") for `NoEditor`, and is
             // self-descriptive for the other variants.
-            self.state.surface_editor_banner(e.to_string());
+            //
+            // Issue #30 — also push a persistent Error toast. The
+            // inline banner stays for now (low-risk transition); both
+            // surfaces disappear when the user dismisses the toast or
+            // the banner.
+            let msg = e.to_string();
+            self.state.push_error_toast(msg.clone(), None, None);
+            self.state.surface_editor_banner(msg);
             cx.notify();
         }
     }
@@ -717,6 +949,102 @@ impl ProjectView {
         self.state.toggle_collapse(group_id);
         cx.notify();
     }
+}
+
+/// Body of the scan worker thread, extracted so the `catch_unwind`
+/// wrapper in [`ProjectView::start_scan`] has a single closure to
+/// guard. Drives the scanner, persists the result, and posts the
+/// terminal `ScanEvent` onto `tx`.
+///
+/// Any panic raised inside here is caught by the enclosing
+/// `catch_unwind`; deliberate scanner errors surface as
+/// `ScanEvent::ScanFailed` on the channel. Either way the poll loop
+/// in `start_scan` sees a terminator and returns state to Idle.
+fn run_scan_worker(
+    worker_folder: &Path,
+    worker_progress: &dedup_core::AtomicProgressSink,
+    worker_cancel: &Arc<std::sync::atomic::AtomicBool>,
+    worker_tx: &mpsc::Sender<ScanEvent>,
+) {
+    // Build a ScanConfig that matches the CLI's defaults: honour any
+    // `.dedup/config.toml` the user has in place, then pin the cache
+    // root so warm scans + persistence work.
+    let config = Config::load(Some(worker_folder)).unwrap_or_default();
+    let mut scan_cfg = ScanConfig::from(&config);
+    scan_cfg.cache_root = Some(worker_folder.to_path_buf());
+    scan_cfg.cancel = Some(worker_cancel.clone());
+
+    // Wire the Tier A streaming callback to the GUI channel. The
+    // callback fires exactly once on the worker thread (after bucket-
+    // fill, before Tier B) and forwards the finalized Tier A set as
+    // `GroupView` rows ready for the sidebar's impact-sorted merge.
+    let stream_tx = worker_tx.clone();
+    let cb: TierAStreamCallback = std::sync::Arc::new(move |groups: &[MatchGroup]| {
+        let views: Vec<GroupView> = groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| group_view_from_match(g, i))
+            .collect();
+        // Best-effort — if the poll loop has already dropped the rx
+        // we just swallow the send.
+        let _ = stream_tx.send(ScanEvent::TierAStream(views));
+    });
+    scan_cfg.on_tier_a_groups = Some(cb);
+
+    let scanner = Scanner::new(scan_cfg);
+    let result = match scanner.scan_with_progress(worker_folder, worker_progress) {
+        Ok(r) => r,
+        Err(ScanError::Cancelled) => {
+            log::info!("dedup-gui: scan cancelled for {}", worker_folder.display());
+            let _ = worker_tx.send(ScanEvent::Cancelled);
+            return;
+        }
+        Err(e) => {
+            // Issue #30 — forward a typed failure so the GUI can raise
+            // an Error toast. Previously the worker just dropped `tx`;
+            // the poll loop would notice the disconnect and quietly
+            // reset, which hid the error from the user.
+            let msg = format!("{e}");
+            log::warn!(
+                "dedup-gui: scan failed for {}: {msg}",
+                worker_folder.display()
+            );
+            let _ = worker_tx.send(ScanEvent::ScanFailed(msg));
+            return;
+        }
+    };
+
+    // Persist before signaling completion so the main thread's
+    // `load_folder` call sees fully-written cache rows. A cache write
+    // failure surfaces as `ScanFailed` (issue #30) instead of being
+    // silently logged; the scan still completes so the in-memory
+    // result is delivered alongside the error toast.
+    match Cache::open(worker_folder) {
+        Ok(mut c) => {
+            if let Err(e) = c.write_scan_result(&result) {
+                log::warn!(
+                    "dedup-gui: failed to persist scan result for {}: {e}",
+                    worker_folder.display()
+                );
+                let _ = worker_tx.send(ScanEvent::ScanFailed(format!(
+                    "Scan succeeded but cache write failed: {e}"
+                )));
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "dedup-gui: failed to open cache for {}: {e}",
+                worker_folder.display()
+            );
+            let _ = worker_tx.send(ScanEvent::ScanFailed(format!(
+                "Scan succeeded but cache open failed: {e}"
+            )));
+        }
+    }
+
+    // Send is best-effort — if the GUI already swapped the rx out
+    // (e.g. user closed the window) we drop the result.
+    let _ = worker_tx.send(ScanEvent::Completed(result));
 }
 
 /// Drain every currently-buffered [`ScanEvent`] off the channel. On
@@ -758,8 +1086,18 @@ fn apply_scan_result(view: &mut ProjectView, result: ScanResult, cx: &mut Contex
     };
     let file_count = result.files_scanned;
     let group_count = result.groups.len();
+    let issues = result.issues.clone();
 
     view.state.finish_scan(group_count, file_count, duration);
+    // Issue #30 — surface the completion banner as an Info toast
+    // alongside the in-place `ScanState::Completed` banner, plus an
+    // Info toast with "View issues" action when the scan recorded
+    // per-file issues. `set_scan_issues` feeds the dialog; the
+    // post-scan toast is the one-click entry point.
+    view.state
+        .push_info_toast(format_completion_banner(group_count, file_count, duration));
+    view.state.set_scan_issues(issues);
+    view.state.push_post_scan_issues_toast();
 
     // Reload the sidebar from the freshly-written cache so the GUI and
     // CLI show identical data. The in-memory `ScanResult` is still
@@ -975,6 +1313,85 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
             entity.update(cx, |view, cx| view.open_config_in_editor(cx));
         }
     });
+
+    // Issue #30 — toast / modal / background-panic action handlers.
+    // These are dispatched from inline buttons in the view layer; the
+    // global `on_action` registration mirrors how #28's banner actions
+    // are wired.
+    cx.on_action(|_: &crate::menubar::DismissTopToast, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.dismiss_top_toast(cx));
+        }
+    });
+    cx.on_action(|_: &crate::menubar::ShowScanIssues, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.open_scan_issues(cx));
+        }
+    });
+    cx.on_action(|_: &crate::menubar::CloseScanIssues, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.close_scan_issues(cx));
+        }
+    });
+    cx.on_action(|_: &crate::menubar::CopyScanIssues, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.copy_scan_issues(cx));
+        }
+    });
+    cx.on_action(|_: &crate::menubar::StartupFixConfig, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.startup_fix_config(cx));
+        }
+    });
+    cx.on_action(
+        |_: &crate::menubar::StartupResetConfig, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.startup_reset_config(cx));
+            }
+        },
+    );
+    cx.on_action(|_: &crate::menubar::RescanCache, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.rescan_current_folder(cx));
+        }
+    });
+    cx.on_action(
+        |_: &crate::menubar::DeleteCacheAndRescan, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.delete_cache_and_rescan(cx));
+            }
+        },
+    );
+}
+
+/// Spawn the 500ms toast auto-dismiss ticker.
+///
+/// Runs on the GPUI background executor; each wake-up calls
+/// [`crate::app_state::AppState::tick_toasts`] with the current
+/// [`Instant`] and requests a repaint if any toast was dropped. Kept
+/// as a standalone function so `run()` in `lib.rs` can kick it off
+/// without exposing the `Context` plumbing.
+pub fn start_toast_ticker(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
+    let weak = entity.downgrade();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            let now = Instant::now();
+            let r = weak.update(cx, |view, cx| {
+                let before = view.state.toasts.len();
+                view.state.tick_toasts(now);
+                if view.state.toasts.len() != before {
+                    cx.notify();
+                }
+            });
+            if r.is_err() {
+                return;
+            }
+        }
+    })
+    .detach();
 }
 
 /// Shared body for the five `OpenRecentN` action handlers. Pulled out
@@ -1035,6 +1452,16 @@ impl Render for ProjectView {
             None
         };
 
+        // Issue #30 — toast stack (top-right overlay), startup-error
+        // modal (full-screen scrim), post-scan issues dialog.
+        let toast_stack = render_toast_stack(&self.state.toasts.toasts);
+        let startup_modal = self.state.startup_error.as_ref().map(render_startup_modal);
+        let issues_dialog = if self.state.scan_issues_open {
+            Some(render_issues_dialog(&self.state.scan_issues))
+        } else {
+            None
+        };
+
         div()
             .size_full()
             .flex()
@@ -1046,6 +1473,9 @@ impl Render for ProjectView {
             .children(overlay)
             .child(body)
             .children(prefs)
+            .children(issues_dialog)
+            .children(startup_modal)
+            .child(toast_stack)
     }
 }
 
@@ -2529,6 +2959,353 @@ fn split_by_tints(run: std::ops::Range<usize>, spans: &[(usize, usize, u32)]) ->
         });
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Issue #30 — toast + modal + issues-dialog renderers.
+// ---------------------------------------------------------------------------
+
+/// Toast palette — values are deliberately hard-coded per the issue
+/// spec so the test lane can assert on them without re-reading the
+/// source palette.
+const TOAST_ERROR_BG: u32 = 0x4c1d1d;
+const TOAST_ERROR_BORDER: u32 = 0xdc2626;
+const TOAST_WARNING_BG: u32 = 0x422c0f;
+const TOAST_WARNING_BORDER: u32 = 0xf59e0b;
+const TOAST_INFO_BG: u32 = 0x1f2937;
+const TOAST_INFO_BORDER: u32 = 0x4b5563;
+
+/// Build the floating toast stack rendered in the top-right corner of
+/// the window. Returns an absolutely-positioned `Div` whose child list
+/// is one card per live toast. Empty stack still renders an empty
+/// overlay (cheap, avoids a render-tree branch).
+fn render_toast_stack(toasts: &[Toast]) -> gpui::Div {
+    let mut wrap = div()
+        .absolute()
+        .top(px(12.0))
+        .right(px(12.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0));
+    for toast in toasts {
+        wrap = wrap.child(render_toast_card(toast));
+    }
+    wrap
+}
+
+fn render_toast_card(toast: &Toast) -> gpui::Div {
+    let (bg, border) = match toast.kind {
+        ToastKind::Error => (TOAST_ERROR_BG, TOAST_ERROR_BORDER),
+        ToastKind::Warning => (TOAST_WARNING_BG, TOAST_WARNING_BORDER),
+        ToastKind::Info => (TOAST_INFO_BG, TOAST_INFO_BORDER),
+    };
+    let icon = match toast.kind {
+        ToastKind::Error => "\u{26A0}",   // ⚠
+        ToastKind::Warning => "\u{26A0}", // ⚠
+        ToastKind::Info => "\u{2139}",    // ℹ
+    };
+    let toast_id = toast.id;
+    let title = toast.title.clone();
+    let body = toast.body.clone();
+    let action = toast.action.clone();
+
+    let mut body_col = div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(div().text_size(px(13.0)).text_color(white()).child(title));
+    if let Some(b) = body {
+        body_col = body_col.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .child(b),
+        );
+    }
+    if let Some(a) = action {
+        let action_name = a.action_name;
+        let label = a.label.clone();
+        let id_key = format!("toast-action-{toast_id}");
+        body_col = body_col.child(
+            div()
+                .id(gpui::SharedString::from(id_key))
+                .mt(px(4.0))
+                .px(px(10.0))
+                .py(px(4.0))
+                .bg(rgb(border))
+                .text_color(white())
+                .text_size(px(12.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                    if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                        entity.update(cx, |view, cx| {
+                            view.dispatch_toast_action(action_name, toast_id, cx)
+                        });
+                    }
+                })
+                .child(label),
+        );
+    }
+
+    let close_id = format!("toast-close-{toast_id}");
+    div()
+        .w(px(340.0))
+        .bg(rgb(bg))
+        .border_1()
+        .border_color(rgb(border))
+        .rounded(px(6.0))
+        .p(px(10.0))
+        .flex()
+        .flex_row()
+        .gap(px(8.0))
+        .child(
+            div()
+                .w(px(20.0))
+                .text_size(px(14.0))
+                .text_color(rgb(border))
+                .child(icon.to_string()),
+        )
+        .child(div().flex_1().child(body_col))
+        .child(
+            div()
+                .id(gpui::SharedString::from(close_id))
+                .w(px(18.0))
+                .h(px(18.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(14.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .cursor_pointer()
+                .child("\u{00D7}")
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                    if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                        entity.update(cx, |view, cx| view.dismiss_toast(toast_id, cx));
+                    }
+                }),
+        )
+}
+
+/// Render the invalid-config startup modal (issue #30).
+///
+/// Full-screen scrim with a centered card carrying the error message
+/// and two buttons: `[Fix config]` (opens the file in `$EDITOR`) and
+/// `[Reset to defaults]` (overwrites with defaults-only TOML). Clicks
+/// on the scrim do *not* dismiss the modal — the user must pick one
+/// of the two actions so the app doesn't silently stay in the broken
+/// state.
+fn render_startup_modal(err: &StartupError) -> gpui::Div {
+    let message = err.message.clone();
+    let path = err.path.display().to_string();
+    div()
+        .absolute()
+        .inset_0()
+        .bg(rgb(0x000000cc))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .id("startup-error-dialog")
+                .w(px(520.0))
+                .bg(rgb(0x24242a))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(TOAST_ERROR_BORDER))
+                .p(px(20.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                // Eat card clicks so they don't punch through.
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .text_color(white())
+                        .child("Invalid configuration"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(ROW_TEXT_DIM))
+                        .child(format!("File: {path}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(ROW_TEXT))
+                        .child(message),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .justify_end()
+                        .child(
+                            div()
+                                .id("startup-reset")
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .bg(rgb(ACCENT_DIM))
+                                .text_color(white())
+                                .text_size(px(12.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::menubar::StartupResetConfig),
+                                        cx,
+                                    );
+                                })
+                                .child("Reset to defaults"),
+                        )
+                        .child(
+                            div()
+                                .id("startup-fix")
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .bg(rgb(ACCENT))
+                                .text_color(white())
+                                .text_size(px(12.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::menubar::StartupFixConfig),
+                                        cx,
+                                    );
+                                })
+                                .child("Fix config"),
+                        ),
+                ),
+        )
+}
+
+/// Render the post-scan issues dialog (issue #30).
+///
+/// Scrim + centered card with a scrollable list of per-file issues
+/// and a `[Copy details]` button that writes the GitHub-issue-ready
+/// markdown block to the clipboard. Scrim click closes the dialog.
+fn render_issues_dialog(issues: &[FileIssue]) -> gpui::Div {
+    // Height-constrained column. GPUI at the pinned Zed revision
+    // doesn't expose an `overflow_y_scroll()` shorthand on `Div`
+    // directly; clipping long issue lists is acceptable for this
+    // milestone — the clipboard "Copy details" action carries the
+    // full block regardless of what's visible on-screen.
+    let mut list = div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .h(px(320.0))
+        .overflow_hidden();
+    for issue in issues {
+        let kind = match issue.kind {
+            dedup_core::FileIssueKind::ReadError => "ReadError",
+            dedup_core::FileIssueKind::Utf8 => "Utf8",
+            dedup_core::FileIssueKind::TierBParse => "TierBParse",
+            dedup_core::FileIssueKind::TierBPanic => "TierBPanic",
+        };
+        let path = issue.path.display().to_string();
+        let msg = issue.message.clone();
+        list = list.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(8.0))
+                .py(px(2.0))
+                .child(
+                    div()
+                        .w(px(120.0))
+                        .text_size(px(11.0))
+                        .text_color(rgb(TOAST_ERROR_BORDER))
+                        .child(kind),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(11.0))
+                        .text_color(rgb(ROW_TEXT))
+                        .child(format!("{path}: {msg}")),
+                ),
+        );
+    }
+
+    div()
+        .absolute()
+        .inset_0()
+        .bg(rgb(0x000000aa))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.dispatch_action(Box::new(crate::menubar::CloseScanIssues), cx);
+        })
+        .child(
+            div()
+                .id("issues-dialog")
+                .w(px(640.0))
+                .bg(rgb(0x24242a))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(0x3b3b48))
+                .p(px(20.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .text_color(white())
+                        .child(format!("{} files had issues", issues.len())),
+                )
+                .child(list)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(8.0))
+                        .justify_end()
+                        .child(
+                            div()
+                                .id("issues-close")
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .bg(rgb(ACCENT_DIM))
+                                .text_color(white())
+                                .text_size(px(12.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::menubar::CloseScanIssues),
+                                        cx,
+                                    );
+                                })
+                                .child("Close"),
+                        )
+                        .child(
+                            div()
+                                .id("issues-copy")
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .bg(rgb(ACCENT))
+                                .text_color(white())
+                                .text_size(px(12.0))
+                                .rounded(px(4.0))
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(crate::menubar::CopyScanIssues),
+                                        cx,
+                                    );
+                                })
+                                .child("Copy details"),
+                        ),
+                ),
+        )
 }
 
 #[cfg(test)]

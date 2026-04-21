@@ -129,6 +129,33 @@ actions!(
         OpenConfigInEditor,
         /// Close the Preferences dialog without saving (issue #29).
         ClosePreferences,
+        /// Issue #30 — dismiss the top-most toast via the global
+        /// "Escape" shortcut (only fires when a toast is showing; the
+        /// handler is a no-op otherwise). Individual `[×]` clicks
+        /// dispatch with a synthesized id via the view layer, so no
+        /// action value is needed here for those.
+        DismissTopToast,
+        /// Issue #30 — open the post-scan issues dialog from the
+        /// sidebar's "N files had issues" link.
+        ShowScanIssues,
+        /// Issue #30 — close the post-scan issues dialog.
+        CloseScanIssues,
+        /// Issue #30 — "Copy details" button on the post-scan issues
+        /// dialog. Writes the GitHub-issue-ready markdown block to the
+        /// clipboard.
+        CopyScanIssues,
+        /// Issue #30 — "Fix config" button on the startup-error modal.
+        /// Opens the failing config file in `$EDITOR` so the user can
+        /// correct it.
+        StartupFixConfig,
+        /// Issue #30 — "Reset to defaults" button on the startup-error
+        /// modal. Overwrites the failing config with a defaults-only
+        /// TOML and retries the load.
+        StartupResetConfig,
+        /// Issue #30 — "Rescan (overwrites cache)" toast action.
+        RescanCache,
+        /// Issue #30 — "Delete .dedup/ and rescan" toast action.
+        DeleteCacheAndRescan,
     ]
 );
 

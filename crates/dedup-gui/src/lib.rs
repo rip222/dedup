@@ -28,16 +28,22 @@ pub mod menubar;
 pub mod project_view;
 pub mod recent;
 pub mod tint;
+pub mod toast;
 
 pub use app_state::{
     AppState, AppStatus, EditorBanner, FolderLoadResult, GroupView, OccurrenceView, Pane,
-    RecentBanner, ScanHandles, ScanState, SortKey, SummaryCounts, SuppressionView, filter_groups,
-    format_completion_banner, format_elapsed, group_label, group_view_from_match, impact_key,
-    language_from_path, launch_editor, load_folder, open_in_editor, sort_groups, summary,
+    RecentBanner, ScanHandles, ScanState, SortKey, StartupError, SummaryCounts, SuppressionView,
+    filter_groups, format_completion_banner, format_elapsed, group_label, group_view_from_match,
+    impact_key, language_from_path, launch_editor, load_folder, open_in_editor, sort_groups,
+    summary,
 };
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};
 pub use recent::{MAX_RECENTS, RecentProject, RecentProjects, config_dir, recent_file_path};
+pub use toast::{
+    CacheErrorClass, Toast, ToastAction, ToastKind, ToastStack, classify_cache_error,
+    format_issues_clipboard, panic_message,
+};
 
 use gpui::{App, AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
@@ -46,7 +52,20 @@ use gpui_platform::application;
 ///
 /// Blocks until the app terminates (e.g. user picks Dedup → Quit).
 pub fn run() {
-    application().run(|cx: &mut App| {
+    // Issue #30 — attempt to load the global config before we enter
+    // the runloop. A malformed `config.toml` must not crash the GUI;
+    // instead we carry the error into the window as a [`StartupError`]
+    // and render an inline "Fix config / Reset to defaults" modal. The
+    // folder-level layer is loaded per-open, so the check here only
+    // exercises the global path. We convert to [`StartupError`] eagerly
+    // because `ConfigError` is not `Clone` — the struct form is plain
+    // data that the move-closure below can capture trivially.
+    let startup_error = dedup_core::Config::load(None)
+        .err()
+        .as_ref()
+        .map(StartupError::from_config_error);
+
+    application().run(move |cx: &mut App| {
         // Hydrate the Open Recent MRU from disk once at startup — the
         // menubar renders off this initial snapshot, and subsequent
         // mutations call `menubar::rebuild_menus` (see `project_view`).
@@ -57,6 +76,7 @@ pub fn run() {
         menubar::install(cx, &initial_recents.entries);
 
         let bounds = Bounds::centered(None, size(px(960.0), px(600.0)), cx);
+        let startup_err = startup_error.clone();
         let window = cx
             .open_window(
                 WindowOptions {
@@ -72,6 +92,9 @@ pub fn run() {
                     cx.new(|_| {
                         let mut view = ProjectView::new();
                         view.state.recent_projects = initial_recents.clone();
+                        if let Some(err) = startup_err.clone() {
+                            view.state.startup_error = Some(err);
+                        }
                         view
                     })
                 },
@@ -82,7 +105,12 @@ pub fn run() {
         // exists — the handler needs to reach back into this view when
         // the `NSOpenPanel` returns. See `register_root`.
         if let Ok(entity) = window.entity(cx) {
-            register_root(entity, cx);
+            register_root(entity.clone(), cx);
+            // Kick off the toast auto-dismiss ticker — a 500ms timer
+            // that drops expired warning/info toasts. Launched here
+            // (after `register_root`) so the root handle is already
+            // installed for the first tick.
+            project_view::start_toast_ticker(entity, cx);
         }
 
         // Bring the app (and its menubar) to the foreground.

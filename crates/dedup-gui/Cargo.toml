@@ -48,6 +48,10 @@ path = "src/lib.rs"
 dedup-core = { path = "../dedup-core" }
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "da25b914c25f17ba457abc8cf75b8e42d0b899e2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "da25b914c25f17ba457abc8cf75b8e42d0b899e2", features = ["font-kit"] }
+# Issue #30 — main-thread panic postmortems. Same version pin as the
+# CLI (`dedup-cli/Cargo.toml`) so both binaries emit the same metadata
+# block pointing at `~/.config/dedup/logs/`.
+human-panic = "2"
 log = "0.4"
 # `rfd` is the standard Rust file-dialog crate; on macOS it wraps
 # `NSOpenPanel`. Default features pull in xdg-portal / wayland for Linux,
