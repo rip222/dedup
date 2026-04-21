@@ -41,3 +41,36 @@ jobs:
         run: cargo test --workspace
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  gui-smoke-test:
+    name: dedup-gui smoke test (macos-latest)
+    runs-on: macos-latest
+    needs: build-test-clippy
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Two-layer smoke test for issue #19:
+      #
+      #   1. `cargo test -p dedup-gui` runs the in-crate unit tests that
+      #      assert on the menubar structure + shortcut coverage. These
+      #      are pure-data tests — they don't construct GPUI's `App` and
+      #      so can run off the test-harness threads. They still prove
+      #      the whole GPUI dep tree links cleanly because `cargo test`
+      #      has to compile the lib crate + linkage-check the action
+      #      types the menus embed.
+      #
+      #   2. `cargo run -p dedup-gui -- --smoke-test` runs the binary
+      #      through its hidden `--smoke-test` flag, exercising
+      #      `main` → `smoke_test` on the **main** thread. This is the
+      #      end-to-end "GPUI initialises on macOS CI" assertion (no
+      #      window is opened; the process exits 0). GPUI requires `App`
+      #      construction on the main thread, so this can't be a
+      #      `#[test]` — running the binary is the standard workaround.
+      #
+      # Neither step needs a display server; both are valid on
+      # `macos-latest` runners. See PRD §Testing → "GUI app | Smoke" row.
+      - name: cargo test -p dedup-gui (structural checks)
+        run: cargo test -p dedup-gui
+      - name: cargo run -p dedup-gui -- --smoke-test (main-thread init)
+        run: cargo run -p dedup-gui -- --smoke-test

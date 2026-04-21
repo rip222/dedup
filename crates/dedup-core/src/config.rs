@@ -346,7 +346,18 @@ fn check_schema_version(path: &Path, found: Option<u32>) -> Result<(), ConfigErr
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// Serializes tests that mutate `HOME` / `XDG_CONFIG_HOME`. Cargo
+    /// runs tests within a single binary in parallel by default, so
+    /// without this mutex two tests can race the process-global env
+    /// vars (e.g. `global_path_prefers_xdg_config_home_when_set` setting
+    /// `XDG_CONFIG_HOME` while
+    /// `global_path_falls_back_to_home_dot_config_without_xdg` expects
+    /// it cleared). Matches the pattern used in
+    /// `crates/dedup-gui/tests/logging_smoke.rs` (issue #16).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn write_project(root: &Path, body: &str) {
         let dir = root.join(PROJECT_CONFIG_DIR);
@@ -522,9 +533,13 @@ include_submodules = true
     fn global_path_prefers_xdg_config_home_when_set() {
         let home = tempdir().unwrap();
         let xdg = tempdir().unwrap();
+        // Hold the env lock for the whole mutation + read so
+        // concurrent tests can't flip `XDG_CONFIG_HOME` underneath us.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: test-only env mutation; restored below.
+        // SAFETY: test-only env mutation; restored below, and serialized
+        // by ENV_LOCK against other env-touching tests in this module.
         unsafe {
             std::env::set_var("HOME", home.path());
             std::env::set_var("XDG_CONFIG_HOME", xdg.path());
@@ -581,23 +596,28 @@ min_lines = 7
     /// Execute `f` with `$HOME` set to `home` and `$XDG_CONFIG_HOME`
     /// cleared so [`Config::global_path`] resolves to
     /// `<home>/.config/dedup/config.toml` regardless of the developer's
-    /// real environment. Restores the environment after.
+    /// or CI runner's real environment (GitHub's ubuntu-latest sets
+    /// `XDG_CONFIG_HOME`, which would otherwise poison the HOME fallback
+    /// test). Restores the environment after.
     ///
-    /// Tests in this module are single-threaded within the module by
-    /// convention (no explicit `#[serial]`) — these env mutations are
-    /// the reason, and the Rust test harness runs integration tests in
-    /// separate processes, so the global bleed risk is minimal. If this
-    /// ever bites, move to the `serial_test` crate.
+    /// Holds [`ENV_LOCK`] for the duration of `f` so concurrent tests
+    /// in this module (notably
+    /// `global_path_prefers_xdg_config_home_when_set`) can't race our
+    /// mutations of the process-global env.
     fn with_test_home<F, R>(home: &Path, f: F) -> R
     where
         F: FnOnce() -> R,
     {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         // Force `dirs` to treat our tempdir as HOME and clear XDG so the
-        // fallback path `<home>/.config/` applies uniformly.
-        // SAFETY: test-only env mutation; the harness serializes tests
-        // that depend on env indirectly by restoring state at scope exit.
+        // fallback path `<home>/.config/` applies uniformly. The test
+        // must remove XDG explicitly — CI runners (ubuntu-latest) set
+        // `XDG_CONFIG_HOME` by default, which would otherwise override
+        // the HOME-fallback path the caller is asserting against.
+        // SAFETY: test-only env mutation; serialized by ENV_LOCK and
+        // restored at scope exit.
         unsafe {
             std::env::set_var("HOME", home);
             std::env::remove_var("XDG_CONFIG_HOME");
@@ -608,8 +628,9 @@ min_lines = 7
                 Some(v) => std::env::set_var("HOME", v),
                 None => std::env::remove_var("HOME"),
             }
-            if let Some(v) = prev_xdg {
-                std::env::set_var("XDG_CONFIG_HOME", v);
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
         out
