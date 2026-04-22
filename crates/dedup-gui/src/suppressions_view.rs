@@ -217,6 +217,8 @@ pub fn render_dismissed_row(s: &SuppressionView, selected: bool) -> gpui::Div {
     let click_id = s.last_group_id;
     let restore_hash = s.hash;
     let label = s.label();
+    let tier = s.tier;
+    let badge_key = s.hash;
     let row_bg = if selected { rgb(0x3b3b48) } else { rgb(0x0) };
 
     let label_cell = div()
@@ -241,6 +243,9 @@ pub fn render_dismissed_row(s: &SuppressionView, selected: bool) -> gpui::Div {
             }
         })
         .child(label_cell)
+        .child(crate::project_view::render_tier_badge(
+            tier, "dismissed", badge_key,
+        ))
         .child(restore_button(restore_hash));
     if selected {
         row = row.bg(row_bg);
@@ -273,6 +278,7 @@ mod tests {
             dismissed_at: 1_704_067_200,
             occurrences: Vec::new(),
             occurrence_dismissals: Vec::new(),
+            tier: dedup_core::Tier::A,
         };
         assert_eq!(banner_headline(&s), "Dismissed on 2024-01-01");
     }

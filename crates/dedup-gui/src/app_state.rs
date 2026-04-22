@@ -191,6 +191,13 @@ pub struct SuppressionView {
     /// populated at folder-load time; restores mutate this list
     /// in place.
     pub occurrence_dismissals: Vec<OccurrenceDismissal>,
+    /// Tier the underlying group was detected at (#61). Drives the
+    /// sidebar A/B badge on dismissed rows so the visual parity with
+    /// live rows holds. Falls back to `Tier::A` when the cache row
+    /// backing the dismissed hash can no longer be resolved — the
+    /// badge is a hint, not ground truth, and Tier A is the safer
+    /// default (it doesn't imply alpha-rename behaviour).
+    pub tier: Tier,
 }
 
 /// One per-occurrence dismissal still tied to a dismissed group (#54).
@@ -1694,6 +1701,7 @@ impl AppState {
             dismissed_at: now,
             occurrences: group.occurrences.clone(),
             occurrence_dismissals: Vec::new(),
+            tier: group.tier,
         });
         self.reclamp_selection();
         Some((hash, group.id))
@@ -1804,6 +1812,7 @@ impl AppState {
             dismissed_at: now,
             occurrences: group.occurrences.clone(),
             occurrence_dismissals: Vec::new(),
+            tier: group.tier,
         });
         self.selected_occurrence_indices.remove(&group_id);
         self.collapsed_occurrences
@@ -2408,7 +2417,7 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
     // only *hide* dismissed groups from the active list, we never
     // delete them). This lets the detail pane render the dismissed
     // group's actual code body rather than a stub.
-    let mut occurrences_by_hash: std::collections::HashMap<u64, (i64, Vec<OccurrenceView>)> =
+    let mut occurrences_by_hash: std::collections::HashMap<u64, (i64, Tier, Vec<OccurrenceView>)> =
         std::collections::HashMap::new();
     let all_summaries = cache.list_groups().unwrap_or_default();
     for summary in all_summaries {
@@ -2441,17 +2450,17 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
                     .collect(),
             })
             .collect();
-        occurrences_by_hash.insert(h, (detail.id, occs));
+        occurrences_by_hash.insert(h, (detail.id, detail.tier, occs));
     }
 
     let dismissed: Vec<SuppressionView> = match cache.list_suppressions() {
         Ok(s) => s
             .into_iter()
             .map(|sup| {
-                let (live_id, occurrences) = occurrences_by_hash
+                let (live_id, tier, occurrences) = occurrences_by_hash
                     .remove(&sup.hash)
-                    .map(|(id, occs)| (Some(id), occs))
-                    .unwrap_or((None, Vec::new()));
+                    .map(|(id, tier, occs)| (Some(id), tier, occs))
+                    .unwrap_or((None, Tier::A, Vec::new()));
                 let occurrence_dismissals =
                     occ_dismissals_by_hash.remove(&sup.hash).unwrap_or_default();
                 SuppressionView {
@@ -2465,6 +2474,7 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
                     dismissed_at: sup.dismissed_at,
                     occurrences,
                     occurrence_dismissals,
+                    tier,
                 }
             })
             .collect(),
@@ -2711,6 +2721,7 @@ mod tests {
             dismissed_at: 0,
             occurrences: Vec::new(),
             occurrence_dismissals: Vec::new(),
+            tier: Tier::A,
         };
         assert_eq!(s.label(), "Dismissed block (hash abcdef012345\u{2026})");
     }

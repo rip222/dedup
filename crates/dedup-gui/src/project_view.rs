@@ -76,6 +76,19 @@ const PROGRESS_BAR_FG: u32 = 0x3b82f6;
 /// the existing `bg_color` tint.
 const DIFF_UNDERLINE: u32 = 0xd97706;
 
+/// Tier A badge background (#61). Muted blue to read as "byte-level
+/// match" — reuses the same hue family as `ACCENT` but a shade darker
+/// so the pill doesn't compete with the row-selection highlight
+/// (`ROW_SELECTED_BG`).
+const TIER_A_BADGE_BG: u32 = 0x1e40af;
+/// Tier B badge background (#61). Amber matches the "different"
+/// signalling already used by `DIFF_UNDERLINE` — Tier B groups are
+/// the ones where locals may have been alpha-renamed across
+/// occurrences, so they warrant closer review.
+const TIER_B_BADGE_BG: u32 = 0xb45309;
+/// Badge label colour. White against both pill backgrounds.
+const TIER_BADGE_TEXT: u32 = 0xffffff;
+
 /// Events the scan worker thread sends back to the GUI poll loop.
 ///
 /// `TierAStream` may arrive once per scan (the single final-membership
@@ -2773,23 +2786,73 @@ fn render_section_header(title: &'static str, count: usize) -> gpui::Div {
         .child(format!("{title} ({count})"))
 }
 
+/// Short human tooltip copy for a tier badge (#61). Public so the
+/// sidebar row, the dismissed row, and unit tests all pin the same
+/// wording.
+pub fn tier_badge_tooltip(tier: Tier) -> &'static str {
+    match tier {
+        Tier::A => "Tier A \u{2014} byte-level match",
+        Tier::B => "Tier B \u{2014} AST match, alpha-renamed locals may differ",
+    }
+}
+
+/// Glyph rendered inside the badge pill.
+pub fn tier_badge_label(tier: Tier) -> &'static str {
+    match tier {
+        Tier::A => "A",
+        Tier::B => "B",
+    }
+}
+
+/// Render one A/B tier badge (#61) used at the right edge of both live
+/// sidebar rows and dismissed-section rows. The pill's `id` is
+/// `tier-badge-<scope>-<key>` so two instances in the same frame
+/// don't collide in GPUI's hover-state registry; `scope` is `"group"`
+/// for live rows and `"dismissed"` for the dismissed section.
+///
+/// Returned as `Stateful<Div>` so `with_tooltip` can layer the hover
+/// copy on top — `Stateful` is the bound that trait requires.
+pub fn render_tier_badge(tier: Tier, scope: &str, key: u64) -> gpui::Stateful<gpui::Div> {
+    let bg = match tier {
+        Tier::A => TIER_A_BADGE_BG,
+        Tier::B => TIER_B_BADGE_BG,
+    };
+    let pill = div()
+        .id(gpui::ElementId::Name(
+            format!("tier-badge-{scope}-{key:016x}").into(),
+        ))
+        .px(px(6.0))
+        .py(px(1.0))
+        .bg(rgb(bg))
+        .rounded(px(3.0))
+        .text_size(px(10.0))
+        .text_color(rgb(TIER_BADGE_TEXT))
+        .child(tier_badge_label(tier));
+    with_tooltip(pill, tier_badge_tooltip(tier))
+}
+
 fn render_group_row(group: &GroupView, selected: bool) -> gpui::Div {
     let id = group.id;
     let label = group.label.clone();
+    let tier = group.tier;
+    let badge_key = group.group_hash.unwrap_or(id as u64);
     // Fixed row height required by `uniform_list` — it measures the
     // first row and reuses that height for every row in the list
     // (#44). Center the label vertically inside the fixed frame so the
     // visual weight matches the prior `py(px(4.0))` layout.
+    let label_cell = div().flex_1().child(label);
     let row = div()
         .h(px(GROUP_ROW_HEIGHT))
         .px(px(16.0))
         .flex()
         .flex_row()
         .items_center()
+        .gap(px(8.0))
         .text_size(px(12.0))
         .text_color(rgb(ROW_TEXT))
         .cursor_pointer()
-        .child(label)
+        .child(label_cell)
+        .child(render_tier_badge(tier, "group", badge_key))
         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
             // Route through the root handle so any other listeners
             // (future: toolbar, keyboard focus) see the same update.
