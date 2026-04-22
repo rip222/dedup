@@ -757,6 +757,32 @@ pub struct AppState {
     /// field — kept here so the renderer can flip state without
     /// round-tripping through disk on every chevron click.
     pub sparkline_collapsed: std::collections::HashMap<String, bool>,
+    /// Issue #65 — set of group hashes the user has "reviewed" in this
+    /// session. A group counts as reviewed when it's been dismissed
+    /// (whole-group or per-occurrence) or when the sidebar selection
+    /// has rested on it at least once (j/k/click/enter). Drives the
+    /// "N of M reviewed" status line and the triage-progress counter.
+    ///
+    /// Keyed by `group_hash` (not `group_id`) so a cache reload
+    /// preserves the reviewed set across the same session — ids get
+    /// re-minted per load, hashes are stable.
+    pub reviewed_hashes: std::collections::HashSet<u64>,
+    /// Issue #65 — LIFO stack of per-session dismissals so the `u`
+    /// shortcut can pop the most recent one. Pushed by
+    /// [`Self::dismiss_current_group`] / [`Self::dismiss_group`] /
+    /// [`Self::dismiss_occurrence`] (the GPUI wrappers run after the
+    /// pure-data helpers return, so a failed dismissal never enters
+    /// the stack). Drained by [`Self::undismiss_last`].
+    ///
+    /// One-deep isn't mandated by the AC but a small `Vec` gives us
+    /// multi-level undo for free and matches the `pending_undos` toast
+    /// queue's spirit.
+    pub last_dismissed_stack: Vec<UndoKind>,
+    /// Issue #65 — whether the `?` cheat-sheet modal is open. Toggled
+    /// by the `ToggleCheatSheet` action; cleared by
+    /// [`Self::close_cheat_sheet`] (also bound to `Esc` + click-outside
+    /// via the modal's scrim).
+    pub cheat_sheet_open: bool,
 }
 
 /// What to restore when the user clicks `[Undo]` on a dismiss toast
@@ -820,6 +846,9 @@ impl Default for AppState {
             selected_gone_hash: None,
             sparkline_severities: Vec::new(),
             sparkline_collapsed: std::collections::HashMap::new(),
+            reviewed_hashes: std::collections::HashSet::new(),
+            last_dismissed_stack: Vec::new(),
+            cheat_sheet_open: false,
         }
     }
 }
@@ -1919,6 +1948,85 @@ impl AppState {
     /// Move the sidebar cursor forward. Clamps at the bottom of the
     /// list (no wraparound — matches the issue-text choice). Updates
     /// `selected_group` so the detail pane follows.
+    /// Issue #65 — mark the currently-selected group as reviewed.
+    /// Called whenever the user's selection rests on a group via
+    /// j/k/enter/click: the group's hash joins `reviewed_hashes` so
+    /// the "N of M reviewed" counter advances. A no-op when the
+    /// selection is empty or the group lacks a stable hash (streaming
+    /// rows).
+    pub fn mark_selection_reviewed(&mut self) {
+        let Some(id) = self.selected_group else {
+            return;
+        };
+        if let Some(hash) = self
+            .groups
+            .iter()
+            .find(|g| g.id == id)
+            .and_then(|g| g.group_hash)
+        {
+            self.reviewed_hashes.insert(hash);
+        }
+    }
+
+    /// Issue #65 — count of distinct groups in the current project
+    /// that have been reviewed (selected or dismissed) at least once
+    /// this session. Includes dismissed rows (they count as reviewed).
+    /// Hashes that no longer appear in either active or dismissed
+    /// lists (e.g. after a fresh scan discards the group) are excluded
+    /// so the ratio stays meaningful.
+    pub fn reviewed_count(&self) -> usize {
+        let active_hashes: std::collections::HashSet<u64> = self
+            .groups
+            .iter()
+            .filter_map(|g| g.group_hash)
+            .collect();
+        let dismissed_hashes: std::collections::HashSet<u64> =
+            self.dismissed.iter().map(|s| s.hash).collect();
+        self.reviewed_hashes
+            .iter()
+            .filter(|h| active_hashes.contains(h) || dismissed_hashes.contains(h))
+            .count()
+    }
+
+    /// Issue #65 — total groups eligible to be reviewed — distinct
+    /// `group_hash` values across `self.groups` + `self.dismissed`.
+    /// Streaming rows (no hash) are excluded so the ratio can't
+    /// silently drift during a live scan. De-duping by hash keeps the
+    /// denominator stable across a dismiss (the same group appears in
+    /// both lists until a fresh cache reload).
+    pub fn total_reviewable_count(&self) -> usize {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for g in &self.groups {
+            if let Some(h) = g.group_hash {
+                seen.insert(h);
+            }
+        }
+        for s in &self.dismissed {
+            seen.insert(s.hash);
+        }
+        seen.len()
+    }
+
+    /// Issue #65 — pop the most recently dismissed item (group or
+    /// occurrence) off [`Self::last_dismissed_stack`] so the GPUI
+    /// layer can replay it through the matching `restore_*` helper
+    /// and roll the dismissal back in the cache. Returns `None` when
+    /// the stack is empty.
+    pub fn pop_last_dismissed(&mut self) -> Option<UndoKind> {
+        self.last_dismissed_stack.pop()
+    }
+
+    /// Issue #65 — toggle the cheat-sheet modal open / closed.
+    pub fn toggle_cheat_sheet(&mut self) {
+        self.cheat_sheet_open = !self.cheat_sheet_open;
+    }
+
+    /// Issue #65 — force the cheat-sheet modal closed (Esc /
+    /// click-outside).
+    pub fn close_cheat_sheet(&mut self) {
+        self.cheat_sheet_open = false;
+    }
+
     pub fn next_group(&mut self) {
         let visible = self.visible_groups();
         if visible.is_empty() {
@@ -1933,6 +2041,9 @@ impl AppState {
         };
         self.selected_group_idx = Some(next_idx);
         self.selected_group = visible.get(next_idx).map(|g| g.id);
+        // Issue #65 — a group the cursor has rested on counts as
+        // reviewed.
+        self.mark_selection_reviewed();
     }
 
     /// Move the sidebar cursor backward. Clamps at the top.
@@ -1950,11 +2061,14 @@ impl AppState {
         };
         self.selected_group_idx = Some(prev_idx);
         self.selected_group = visible.get(prev_idx).map(|g| g.id);
+        self.mark_selection_reviewed();
     }
 
     /// `Enter` handler — focus the detail pane without moving the cursor.
     pub fn activate_group(&mut self) {
         self.focused_pane = Pane::Detail;
+        // Issue #65 — activating the current row counts as reviewing it.
+        self.mark_selection_reviewed();
     }
 
     /// `x` handler — dismiss the currently-selected group locally.
@@ -1982,6 +2096,10 @@ impl AppState {
             occurrence_dismissals: Vec::new(),
             tier: group.tier,
         });
+        // Issue #65 — record on the triage stack for `u` + reviewed set.
+        self.last_dismissed_stack
+            .push(UndoKind::Group { hash });
+        self.reviewed_hashes.insert(hash);
         self.reclamp_selection();
         Some((hash, group.id))
     }
@@ -2099,6 +2217,10 @@ impl AppState {
         if self.selected_group == Some(group_id) {
             self.selected_group = None;
         }
+        // Issue #65 — triage-stack + reviewed bookkeeping.
+        self.last_dismissed_stack
+            .push(UndoKind::Group { hash });
+        self.reviewed_hashes.insert(hash);
         self.reclamp_selection();
         Some((hash, group.id))
     }
@@ -2129,6 +2251,14 @@ impl AppState {
         let occ = visible.get(occ_idx)?.clone();
         self.session_occurrence_dismissed
             .insert((hash, occ.path.clone()));
+        // Issue #65 — triage stack + reviewed bookkeeping. A group with
+        // any occurrence dismissed has been "touched" by the user, so
+        // it counts as reviewed.
+        self.last_dismissed_stack.push(UndoKind::Occurrence {
+            hash,
+            path: occ.path.clone(),
+        });
+        self.reviewed_hashes.insert(hash);
         // Remove that index from the selection set and shift any
         // higher indices down — indices are into the *post-dismiss*
         // visible list, so a dismiss at index k means all indices > k
@@ -5141,5 +5271,101 @@ mod tests {
         };
         let out = s.apply_history_filter(vec![g.clone()]);
         assert_eq!(out.len(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #65 — keyboard triage mode + cheat sheet.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn next_group_marks_landed_row_as_reviewed() {
+        let mut s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "a", vec![occ("a.rs", 1, 2)], Some(0x1)),
+            mkgroup(2, Tier::A, "b", vec![occ("b.rs", 1, 2)], Some(0x2)),
+        ]);
+        s.set_sort_key(SortKey::Alphabetical);
+        // Default selection is the first row, so `0x1` gets marked on
+        // the initial landing.
+        s.mark_selection_reviewed();
+        assert_eq!(s.reviewed_count(), 1);
+        // Advancing records the second row's hash.
+        s.next_group();
+        assert_eq!(s.reviewed_count(), 2);
+        // Going back a row doesn't uncount — the ratio is monotonic.
+        s.prev_group();
+        assert_eq!(s.reviewed_count(), 2);
+    }
+
+    #[test]
+    fn dismiss_current_group_pushes_onto_last_dismissed_stack() {
+        let mut s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "a", vec![occ("a.rs", 1, 2)], Some(0xAA)),
+            mkgroup(2, Tier::A, "b", vec![occ("b.rs", 1, 2)], Some(0xBB)),
+        ]);
+        s.set_sort_key(SortKey::Alphabetical);
+        let _ = s.dismiss_current_group();
+        assert_eq!(
+            s.last_dismissed_stack.last().cloned(),
+            Some(UndoKind::Group { hash: 0xAA })
+        );
+        // Reviewed bookkeeping also records the dismissed row.
+        assert!(s.reviewed_hashes.contains(&0xAA));
+    }
+
+    #[test]
+    fn pop_last_dismissed_returns_lifo_order() {
+        let mut s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "a", vec![occ("a.rs", 1, 2)], Some(0xAA)),
+            mkgroup(2, Tier::A, "b", vec![occ("b.rs", 1, 2)], Some(0xBB)),
+        ]);
+        s.set_sort_key(SortKey::Alphabetical);
+        let _ = s.dismiss_current_group(); // 0xAA
+        // After first dismiss, selection clamps to remaining row (0xBB).
+        let _ = s.dismiss_current_group(); // 0xBB
+        assert_eq!(
+            s.pop_last_dismissed(),
+            Some(UndoKind::Group { hash: 0xBB })
+        );
+        assert_eq!(
+            s.pop_last_dismissed(),
+            Some(UndoKind::Group { hash: 0xAA })
+        );
+        assert_eq!(s.pop_last_dismissed(), None);
+    }
+
+    #[test]
+    fn dismiss_occurrence_records_occurrence_level_undo() {
+        let mut s = loaded_with_multi_occ();
+        let _ = s.dismiss_occurrence(1, 0);
+        let top = s.last_dismissed_stack.last().cloned();
+        assert!(matches!(
+            top,
+            Some(UndoKind::Occurrence { hash: 0xAA, .. })
+        ));
+    }
+
+    #[test]
+    fn total_reviewable_counts_active_plus_dismissed_with_hash() {
+        let mut s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "a", vec![occ("a.rs", 1, 2)], Some(0x1)),
+            mkgroup(2, Tier::A, "b", vec![occ("b.rs", 1, 2)], Some(0x2)),
+            // Streaming row with no hash — excluded from the denominator.
+            mkgroup(3, Tier::A, "c", vec![occ("c.rs", 1, 2)], None),
+        ]);
+        assert_eq!(s.total_reviewable_count(), 2);
+        s.set_sort_key(SortKey::Alphabetical);
+        let _ = s.dismiss_current_group();
+        // Dismissed row stays in the denominator.
+        assert_eq!(s.total_reviewable_count(), 2);
+    }
+
+    #[test]
+    fn toggle_cheat_sheet_flips_flag() {
+        let mut s = AppState::new();
+        assert!(!s.cheat_sheet_open);
+        s.toggle_cheat_sheet();
+        assert!(s.cheat_sheet_open);
+        s.close_cheat_sheet();
+        assert!(!s.cheat_sheet_open);
     }
 }

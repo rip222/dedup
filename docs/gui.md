@@ -157,16 +157,43 @@ text inputs elsewhere.
 | `x` | Dismiss the currently-selected group |
 | `o` | Open the selected group's checked files in the editor |
 
+### Triage mode (issue #65)
+
+Full keyboard-first triage shortcuts for rapidly walking the group
+list. Every binding carries a `!SearchInput` context predicate so
+plain letter keys route to the search input when it owns focus.
+
+| Shortcut | Action |
+|---|---|
+| `d` | Dismiss the currently-selected group (mirrors `x`) |
+| `u` | Undismiss the most recently dismissed group or occurrence |
+| `c` | Copy the selected group as an LLM prompt (mirrors the toolbar "Copy as LLM prompt" button) |
+| `e` | Launch the editor for every occurrence of the selected group |
+| `?` (shift-/) | Toggle the keyboard cheat-sheet modal |
+
+A small **"N of M reviewed"** status strip at the bottom of the
+sidebar tracks triage progress. A group counts as reviewed once the
+user has either dismissed it (whole-group or any occurrence) or
+rested the sidebar cursor on it at least once this session. The
+ratio is over the union of active and dismissed groups that carry
+a stable hash.
+
+The cheat-sheet modal (opened via `?`) lists every shortcut and is
+dismissable with Esc or a click on the full-window scrim. The modal
+is the single source of truth alongside this file — if the two
+drift, open a bug against `crates/dedup-gui/src/project_view.rs`'s
+`CHEAT_SHEET_ROWS` constant.
+
 ### Detail-pane toolbar
 
 Not keybound globally — surfaced via mouse/touch through the toolbar
 chrome. Includes "Collapse all" / "Expand all" buttons (issue #27).
 
-### Toast overlay
+### Toast overlay / Esc
 
 | Shortcut | Action |
 |---|---|
-| Esc | Dismiss the top-most toast (no-op if none) |
+| Esc | Close the cheat-sheet modal (no-op when it isn't open; the search input consumes Esc itself to blur) |
 
 ## Tooltips on icon buttons
 

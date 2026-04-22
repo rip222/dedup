@@ -156,6 +156,22 @@ actions!(
         RescanCache,
         /// Issue #30 — "Delete .dedup/ and rescan" toast action.
         DeleteCacheAndRescan,
+        /// Issue #65 — `u` undismiss the most-recently-dismissed item
+        /// (group or occurrence). Pops from the per-session last-
+        /// dismissed stack on [`crate::app_state::AppState`].
+        UndismissLast,
+        /// Issue #65 — `c` copy the currently-selected group as an LLM
+        /// prompt. Shortcut equivalent of the toolbar's "Copy as LLM
+        /// prompt" button (#57).
+        CopyAsLlmPrompt,
+        /// Issue #65 — `e` launch the editor for every occurrence in
+        /// the currently-selected group. Shortcut equivalent of the
+        /// toolbar's "Open in editor" button (#29).
+        OpenAllOccurrencesInEditor,
+        /// Issue #65 — `?` open/toggle the keyboard cheat-sheet modal.
+        ToggleCheatSheet,
+        /// Issue #65 — close the cheat-sheet modal (Esc / click-outside).
+        CloseCheatSheet,
     ]
 );
 
@@ -274,6 +290,26 @@ fn register_keybindings(cx: &mut App) {
             "OpenSelectedInEditor" => {
                 KeyBinding::new(keystroke, OpenSelectedInEditor, Some("!SearchInput"))
             }
+            // Issue #65 — triage-mode shortcuts. All gated on
+            // `!SearchInput` so the keys stay usable inside the live
+            // search input.
+            "UndismissLast" => {
+                KeyBinding::new(keystroke, UndismissLast, Some("!SearchInput"))
+            }
+            "CopyAsLlmPrompt" => {
+                KeyBinding::new(keystroke, CopyAsLlmPrompt, Some("!SearchInput"))
+            }
+            "OpenAllOccurrencesInEditor" => KeyBinding::new(
+                keystroke,
+                OpenAllOccurrencesInEditor,
+                Some("!SearchInput"),
+            ),
+            "ToggleCheatSheet" => {
+                KeyBinding::new(keystroke, ToggleCheatSheet, Some("!SearchInput"))
+            }
+            "CloseCheatSheet" => {
+                KeyBinding::new(keystroke, CloseCheatSheet, Some("!SearchInput"))
+            }
             other => unreachable!("unmapped shortcut action {other}"),
         }
     }));
@@ -311,6 +347,22 @@ pub(crate) const SHORTCUTS: &[(&str, &str)] = &[
     ("enter", "ActivateGroup"),
     ("x", "DismissCurrentGroup"),
     ("o", "OpenSelectedInEditor"),
+    // Issue #65 — keyboard triage shortcuts. `d` mirrors the `x`
+    // dismiss binding (common vim-style triage muscle memory) — both
+    // routes dispatch `DismissCurrentGroup`. `u` undoes the most
+    // recently dismissed group / occurrence. `c` / `e` drive the
+    // per-group clipboard + editor actions. `?` (shift-/) opens the
+    // cheat-sheet modal.
+    ("d", "DismissCurrentGroup"),
+    ("u", "UndismissLast"),
+    ("c", "CopyAsLlmPrompt"),
+    ("e", "OpenAllOccurrencesInEditor"),
+    ("shift-/", "ToggleCheatSheet"),
+    // Esc closes the cheat-sheet modal. The action handler is a no-op
+    // when the modal isn't open so stray Esc presses don't mis-fire,
+    // and the `!SearchInput` predicate keeps the search input's own
+    // Esc-to-blur behaviour intact.
+    ("escape", "CloseCheatSheet"),
 ];
 
 /// Build the NSMenu menu tree.

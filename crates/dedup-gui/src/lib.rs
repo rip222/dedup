@@ -206,6 +206,8 @@ mod tests {
             "cmd-,", "cmd-o", "cmd-w", "cmd-r", "cmd-.", "cmd-b", "cmd-1", "cmd-2",
             // Issue #23 acceptance criteria — search + keyboard nav.
             "cmd-f", "j", "k", "up", "down", "enter", "x", "o",
+            // Issue #65 acceptance criteria — keyboard triage mode.
+            "d", "u", "c", "e", "shift-/", "escape",
         ] {
             assert!(
                 present.contains(required),
@@ -340,5 +342,77 @@ mod tests {
              GPUI's dispatch path is empty and no shortcut fires \
              (issue #42)"
         );
+    }
+
+    /// Issue #65 — regression guard for the triage-mode shortcut set
+    /// and cheat-sheet modal plumbing. All assertions are pure-data
+    /// so the test runs in the normal `cargo test` lane without
+    /// standing up a GPUI runtime.
+    #[test]
+    fn triage_mode_shortcuts_and_cheatsheet_are_wired() {
+        let menubar_src = include_str!("menubar.rs");
+        // Every AC-mandated shortcut must route to a concrete action
+        // in the keybinding match. Anchoring on the action name is
+        // more robust than parsing the SHORTCUTS tuple table.
+        for action in [
+            "UndismissLast",
+            "CopyAsLlmPrompt",
+            "OpenAllOccurrencesInEditor",
+            "ToggleCheatSheet",
+            "CloseCheatSheet",
+        ] {
+            let needle = format!("\"{action}\"");
+            assert!(
+                menubar_src.contains(&needle),
+                "menubar.rs SHORTCUTS / register_keybindings must \
+                 mention {action} (issue #65)"
+            );
+        }
+
+        let pv_src = include_str!("project_view.rs");
+        // Every action needs a `cx.on_action` handler — otherwise the
+        // keystroke fires into the void.
+        for handler in [
+            "|_: &UndismissLast,",
+            "|_: &CopyAsLlmPrompt,",
+            "|_: &OpenAllOccurrencesInEditor,",
+            "|_: &ToggleCheatSheet,",
+            "|_: &CloseCheatSheet,",
+        ] {
+            assert!(
+                pv_src.contains(handler),
+                "project_view.rs register_root must install \
+                 cx.on_action for {handler} (issue #65)"
+            );
+        }
+        // The cheat-sheet modal + status strip must be wired in
+        // render. Both are tiny text assertions so a future rename
+        // breaks the build loudly.
+        assert!(
+            pv_src.contains("CHEAT_SHEET_ROWS"),
+            "project_view.rs must expose CHEAT_SHEET_ROWS as the \
+             source of truth for the cheat-sheet modal (issue #65)"
+        );
+        assert!(
+            pv_src.contains("render_cheat_sheet()"),
+            "project_view.rs must call render_cheat_sheet() when \
+             cheat_sheet_open is true (issue #65)"
+        );
+        assert!(
+            pv_src.contains("render_triage_status_strip"),
+            "project_view.rs must render the triage-progress status \
+             strip in the sidebar (issue #65)"
+        );
+
+        // `docs/gui.md` keeps the single source of truth for the
+        // shortcut list and must mention every AC shortcut.
+        let docs_src = include_str!("../../../docs/gui.md");
+        for row in ["`u`", "`c`", "`e`", "`?`", "N of M reviewed"] {
+            assert!(
+                docs_src.contains(row),
+                "docs/gui.md must document `{row}` in the keyboard \
+                 section (issue #65)"
+            );
+        }
     }
 }

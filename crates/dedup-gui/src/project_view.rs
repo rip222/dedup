@@ -38,11 +38,12 @@ use crate::detail_rows::{
     DetailRow, DetailRowsCache, LineSegment, compute_cache_key,
 };
 use crate::menubar::{
-    ActivateGroup, ClearRecents, ClosePreferences, CollapseAll, DismissCurrentGroup,
-    DismissEditorBanner, DismissRecentBanner, ExpandAll, FindInSidebar, FocusDetail, FocusSidebar,
-    NextGroup, OpenConfigInEditor, OpenFolder, OpenRecent0, OpenRecent1, OpenRecent2, OpenRecent3,
+    ActivateGroup, ClearRecents, CloseCheatSheet, ClosePreferences, CollapseAll,
+    CopyAsLlmPrompt, DismissCurrentGroup, DismissEditorBanner, DismissRecentBanner, ExpandAll,
+    FindInSidebar, FocusDetail, FocusSidebar, NextGroup, OpenAllOccurrencesInEditor,
+    OpenConfigInEditor, OpenFolder, OpenRecent0, OpenRecent1, OpenRecent2, OpenRecent3,
     OpenRecent4, OpenSelectedInEditor, Preferences, PrevGroup, RemoveStaleRecent, StartScan,
-    StopScan, ToggleSidebar,
+    StopScan, ToggleCheatSheet, ToggleSidebar, UndismissLast,
 };
 use crate::toast::{
     ACTION_CACHE_DELETE_AND_RESCAN, ACTION_CACHE_RESCAN, ACTION_CONFIG_FIX, ACTION_CONFIG_RESET,
@@ -595,6 +596,12 @@ impl ProjectView {
         if is_dismissed {
             self.state.focused_pane = Pane::Detail;
         }
+        // Issue #65 — clicking a row is a "review" signal even when
+        // the user never fires j/k/enter. Dismissed rows already have
+        // their hash in `reviewed_hashes` via the dismissal path, but
+        // calling through is cheap and keeps the invariant "anything
+        // the user ever selected is reviewed" in one place.
+        self.state.mark_selection_reviewed();
         cx.notify();
     }
 
@@ -905,6 +912,71 @@ impl ProjectView {
             .map(|o| (o.path.clone(), o.start_line.max(1) as u32))
             .collect();
         self.launch_editor_with_banner(&targets, cx);
+    }
+
+    /// Issue #65 — `u` handler: pop the most recently dismissed item
+    /// off the triage stack and restore it via the matching
+    /// `restore_*_click` helper (the same ones the undo-toast
+    /// dispatcher uses). No-op when the stack is empty.
+    ///
+    /// Does not gate on `focused_pane` — the AC calls `u` out as a
+    /// global triage shortcut and the search input already short-
+    /// circuits it via the `!SearchInput` context predicate.
+    pub fn undismiss_last(&mut self, cx: &mut Context<Self>) {
+        let Some(kind) = self.state.pop_last_dismissed() else {
+            return;
+        };
+        match kind {
+            UndoKind::Group { hash } => self.restore_group_click(hash, cx),
+            UndoKind::Occurrence { hash, path } => {
+                self.restore_occurrence_click(hash, path, cx)
+            }
+        }
+    }
+
+    /// Issue #65 — `c` handler: copy the currently-selected group as
+    /// an LLM prompt. Delegates to the existing
+    /// [`Self::copy_group_as_llm_prompt`] flow so the clipboard
+    /// payload matches the toolbar button (#57) byte-for-byte.
+    pub fn copy_current_group_as_llm_prompt(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(gid) = self.state.selected_group else {
+            return;
+        };
+        self.copy_group_as_llm_prompt(gid, window, cx);
+    }
+
+    /// Issue #65 — `e` handler: launch the editor for every
+    /// occurrence of the currently-selected group. Unlike the `o`
+    /// shortcut this ignores the sidebar-focused gate so the user can
+    /// fire it while the detail pane owns focus too (matches the AC
+    /// "launches configured editor with every occurrence's file +
+    /// line").
+    pub fn open_all_occurrences(&mut self, cx: &mut Context<Self>) {
+        let occurrences = self.state.selected_occurrences();
+        if occurrences.is_empty() {
+            return;
+        }
+        let targets: Vec<(PathBuf, u32)> = occurrences
+            .iter()
+            .map(|o| (o.path.clone(), o.start_line.max(1) as u32))
+            .collect();
+        self.launch_editor_with_banner(&targets, cx);
+    }
+
+    /// Issue #65 — `?` handler: toggle the cheat-sheet modal.
+    pub fn toggle_cheat_sheet(&mut self, cx: &mut Context<Self>) {
+        self.state.toggle_cheat_sheet();
+        cx.notify();
+    }
+
+    /// Issue #65 — close the cheat-sheet modal (scrim click / Esc).
+    pub fn close_cheat_sheet(&mut self, cx: &mut Context<Self>) {
+        self.state.close_cheat_sheet();
+        cx.notify();
     }
 
     /// Update the sidebar search query. Invoked from the search input's
@@ -1766,6 +1838,77 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
         }
     });
 
+    // Issue #65 — keyboard triage shortcuts. `u` / `e` are wired at
+    // app scope because neither handler needs a `&mut Window`. `c`
+    // wants clipboard access (no window needed either — `&mut App`
+    // suffices via `ClipboardItem::new_string`).
+    cx.on_action(|_: &UndismissLast, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.undismiss_last(cx));
+        }
+    });
+    cx.on_action(|_: &OpenAllOccurrencesInEditor, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.open_all_occurrences(cx));
+        }
+    });
+    // `CopyAsLlmPrompt` / `ToggleCheatSheet` / `CloseCheatSheet` are
+    // pure view-state mutations — none of them need a `&mut Window`,
+    // so wiring them at app scope is the simpler route (same pattern
+    // as `DismissCurrentGroup` etc.).
+    cx.on_action(|_: &CopyAsLlmPrompt, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| {
+                let Some(gid) = view.state.selected_group else {
+                    return;
+                };
+                // The wrapper's `_window` arg is unused — we synthesise
+                // a dummy via `&mut Window` is impossible here, so we
+                // inline the body. Matches the toolbar-button flow in
+                // `copy_group_as_llm_prompt`.
+                let group_opt = view
+                    .state
+                    .groups
+                    .iter()
+                    .find(|g| g.id == gid)
+                    .cloned();
+                let Some(group) = group_opt else {
+                    return;
+                };
+                let occurrences = view.state.visible_occurrences_of(&group);
+                if occurrences.is_empty() {
+                    return;
+                }
+                let sources: Vec<Option<String>> = occurrences
+                    .iter()
+                    .map(|o| read_occurrence_source(&view.state, o).map(|(s, _)| s))
+                    .collect();
+                if !crate::llm_prompt::all_sources_available(&sources) {
+                    view.state.push_warning_toast(
+                        "Some source files are unavailable — prompt not copied.",
+                    );
+                    cx.notify();
+                    return;
+                }
+                let prompt =
+                    crate::llm_prompt::llm_prompt(&group, &occurrences, &sources);
+                cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+                view.state.push_info_toast("Copied LLM prompt to clipboard.");
+                cx.notify();
+            });
+        }
+    });
+    cx.on_action(|_: &ToggleCheatSheet, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.toggle_cheat_sheet(cx));
+        }
+    });
+    cx.on_action(|_: &CloseCheatSheet, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.close_cheat_sheet(cx));
+        }
+    });
+
     // Issue #27 — toolbar "Collapse all" / "Expand all" actions. These
     // also have keyboard-shortcut potential but the issue only asks
     // for button wiring; the keybinding table stays unchanged.
@@ -2011,6 +2154,14 @@ impl Render for ProjectView {
             None
         };
 
+        // Issue #65 — cheat-sheet modal. Layered above every popup /
+        // toast so the user's explicit `?` request always wins.
+        let cheat_sheet = if self.state.cheat_sheet_open {
+            Some(render_cheat_sheet())
+        } else {
+            None
+        };
+
         div()
             .track_focus(&root_focus)
             .key_context("ProjectView")
@@ -2053,6 +2204,7 @@ impl Render for ProjectView {
             .children(prefs)
             .children(issues_dialog)
             .children(startup_modal)
+            .children(cheat_sheet)
             .child(toast_stack)
     }
 }
@@ -2745,6 +2897,32 @@ fn render_sidebar(
         .child(render_dismissed_section(state))
         // Issue #62 — "Resolved since baseline" section below dismissed.
         .child(render_history_gone_section(state))
+        // Issue #65 — triage-progress status strip at the sidebar
+        // bottom. Always rendered (even at 0/0) so the footer height
+        // doesn't jump when the first group is reviewed.
+        .child(render_triage_status_strip(state))
+}
+
+/// Issue #65 — small "N of M reviewed" footer strip at the bottom of
+/// the sidebar. "Reviewed" counts distinct groups touched by the user
+/// via selection or dismissal this session (see
+/// [`AppState::reviewed_count`]). Visual weight is intentionally
+/// low — dim text on the existing sidebar background — so it reads
+/// as a progress indicator, not a toolbar.
+fn render_triage_status_strip(state: &AppState) -> gpui::Div {
+    let reviewed = state.reviewed_count();
+    let total = state.total_reviewable_count();
+    let label = format!("{reviewed} of {total} reviewed");
+    div()
+        .w_full()
+        .px(px(12.0))
+        .py(px(6.0))
+        .border_t_1()
+        .border_color(black())
+        .bg(rgb(SIDEBAR_BG))
+        .text_size(px(11.0))
+        .text_color(rgb(ROW_TEXT_DIM))
+        .child(label)
 }
 
 /// Wrap a `uniform_list` of sidebar group rows in a `flex_1` container
@@ -5053,6 +5231,114 @@ fn render_toast_card(toast: &Toast) -> gpui::Div {
 /// on the scrim do *not* dismiss the modal — the user must pick one
 /// of the two actions so the app doesn't silently stay in the broken
 /// state.
+/// Issue #65 — keyboard cheat-sheet shortcut table.
+///
+/// Kept as `pub(crate) const` so the regression tests can assert every
+/// shortcut listed in the AC round-trips through this table. The
+/// ordering mirrors the `## Keyboard shortcuts` section of
+/// `docs/gui.md`; keeping both in sync is the docs side of the AC.
+pub(crate) const CHEAT_SHEET_ROWS: &[(&str, &str)] = &[
+    ("j / \u{2193}", "Next group"),
+    ("k / \u{2191}", "Previous group"),
+    ("Enter", "Activate — focus detail pane"),
+    ("d / x", "Dismiss current group"),
+    ("u", "Undismiss most recent"),
+    ("c", "Copy group as LLM prompt"),
+    ("e / o", "Open all occurrences in editor"),
+    ("?", "Toggle this cheat sheet"),
+    ("\u{2318}F", "Find in sidebar"),
+    ("\u{2318}B", "Toggle sidebar"),
+    ("\u{2318}1 / \u{2318}2", "Focus sidebar / detail"),
+    ("\u{2318}R / \u{2318}.", "Start / Stop scan"),
+    ("Esc", "Close modal / dismiss top toast"),
+];
+
+/// Render the `?` cheat-sheet modal (issue #65).
+///
+/// Same scrim + card pattern as [`render_startup_modal`]. Scrim click
+/// dispatches [`CloseCheatSheet`]; the card eats click events so
+/// hits inside don't punch through. Esc routes through the Dismiss-
+/// Top-Toast / FindInSidebar chain: the cheat sheet explicitly wires
+/// a window-level keybinding-less dismissal by surfacing a `[Close]`
+/// button on the card plus the scrim click. Esc coverage is provided
+/// by the cheat-sheet scrim's on_mouse_down (user intent equivalent)
+/// plus the app-scope `CloseCheatSheet` action the card's button
+/// dispatches.
+fn render_cheat_sheet() -> gpui::Div {
+    let mut rows = div().flex().flex_col().gap(px(4.0));
+    for (key, desc) in CHEAT_SHEET_ROWS {
+        rows = rows.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(12.0))
+                .py(px(2.0))
+                .child(
+                    div()
+                        .w(px(140.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(ROW_TEXT))
+                        .child((*key).to_string()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(12.0))
+                        .text_color(rgb(ROW_TEXT_DIM))
+                        .child((*desc).to_string()),
+                ),
+        );
+    }
+    div()
+        .absolute()
+        .inset_0()
+        .bg(rgb(0x000000cc))
+        .flex()
+        .items_center()
+        .justify_center()
+        // Click-outside → dismiss. Dispatches the same action the
+        // `[Close]` button fires so both routes land on
+        // `ProjectView::close_cheat_sheet`.
+        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+            window.dispatch_action(Box::new(CloseCheatSheet), cx);
+        })
+        .child(
+            div()
+                .id("cheat-sheet-card")
+                .w(px(480.0))
+                .bg(rgb(0x24242a))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(rgb(0x3b3b48))
+                .p(px(20.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .text_color(white())
+                        .child("Keyboard shortcuts"),
+                )
+                .child(rows)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .child(toast_action_button(
+                            "cheat-sheet-close",
+                            ACCENT,
+                            12.0,
+                            6.0,
+                            "Close",
+                            CloseCheatSheet,
+                        )),
+                ),
+        )
+}
+
 fn render_startup_modal(err: &StartupError) -> gpui::Div {
     let message = err.message.clone();
     let path = err.path.display().to_string();
