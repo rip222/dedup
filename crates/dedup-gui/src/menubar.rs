@@ -211,11 +211,10 @@ fn register_handlers(cx: &mut App) {
     // Firing the action before `register_root` runs (or with no scan in
     // flight) is a safe no-op.
     stub(cx, "Clear Cache…", |_: &ClearCache, _: &mut App| {});
-    stub(
-        cx,
-        "Toggle Sidebar (⌘B) — #23",
-        |_: &ToggleSidebar, _: &mut App| {},
-    );
+    // `ToggleSidebar` is no longer a stub — `crate::project_view::register_root`
+    // wires it to the real sidebar-visibility toggle (issue #52) once
+    // the root view is created. Firing the action before `register_root`
+    // runs is a safe no-op.
     // `FocusSidebar`, `FocusDetail`, `FindInSidebar`, and the five
     // sidebar keyboard-nav actions are no longer stubs — they are wired
     // by `crate::project_view::register_root` once the root view is

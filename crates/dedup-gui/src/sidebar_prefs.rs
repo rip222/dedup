@@ -50,6 +50,13 @@ pub struct SidebarPrefs {
     /// `sidebar_width = 2.0` still renders a usable sidebar.
     #[serde(default = "default_width")]
     pub sidebar_width: f32,
+    /// Whether the sidebar is hidden (issue #52). Toggled by ⌘B / the
+    /// View → Toggle Sidebar menu item. Persists next to
+    /// `sidebar_width` so visibility survives across window close and
+    /// reopen. Defaults to `false` (visible) so a fresh install sees
+    /// the sidebar.
+    #[serde(default)]
+    pub sidebar_hidden: bool,
 }
 
 fn default_width() -> f32 {
@@ -60,6 +67,7 @@ impl Default for SidebarPrefs {
     fn default() -> Self {
         Self {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sidebar_hidden: false,
         }
     }
 }
@@ -228,6 +236,7 @@ mod tests {
         let path = dir.path().join("sidebar.json");
         let prefs = SidebarPrefs {
             sidebar_width: 412.0,
+            sidebar_hidden: false,
         };
         prefs.save_to_path(&path).unwrap();
         let loaded = SidebarPrefs::load_from_path(&path);
@@ -250,12 +259,45 @@ mod tests {
 
         let prefs = SidebarPrefs {
             sidebar_width: 500.0,
+            sidebar_hidden: false,
         };
         prefs.save_to_path(&path).unwrap();
 
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("500"));
         assert!(!dir.path().join("sidebar.json.tmp").exists());
+    }
+
+    // Issue #52 — sidebar-hidden persistence.
+    #[test]
+    fn default_sidebar_hidden_is_false() {
+        assert!(!SidebarPrefs::default().sidebar_hidden);
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_preserves_hidden_flag() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.json");
+        let prefs = SidebarPrefs {
+            sidebar_width: 320.0,
+            sidebar_hidden: true,
+        };
+        prefs.save_to_path(&path).unwrap();
+        let loaded = SidebarPrefs::load_from_path(&path);
+        assert!(loaded.sidebar_hidden);
+    }
+
+    #[test]
+    fn legacy_file_without_hidden_defaults_to_visible() {
+        // Pre-#52 sidebar.json only stored sidebar_width. `#[serde(default)]`
+        // must let us read it back as sidebar_hidden=false instead of
+        // erroring + snapping the whole struct to defaults.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.json");
+        fs::write(&path, r#"{"sidebar_width": 400.0}"#).unwrap();
+        let prefs = SidebarPrefs::load_from_path(&path);
+        assert_eq!(prefs.sidebar_width, 400.0);
+        assert!(!prefs.sidebar_hidden);
     }
 
     #[test]

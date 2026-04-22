@@ -421,6 +421,12 @@ pub struct AppState {
     /// loaded at startup (see [`crate::lib`]) and written on drag end
     /// via [`AppState::persist_sidebar_prefs`].
     pub sidebar_width: f32,
+    /// Whether the sidebar is hidden (issue #52). Toggled by ⌘B / the
+    /// View → Toggle Sidebar menu item via
+    /// [`AppState::toggle_sidebar_visible`]. Persists alongside
+    /// `sidebar_width` in `sidebar.json` so visibility survives across
+    /// window close and reopen.
+    pub sidebar_hidden: bool,
     /// Cached detail-pane rows (issue #49). Populated on the first
     /// `render_detail` call after the state mutates; invalidated when
     /// the cache-key fingerprint changes (group selection, per-
@@ -465,6 +471,7 @@ impl Default for AppState {
             scan_issues: Vec::new(),
             scan_issues_open: false,
             sidebar_width: crate::sidebar_prefs::DEFAULT_SIDEBAR_WIDTH,
+            sidebar_hidden: false,
             detail_rows_cache: RefCell::new(None),
         }
     }
@@ -1100,13 +1107,23 @@ impl AppState {
         self.sidebar_width = crate::sidebar_prefs::clamp_width(width);
     }
 
-    /// Persist the current `sidebar_width` to `sidebar.json`. Called on
-    /// drag end (mouse up) so the value survives restarts. Errors are
-    /// swallowed with a `debug!` line — persistence is a hint, not a
-    /// requirement for the session.
+    /// Flip `sidebar_hidden` (issue #52). ⌘B / View → Toggle Sidebar
+    /// route here through [`crate::project_view::ProjectView::toggle_sidebar`].
+    /// Callers should follow up with [`Self::persist_sidebar_prefs`]
+    /// so the new visibility survives a restart.
+    pub fn toggle_sidebar_visible(&mut self) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+    }
+
+    /// Persist the current `sidebar_width` + `sidebar_hidden` to
+    /// `sidebar.json`. Called on splitter drag end (mouse up) and on
+    /// ⌘B toggle so the value survives restarts. Errors are swallowed
+    /// with a `debug!` line — persistence is a hint, not a requirement
+    /// for the session.
     pub fn persist_sidebar_prefs(&self) {
         let prefs = crate::sidebar_prefs::SidebarPrefs {
             sidebar_width: self.sidebar_width,
+            sidebar_hidden: self.sidebar_hidden,
         };
         if let Err(e) = prefs.save_to_disk() {
             tracing::debug!(
@@ -2102,6 +2119,22 @@ mod tests {
     fn default_sidebar_width_matches_preset() {
         let s = AppState::new();
         assert_eq!(s.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+    }
+
+    // Issue #52 — sidebar visibility toggle.
+    #[test]
+    fn default_sidebar_is_visible() {
+        let s = AppState::new();
+        assert!(!s.sidebar_hidden);
+    }
+
+    #[test]
+    fn toggle_sidebar_visible_flips_flag() {
+        let mut s = AppState::new();
+        s.toggle_sidebar_visible();
+        assert!(s.sidebar_hidden);
+        s.toggle_sidebar_visible();
+        assert!(!s.sidebar_hidden);
     }
 
     fn occ(path: &str, s: i64, e: i64) -> OccurrenceView {

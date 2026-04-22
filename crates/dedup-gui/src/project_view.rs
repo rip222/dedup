@@ -41,7 +41,7 @@ use crate::menubar::{
     DismissEditorBanner, DismissRecentBanner, ExpandAll, FindInSidebar, FocusDetail, FocusSidebar,
     NextGroup, OpenConfigInEditor, OpenFolder, OpenRecent0, OpenRecent1, OpenRecent2, OpenRecent3,
     OpenRecent4, OpenSelectedInEditor, Preferences, PrevGroup, RemoveStaleRecent, StartScan,
-    StopScan,
+    StopScan, ToggleSidebar,
 };
 use crate::toast::{
     ACTION_CACHE_DELETE_AND_RESCAN, ACTION_CACHE_RESCAN, ACTION_CONFIG_FIX, ACTION_CONFIG_RESET,
@@ -1013,6 +1013,16 @@ impl ProjectView {
         cx.notify();
     }
 
+    /// ⌘B / View → Toggle Sidebar handler (issue #52). Flips
+    /// [`AppState::sidebar_hidden`] then persists the new value to
+    /// `sidebar.json` so visibility survives across window close +
+    /// reopen (same scope as the resizable-sidebar width pref).
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.state.toggle_sidebar_visible();
+        self.state.persist_sidebar_prefs();
+        cx.notify();
+    }
+
     /// Toolbar `[×]` close — clear selection so the detail pane blanks.
     pub fn close_group_detail(&mut self, cx: &mut Context<Self>) {
         self.state.close_group_detail();
@@ -1287,6 +1297,15 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
     // Issue #23 — sidebar focus, search, and keyboard-nav actions.
     // Every handler forwards into the matching `ProjectView::*`
     // wrapper, which in turn delegates to pure-data `AppState` methods.
+    // Issue #52 — ⌘B / View → Toggle Sidebar. Flips
+    // `AppState::sidebar_hidden` and persists to `sidebar.json` so the
+    // visibility choice survives a window close + reopen. Replaces the
+    // no-op stub formerly installed by `menubar::register_handlers`.
+    cx.on_action(|_: &ToggleSidebar, cx: &mut gpui::App| {
+        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+            entity.update(cx, |view, cx| view.toggle_sidebar(cx));
+        }
+    });
     cx.on_action(|_: &FocusSidebar, cx: &mut gpui::App| {
         if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
             entity.update(cx, |view, cx| view.focus_sidebar(cx));
@@ -2085,13 +2104,19 @@ fn render_loaded(
     window: &Window,
     search_focus_handle: &FocusHandle,
 ) -> gpui::Div {
-    div()
-        .size_full()
-        .flex()
-        .flex_row()
-        .child(render_sidebar(state, window, search_focus_handle))
-        .child(render_sidebar_splitter())
-        .child(render_detail(state))
+    // Issue #52 — when the sidebar is hidden (⌘B), drop both the
+    // sidebar list and the drag splitter from the tree so the detail
+    // pane's `flex_1` sibling expands to fill the window. Keeping the
+    // splitter would leave a 4px dead strip with the ResizeLeftRight
+    // cursor next to the detail pane, which is visually worse than
+    // dropping it entirely.
+    let mut row = div().size_full().flex().flex_row();
+    if !state.sidebar_hidden {
+        row = row
+            .child(render_sidebar(state, window, search_focus_handle))
+            .child(render_sidebar_splitter());
+    }
+    row.child(render_detail(state))
 }
 
 /// Issue #47 — draggable splitter between the sidebar and the detail

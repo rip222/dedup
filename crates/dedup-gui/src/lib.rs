@@ -106,6 +106,10 @@ pub fn run() {
                         // `load_or_default` returned an unclamped value
                         // (it shouldn't, but defence-in-depth).
                         view.state.set_sidebar_width(initial_sidebar.sidebar_width);
+                        // Issue #52 — restore persisted visibility.
+                        // `sidebar_hidden` has no clamp / invariant to
+                        // enforce, so a plain assignment is fine.
+                        view.state.sidebar_hidden = initial_sidebar.sidebar_hidden;
                         if let Some(err) = startup_err.clone() {
                             view.state.startup_error = Some(err);
                         }

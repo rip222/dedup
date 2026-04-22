@@ -113,7 +113,7 @@ Sourced directly from the `SHORTCUTS` table in
 
 | Shortcut | Action |
 |---|---|
-| ⌘B | Toggle Sidebar |
+| ⌘B | Toggle Sidebar — hide / show the sidebar; detail pane expands to fill the window while hidden. Visibility persists across window close + reopen (stored in `sidebar.json` next to the resizable width). |
 | ⌘1 | Focus Sidebar |
 | ⌘2 | Focus Detail |
 | ⌘F | Find in Sidebar (focus search box) |
