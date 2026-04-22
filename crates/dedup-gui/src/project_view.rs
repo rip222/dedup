@@ -68,6 +68,13 @@ const BANNER_BG: u32 = 0x14532d;
 const BANNER_TEXT: u32 = 0xd1fae5;
 const PROGRESS_BAR_BG: u32 = 0x2d2d35;
 const PROGRESS_BAR_FG: u32 = 0x3b82f6;
+/// Cross-occurrence diff underline color (#55). A muted amber that
+/// reads as "different" against the dim detail-pane background
+/// without competing with the alpha-rename tints (which live on the
+/// pastel half of the wheel — see `tint.rs`). Rendered as a 1px
+/// bottom border on each differing segment so it stacks cleanly with
+/// the existing `bg_color` tint.
+const DIFF_UNDERLINE: u32 = 0xd97706;
 
 /// Events the scan worker thread sends back to the GUI poll loop.
 ///
@@ -3410,6 +3417,19 @@ fn render_code_line(line_number: u32, is_context: bool, segments: &[LineSegment]
         if let Some(bg) = seg.bg_color {
             node = node.bg(rgb(bg));
         }
+        // #55 — mark cross-occurrence diffs with a 1px bottom border.
+        // Context lines are never flagged (the diff fn filters them
+        // out), so we don't need to gate on `is_context` here — but we
+        // dim the underline for symmetry with the fg dim pass in case
+        // a stale diff flag slips through during a transient render.
+        if seg.is_diff {
+            let underline = if is_context {
+                dim(DIFF_UNDERLINE)
+            } else {
+                DIFF_UNDERLINE
+            };
+            node = node.border_b_1().border_color(rgb(underline));
+        }
         code = code.child(node);
     }
 
@@ -3480,6 +3500,13 @@ fn get_or_build_detail_rows(
 /// Build the flat row list from the current occurrences. Pure helper —
 /// the closure handed to `uniform_list` is `'static` so we pre-compute
 /// everything here rather than recomputing per-frame.
+///
+/// Reads each occurrence's source file once up front: the bytes drive
+/// both the per-occurrence highlight + tint pipeline and the cross-
+/// occurrence diff overlay (#55). Occurrences whose source can't be
+/// read produce a `DetailRow::Unavailable` row and contribute `None`
+/// to the diff input, so the other occurrences in the group still diff
+/// against each other without panicking.
 fn build_detail_rows(
     state: &AppState,
     group_id: i64,
@@ -3492,6 +3519,26 @@ fn build_detail_rows(
     )));
 
     let context_lines = state.detail_config.context_lines;
+
+    // Read every occurrence's source once. Kept as `Option<(source,
+    // lang_hint)>` so the diff pass (which only needs the source
+    // bytes) and the per-occurrence render loop (which needs the
+    // lang_hint too) share the same I/O.
+    let sources: Vec<Option<(String, Option<String>)>> = occurrences
+        .iter()
+        .map(|occ| read_occurrence_source(state, occ))
+        .collect();
+
+    // Bytes-only vec the diff fn wants. Cloning is cheap relative to
+    // the file read we already did, and keeping the shapes separate
+    // avoids teaching `detail_rows::diff` about `lang_hint`.
+    let diff_sources: Vec<Option<String>> = sources
+        .iter()
+        .map(|s| s.as_ref().map(|(src, _)| src.clone()))
+        .collect();
+    let diff_flags =
+        crate::detail_rows::diff::diff(occurrences, &diff_sources, context_lines);
+
     for (i, occ) in occurrences.iter().enumerate() {
         let collapsed = state.is_occurrence_collapsed(group_id, i);
         if i > 0 && !collapsed {
@@ -3511,15 +3558,22 @@ fn build_detail_rows(
         if collapsed {
             continue;
         }
-        match read_occurrence_source(state, occ) {
+        match sources[i].as_ref() {
             Some((source, lang_hint)) => {
                 let slice = crate::detail::extract_with_context(
-                    &source,
+                    source,
                     occ.start_line.max(1) as u32,
                     occ.end_line.max(1) as u32,
                     context_lines,
                 );
-                append_slice_rows(&mut out, &source, lang_hint.as_deref(), &slice, occ);
+                append_slice_rows(
+                    &mut out,
+                    source,
+                    lang_hint.as_deref(),
+                    &slice,
+                    occ,
+                    &diff_flags[i],
+                );
             }
             None => out.push(DetailRow::Unavailable),
         }
@@ -3550,6 +3604,7 @@ fn append_slice_rows(
     lang_hint: Option<&str>,
     slice: &crate::detail::ContextualSlice,
     occ: &crate::app_state::OccurrenceView,
+    diff_ranges: &[std::ops::Range<usize>],
 ) {
     use crate::detail::LineKind;
     use crate::highlight::highlight;
@@ -3564,8 +3619,20 @@ fn append_slice_rows(
     let mut tint_spans: Vec<(usize, usize, u32)> = occ.alpha_rename_spans.clone();
     tint_spans.sort_unstable_by_key(|(s, _, _)| *s);
 
+    // Sort diff ranges once too — `segments_for_range` does the same
+    // "walk runs, intersect with spans" logic, and a sorted input lets
+    // it binary-search the relevant entries instead of scanning.
+    let mut diff_sorted: Vec<std::ops::Range<usize>> = diff_ranges.to_vec();
+    diff_sorted.sort_unstable_by_key(|r| r.start);
+
     for line in &slice.lines {
-        let segments = segments_for_range(source, &runs, &tint_spans, line.byte_range.clone());
+        let segments = segments_for_range(
+            source,
+            &runs,
+            &tint_spans,
+            &diff_sorted,
+            line.byte_range.clone(),
+        );
         out.push(DetailRow::CodeLine {
             line_number: line.line_number,
             is_context: line.kind == LineKind::Context,
@@ -3583,6 +3650,7 @@ fn segments_for_range(
     source: &str,
     runs: &[crate::highlight::HighlightedRun],
     tint_spans: &[(usize, usize, u32)],
+    diff_ranges: &[std::ops::Range<usize>],
     line: std::ops::Range<usize>,
 ) -> Vec<LineSegment> {
     use crate::highlight::theme_color;
@@ -3590,6 +3658,15 @@ fn segments_for_range(
     if line.is_empty() {
         return Vec::new();
     }
+
+    // Whether *this whole line* lies inside any diff range. The diff
+    // overlay is line-level (see `detail_rows::diff`), so any
+    // intersection with this line's byte range flags every segment
+    // produced from it. Cheap — typical groups have a handful of diff
+    // ranges per occurrence.
+    let line_is_diff = diff_ranges
+        .iter()
+        .any(|r| r.start < line.end && r.end > line.start);
 
     let mut segments = Vec::new();
     for run in runs.iter() {
@@ -3611,6 +3688,7 @@ fn segments_for_range(
                 text,
                 fg_color: theme_color(run.kind),
                 bg_color: piece.tint,
+                is_diff: line_is_diff,
             });
         }
     }

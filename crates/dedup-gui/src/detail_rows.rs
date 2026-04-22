@@ -33,6 +33,16 @@ use std::rc::Rc;
 
 use crate::app_state::OccurrenceView;
 
+pub mod diff;
+
+/// Cache-key discriminator bumped whenever `build_detail_rows`'
+/// output shape changes. Hashing this into [`compute_cache_key`]
+/// guarantees any in-process cache entry produced by an older build
+/// fails to match after a hot-reload or plugin upgrade, even when the
+/// other inputs happen to collide. Bumped for #55 (cross-occurrence
+/// diff overlay — output segments now carry `is_diff` flags).
+const DETAIL_ROWS_SCHEMA_VERSION: u32 = 2;
+
 /// One flattened row of the detail pane's virtualized list (issue #26).
 ///
 /// A group with `N` occurrences and `M` rendered lines per occurrence
@@ -76,12 +86,17 @@ pub enum DetailRow {
 ///
 /// `fg_color` is the highlight palette colour; `bg_color` is
 /// `Some(rgb)` when the byte range lies inside an alpha-rename tint
-/// span (#25).
+/// span (#25); `is_diff` is `true` when the byte range differs from
+/// the corresponding byte range of at least one peer occurrence in
+/// the same group (#55). Diff marks render as a subtle underline, a
+/// visual distinct from the rename tint so the two overlays stack
+/// cleanly.
 #[derive(Debug, Clone)]
 pub struct LineSegment {
     pub text: String,
     pub fg_color: u32,
     pub bg_color: Option<u32>,
+    pub is_diff: bool,
 }
 
 /// Fingerprint of every `build_detail_rows` input.
@@ -121,10 +136,18 @@ pub struct DetailRowsCache {
 ///
 /// Hashes (in order):
 ///
+/// 0. `DETAIL_ROWS_SCHEMA_VERSION` — row-shape discriminator. Bumped
+///    for #55 so in-process caches built against the pre-diff row
+///    shape can never match a post-diff lookup.
 /// 1. `group_id`
 /// 2. `context_lines`
 /// 3. Each occurrence's `path`, `start_line`, `end_line`, and its
 ///    `alpha_rename_spans` (content affects `CodeLine::segments`).
+///    These four also fully determine the diff overlay inputs (#55):
+///    the diff fn reads each occurrence's file at `path` and extracts
+///    the focus window defined by `start_line..=end_line` +
+///    `context_lines`, so a mutation of any of them invalidates the
+///    diff output in lockstep with the existing highlight/tint output.
 /// 4. The `(group_id, occ_idx)` collapse flags for this group only.
 /// 5. The `(group_id, occ_idx)` selection flags for this group only —
 ///    they flip `OccurrenceHeader::checked`.
@@ -145,6 +168,7 @@ pub fn compute_cache_key(
     use std::collections::hash_map::DefaultHasher;
 
     let mut hasher = DefaultHasher::new();
+    DETAIL_ROWS_SCHEMA_VERSION.hash(&mut hasher);
     group_id.hash(&mut hasher);
     context_lines.hash(&mut hasher);
 
