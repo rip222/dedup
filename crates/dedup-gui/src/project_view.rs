@@ -29,7 +29,7 @@ use gpui::{
 };
 
 use crate::app_state::{
-    AppState, AppStatus, GroupView, OccurrenceView, Pane, ScanState, SortKey, StartupError,
+    AppState, AppStatus, GroupView, Pane, ScanState, SortKey, StartupError,
     SuppressionView, format_completion_banner, format_elapsed, group_view_from_match,
     launch_editor, load_folder,
 };
@@ -1151,24 +1151,35 @@ impl gpui::Global for RootHandle {}
 pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
     cx.set_global(RootHandle(entity));
     cx.on_action(|_: &OpenFolder, cx: &mut gpui::App| {
-        // Synchronous `NSOpenPanel`. GPUI guarantees action handlers run
-        // on the main thread, which is where Cocoa requires modal file
-        // dialogs to live, so this is safe.
-        let picked: Option<PathBuf> = rfd::FileDialog::new()
-            .set_title("Open folder")
-            .pick_folder();
-        let Some(folder) = picked else {
-            // User hit Cancel — leave state untouched. This is the
-            // explicit "open but do nothing" branch required by issue
-            // #20 AC ("user-invoked only — no silent scans").
-            return;
-        };
-        let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() else {
-            return;
-        };
-        entity.update(cx, |view, cx| {
-            view.apply_folder(&folder, cx);
-        });
+        // The sync `FileDialog::pick_folder` spins Cocoa's modal runloop
+        // while we're still nested inside `App::update` (the action
+        // dispatch path holds the `AppCell` borrow). Any GPUI task the
+        // modal pumps that calls `update` re-enters `borrow_mut` and
+        // panics with "RefCell already borrowed". Using the async
+        // variant + `cx.spawn` lets the current dispatch unwind and
+        // release the borrow before the panel opens.
+        cx.spawn(async move |cx| {
+            let picked = rfd::AsyncFileDialog::new()
+                .set_title("Open folder")
+                .pick_folder()
+                .await;
+            let Some(handle) = picked else {
+                // User hit Cancel — leave state untouched. This is the
+                // explicit "open but do nothing" branch required by
+                // issue #20 AC ("user-invoked only — no silent scans").
+                return;
+            };
+            let folder = handle.path().to_path_buf();
+            let _ = cx.update(|cx| {
+                let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() else {
+                    return;
+                };
+                entity.update(cx, |view, cx| {
+                    view.apply_folder(&folder, cx);
+                });
+            });
+        })
+        .detach();
     });
 
     // `StartScan` (⌘R / Scan → Start Scan) — routed through the root
@@ -2011,25 +2022,30 @@ fn render_sidebar(state: &AppState) -> gpui::Div {
         .child(render_search_box(state))
         .child(render_sort_dropdown(state))
         .child(render_summary_header(&summary.format()))
-        // Section 1: Tier B — "Duplicated functions / classes"
-        .child(render_section_header(
-            "Duplicated functions / classes",
-            tier_b.len(),
-        ))
-        .children(
-            tier_b
-                .iter()
-                .map(|g| render_group_row(g, state.selected_group == Some(g.id))),
+        // Scrollable body: sections + rows + dismissed. Header stays pinned.
+        .child(
+            div()
+                .id("sidebar-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(render_section_header(
+                    "Duplicated functions / classes",
+                    tier_b.len(),
+                ))
+                .children(
+                    tier_b
+                        .iter()
+                        .map(|g| render_group_row(g, state.selected_group == Some(g.id))),
+                )
+                .child(render_section_header("Duplicated blocks", tier_a.len()))
+                .children(
+                    tier_a
+                        .iter()
+                        .map(|g| render_group_row(g, state.selected_group == Some(g.id))),
+                )
+                .child(render_dismissed_section(state)),
         )
-        // Section 2: Tier A — "Duplicated blocks"
-        .child(render_section_header("Duplicated blocks", tier_a.len()))
-        .children(
-            tier_a
-                .iter()
-                .map(|g| render_group_row(g, state.selected_group == Some(g.id))),
-        )
-        // Section 3: Dismissed (collapsed by default).
-        .child(render_dismissed_section(state))
 }
 
 /// Search input slot (issue #23).
@@ -2309,8 +2325,17 @@ enum DetailRow {
     /// The `{occurrences.len()} occurrences` preamble at the top of
     /// the pane.
     Summary(String),
-    /// One per occurrence — `path:Lstart–end`.
-    OccurrenceHeader(String),
+    /// One per occurrence — `path:Lstart–end` + inline checkbox /
+    /// `[Copy path]` / `[×]` controls. Carries the state needed to wire
+    /// the controls through `RootHandle` without touching `AppState`
+    /// from the `'static` `uniform_list` render closure.
+    OccurrenceHeader {
+        group_id: i64,
+        occ_idx: usize,
+        label: String,
+        checked: bool,
+        path: std::path::PathBuf,
+    },
     /// Blank row between consecutive occurrence cards, for visual
     /// separation in the flattened list.
     Gap,
@@ -2388,7 +2413,7 @@ fn render_detail(state: &AppState) -> gpui::AnyElement {
         // unchanged; users re-expand to see the code.
         Vec::new()
     } else {
-        build_detail_rows(state, &occurrences)
+        build_detail_rows(state, group_id, &occurrences)
     };
     let rows = Rc::new(rows);
     let row_count = rows.len();
@@ -2408,7 +2433,6 @@ fn render_detail(state: &AppState) -> gpui::AnyElement {
         .bg(rgb(BG))
         .flex_1()
         .child(render_group_toolbar(state, group_id))
-        .child(render_occurrence_cards(state, group_id, &occurrences))
         .child(div().flex_1().px(px(16.0)).pb(px(16.0)).child(list))
         .into_any_element()
 }
@@ -2555,131 +2579,6 @@ fn render_group_toolbar(state: &AppState, group_id: i64) -> gpui::Div {
         .child(close_btn)
 }
 
-/// Per-occurrence checkbox + path + hover-only `[Copy path]` + `[×]`
-/// card rendered between the toolbar and the scrolling code body.
-fn render_occurrence_cards(
-    state: &AppState,
-    group_id: i64,
-    occurrences: &[OccurrenceView],
-) -> gpui::Div {
-    let mut wrap = div()
-        .flex()
-        .flex_col()
-        .px(px(16.0))
-        .py(px(8.0))
-        .gap(px(4.0));
-    for (idx, occ) in occurrences.iter().enumerate() {
-        wrap = wrap.child(render_occurrence_card(group_id, idx, occ, state));
-    }
-    wrap
-}
-
-fn render_occurrence_card(
-    group_id: i64,
-    occ_idx: usize,
-    occ: &OccurrenceView,
-    state: &AppState,
-) -> gpui::Div {
-    let checked = state.is_occurrence_selected(group_id, occ_idx);
-    let label = occ.label();
-    let path_for_copy = occ.path.clone();
-    let group_hover_key = format!("occ-card-{group_id}-{occ_idx}");
-
-    let checkbox_bg = if checked {
-        CHECKBOX_CHECKED_BG
-    } else {
-        CHECKBOX_UNCHECKED_BG
-    };
-    let check_mark = if checked { "\u{2713}" } else { " " };
-
-    let checkbox = div()
-        .id(("occ-checkbox", (group_id as u64) << 32 | occ_idx as u64))
-        .w(px(16.0))
-        .h(px(16.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(checkbox_bg))
-        .rounded(px(3.0))
-        .text_size(px(11.0))
-        .text_color(white())
-        .cursor_pointer()
-        .child(check_mark.to_string())
-        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
-            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-                entity.update(cx, |view, cx| view.toggle_occurrence(group_id, occ_idx, cx));
-            }
-        });
-
-    // Per-row [×] — dismisses THIS occurrence without dismissing the
-    // whole group (#27 AC).
-    let dismiss = div()
-        .id(("occ-dismiss", (group_id as u64) << 32 | occ_idx as u64))
-        .w(px(18.0))
-        .h(px(18.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(TOOLBAR_DANGER_BG))
-        .rounded(px(3.0))
-        .text_size(px(12.0))
-        .text_color(white())
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
-        .child("\u{00D7}")
-        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
-            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-                entity.update(cx, |view, cx| {
-                    view.dismiss_occurrence(group_id, occ_idx, cx)
-                });
-            }
-        });
-
-    // Per-row `[Copy path]` — hidden by default, revealed on row hover
-    // via GPUI's `group_hover` mechanism. The wrapper div declares a
-    // named hover group; the copy button is invisible until the group
-    // is hovered, at which point it fades into full opacity.
-    let copy_button = div()
-        .id(("occ-copy", (group_id as u64) << 32 | occ_idx as u64))
-        .px(px(8.0))
-        .py(px(3.0))
-        .bg(rgb(TOOLBAR_BUTTON_BG))
-        .rounded(px(3.0))
-        .text_size(px(11.0))
-        .text_color(rgb(ROW_TEXT))
-        .cursor_pointer()
-        .invisible()
-        .group_hover(group_hover_key.clone(), |s| s.visible())
-        .child("Copy path")
-        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
-            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-                let p = path_for_copy.clone();
-                entity.update(cx, |view, cx| view.copy_single_path(p, cx));
-            }
-        });
-
-    div()
-        .group(group_hover_key)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(8.0))
-        .px(px(8.0))
-        .py(px(5.0))
-        .bg(rgb(SIDEBAR_BG))
-        .rounded(px(4.0))
-        .child(checkbox)
-        .child(
-            div()
-                .flex_1()
-                .text_size(px(12.0))
-                .text_color(rgb(ROW_TEXT))
-                .child(label),
-        )
-        .child(copy_button)
-        .child(dismiss)
-}
-
 /// Render one flattened row from [`build_detail_rows`].
 ///
 /// Returns a fixed-height `Div` — `uniform_list` assumes every row is
@@ -2691,13 +2590,13 @@ fn render_detail_row(row: &DetailRow) -> gpui::Div {
             .text_size(px(12.0))
             .text_color(rgb(ROW_TEXT_DIM))
             .child(text.clone()),
-        DetailRow::OccurrenceHeader(text) => div()
-            .h(px(DETAIL_ROW_HEIGHT))
-            .px(px(8.0))
-            .bg(rgb(SIDEBAR_BG))
-            .text_size(px(12.0))
-            .text_color(rgb(ROW_TEXT))
-            .child(text.clone()),
+        DetailRow::OccurrenceHeader {
+            group_id,
+            occ_idx,
+            label,
+            checked,
+            path,
+        } => render_occurrence_header_row(*group_id, *occ_idx, label, *checked, path),
         DetailRow::Gap => div().h(px(DETAIL_ROW_HEIGHT)),
         DetailRow::Unavailable => div()
             .h(px(DETAIL_ROW_HEIGHT))
@@ -2711,6 +2610,108 @@ fn render_detail_row(row: &DetailRow) -> gpui::Div {
             segments,
         } => render_code_line(*line_number, *is_context, segments),
     }
+}
+
+/// Inline occurrence header row shown inside `uniform_list` — carries
+/// the per-occurrence checkbox, `[Copy path]` (hover-only), and `[×]`
+/// dismiss controls next to `path:Lstart–end`. Replaces the standalone
+/// `render_occurrence_cards` list that used to sit above the code body.
+fn render_occurrence_header_row(
+    group_id: i64,
+    occ_idx: usize,
+    label: &str,
+    checked: bool,
+    path: &std::path::Path,
+) -> gpui::Div {
+    let key = (group_id as u64) << 32 | occ_idx as u64;
+    let group_hover_key = format!("occ-hdr-{group_id}-{occ_idx}");
+
+    let checkbox_bg = if checked {
+        CHECKBOX_CHECKED_BG
+    } else {
+        CHECKBOX_UNCHECKED_BG
+    };
+    let check_mark = if checked { "\u{2713}" } else { " " };
+
+    let checkbox = div()
+        .id(("occ-checkbox", key))
+        .w(px(14.0))
+        .h(px(14.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(checkbox_bg))
+        .rounded(px(3.0))
+        .text_size(px(10.0))
+        .text_color(white())
+        .cursor_pointer()
+        .child(check_mark.to_string())
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.toggle_occurrence(group_id, occ_idx, cx));
+            }
+        });
+
+    let path_for_copy = path.to_path_buf();
+    let copy_button = div()
+        .id(("occ-copy", key))
+        .px(px(6.0))
+        .bg(rgb(TOOLBAR_BUTTON_BG))
+        .rounded(px(3.0))
+        .text_size(px(10.0))
+        .text_color(rgb(ROW_TEXT))
+        .cursor_pointer()
+        .invisible()
+        .group_hover(group_hover_key.clone(), |s| s.visible())
+        .child("Copy path")
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                let p = path_for_copy.clone();
+                entity.update(cx, |view, cx| view.copy_single_path(p, cx));
+            }
+        });
+
+    let dismiss = div()
+        .id(("occ-dismiss", key))
+        .w(px(16.0))
+        .h(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(TOOLBAR_DANGER_BG))
+        .rounded(px(3.0))
+        .text_size(px(11.0))
+        .text_color(white())
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+        .child("\u{00D7}")
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| {
+                    view.dismiss_occurrence(group_id, occ_idx, cx)
+                });
+            }
+        });
+
+    div()
+        .group(group_hover_key)
+        .h(px(DETAIL_ROW_HEIGHT))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .bg(rgb(SIDEBAR_BG))
+        .child(checkbox)
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(12.0))
+                .text_color(rgb(ROW_TEXT))
+                .child(label.to_string()),
+        )
+        .child(copy_button)
+        .child(dismiss)
 }
 
 /// Render one `[gutter][code]` row with horizontal overflow scrolling
@@ -2772,6 +2773,7 @@ fn dim(color: u32) -> u32 {
 /// everything here rather than recomputing per-frame.
 fn build_detail_rows(
     state: &AppState,
+    group_id: i64,
     occurrences: &[crate::app_state::OccurrenceView],
 ) -> Vec<DetailRow> {
     let mut out = Vec::with_capacity(occurrences.len() * 8);
@@ -2785,7 +2787,13 @@ fn build_detail_rows(
         if i > 0 {
             out.push(DetailRow::Gap);
         }
-        out.push(DetailRow::OccurrenceHeader(occ.label()));
+        out.push(DetailRow::OccurrenceHeader {
+            group_id,
+            occ_idx: i,
+            label: occ.label(),
+            checked: state.is_occurrence_selected(group_id, i),
+            path: occ.path.clone(),
+        });
         match read_occurrence_source(state, occ) {
             Some((source, lang_hint)) => {
                 let slice = crate::detail::extract_with_context(
