@@ -387,6 +387,10 @@ pub struct AppState {
     /// is an inline modal overlay rather than a native window — see
     /// the PR body for the GPUI-primitives compromise.
     pub preferences_open: bool,
+    /// Whether the sidebar sort-dropdown popup is open (issue #46).
+    /// Toggled by clicking the `Sort: <key>` button; auto-closed by
+    /// `set_sort_key` and by a click on the full-window scrim.
+    pub sort_popup_open: bool,
     /// Live toast queue (issue #30). Pushed to by error classifiers,
     /// the scan-complete flow, and background-panic propagation. The
     /// 500ms tick timer in `ProjectView::start_toast_ticker` drops
@@ -1262,9 +1266,25 @@ impl AppState {
 
     /// Swap the sort key, keeping the selection on the same group-id
     /// when possible (so re-sort doesn't feel like a teleport).
+    ///
+    /// Also closes the sort-dropdown popup (issue #46) — selecting
+    /// any key dismisses the menu.
     pub fn set_sort_key(&mut self, key: SortKey) {
         self.sort_key = key;
+        self.sort_popup_open = false;
         self.reclamp_selection();
+    }
+
+    /// Toggle the sort-dropdown popup (issue #46). Bound to the
+    /// `Sort: <key>` button in the sidebar.
+    pub fn toggle_sort_popup(&mut self) {
+        self.sort_popup_open = !self.sort_popup_open;
+    }
+
+    /// Close the sort-dropdown popup without changing the key
+    /// (issue #46). Wired to the click-outside scrim.
+    pub fn close_sort_popup(&mut self) {
+        self.sort_popup_open = false;
     }
 
     /// Move the sidebar cursor forward. Clamps at the bottom of the
@@ -3337,5 +3357,61 @@ mod tests {
             t.action.as_ref().map(|a| a.action_name),
             Some(ACTION_SHOW_ISSUES)
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #46 — sidebar sort-dropdown popup state helpers.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn sort_popup_defaults_closed() {
+        let s = AppState::new();
+        assert!(!s.sort_popup_open);
+    }
+
+    #[test]
+    fn toggle_sort_popup_flips_flag() {
+        let mut s = AppState::new();
+        s.toggle_sort_popup();
+        assert!(s.sort_popup_open);
+        s.toggle_sort_popup();
+        assert!(!s.sort_popup_open);
+    }
+
+    #[test]
+    fn close_sort_popup_is_idempotent() {
+        let mut s = AppState::new();
+        s.close_sort_popup();
+        assert!(!s.sort_popup_open);
+        s.toggle_sort_popup();
+        assert!(s.sort_popup_open);
+        s.close_sort_popup();
+        assert!(!s.sort_popup_open);
+        s.close_sort_popup();
+        assert!(!s.sort_popup_open);
+    }
+
+    #[test]
+    fn set_sort_key_closes_popup_and_swaps_key() {
+        let mut s = AppState::new();
+        s.toggle_sort_popup();
+        assert!(s.sort_popup_open);
+        assert_eq!(s.sort_key, SortKey::Impact);
+        s.set_sort_key(SortKey::Alphabetical);
+        assert_eq!(s.sort_key, SortKey::Alphabetical);
+        assert!(
+            !s.sort_popup_open,
+            "selecting a key should dismiss the popup"
+        );
+    }
+
+    #[test]
+    fn set_sort_key_closes_popup_even_when_key_unchanged() {
+        // Clicking the currently-selected key should still close the
+        // popup (matches "selecting a key closes the popup" AC).
+        let mut s = AppState::new();
+        s.toggle_sort_popup();
+        s.set_sort_key(s.sort_key);
+        assert!(!s.sort_popup_open);
     }
 }

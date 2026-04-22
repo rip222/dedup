@@ -813,9 +813,24 @@ impl ProjectView {
     }
 
     /// Update the sidebar sort key. Invoked from the sort-dropdown
-    /// menu items.
+    /// menu items (issue #46). Also closes the popup via
+    /// [`AppState::set_sort_key`].
     pub fn set_sort_key(&mut self, key: SortKey, cx: &mut Context<Self>) {
         self.state.set_sort_key(key);
+        cx.notify();
+    }
+
+    /// Toggle the sort-dropdown popup open/closed (issue #46). Wired
+    /// to the `Sort: <key>` button in the sidebar.
+    pub fn toggle_sort_popup(&mut self, cx: &mut Context<Self>) {
+        self.state.toggle_sort_popup();
+        cx.notify();
+    }
+
+    /// Close the sort-dropdown popup without changing the key
+    /// (issue #46). Wired to the click-outside scrim.
+    pub fn close_sort_popup(&mut self, cx: &mut Context<Self>) {
+        self.state.close_sort_popup();
         cx.notify();
     }
 
@@ -1499,6 +1514,17 @@ impl Render for ProjectView {
             None
         };
 
+        // Issue #46 — sort-dropdown popup. Rendered as a transparent
+        // full-window scrim (click-to-dismiss) with the menu card
+        // anchored near the sort button. Layered above the body but
+        // below modal dialogs so Preferences / startup-error still take
+        // priority when both happen to be open.
+        let sort_popup = if self.state.sort_popup_open {
+            Some(render_sort_popup(self.state.sort_key))
+        } else {
+            None
+        };
+
         div()
             .track_focus(&root_focus)
             .key_context("ProjectView")
@@ -1511,6 +1537,7 @@ impl Render for ProjectView {
             .children(editor_banner)
             .children(overlay)
             .child(body)
+            .children(sort_popup)
             .children(prefs)
             .children(issues_dialog)
             .children(startup_modal)
@@ -2168,22 +2195,109 @@ fn render_search_box(state: &AppState) -> gpui::Div {
         .child(text)
 }
 
-/// Sort-dropdown slot (issue #23).
+/// Sort-dropdown button (issues #23, #46).
 ///
-/// Shows "Sort: <current key>". Full menu UI lives behind a GPUI popup
-/// we don't have a helper for yet; the state field is exposed so the
-/// dropdown can be wired in when the popup primitive lands.
-fn render_sort_dropdown(state: &AppState) -> gpui::Div {
+/// Renders the `Sort: <current key>` label as a clickable button
+/// styled to match the sidebar. Clicking it toggles the full-window
+/// popup defined by [`render_sort_popup`]. Selection + click-outside
+/// dismissal are routed through `RootHandle` → `ProjectView`.
+fn render_sort_dropdown(state: &AppState) -> gpui::Stateful<gpui::Div> {
+    let open = state.sort_popup_open;
+    let border_color = if open { rgb(ACCENT) } else { rgb(ACCENT_DIM) };
     div()
+        .id("sidebar-sort-button")
         .mx(px(12.0))
         .mt(px(4.0))
         .px(px(8.0))
         .py(px(6.0))
         .bg(rgb(ACCENT_DIM))
         .rounded(px(4.0))
+        .border_1()
+        .border_color(border_color)
         .text_size(px(12.0))
         .text_color(rgb(ROW_TEXT))
+        .cursor_pointer()
         .child(format!("Sort: {}", state.sort_key.label()))
+        .on_mouse_down(MouseButton::Left, |_, _window, cx: &mut gpui::App| {
+            // Stop the scrim's outside-click handler from also firing
+            // by closing/opening via the view directly. The scrim only
+            // captures clicks while the popup is already open, so on
+            // the opening click there's no conflict; on the next click
+            // the scrim wins and dismisses the popup.
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.toggle_sort_popup(cx));
+            }
+        })
+}
+
+/// Sort-dropdown popup menu (issue #46). Full-window transparent
+/// scrim so clicks outside the card dismiss; card itself lists every
+/// [`SortKey::ALL`] variant, with the current key highlighted and
+/// marked with a leading dot.
+fn render_sort_popup(current: SortKey) -> gpui::Div {
+    // Card anchored under the sort button. The sidebar is 320 px wide
+    // with 12 px horizontal padding around the button and the button
+    // stack (search 12 px mt + ~32 px button height + 4 px + 32 px)
+    // sits roughly 96 px from the top of the sidebar. 112 px gives a
+    // little breathing room under the button.
+    let mut card = div()
+        .id("sort-popup-card")
+        .absolute()
+        .left(px(12.0))
+        .top(px(112.0))
+        .w(px(224.0))
+        .bg(rgb(SIDEBAR_BG))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(rgb(ACCENT))
+        .p(px(4.0))
+        .flex()
+        .flex_col()
+        // Eat clicks on the card itself so they don't reach the
+        // scrim's `on_mouse_down` dismiss handler.
+        .on_mouse_down(MouseButton::Left, |_, _, _| {});
+
+    for key in SortKey::ALL {
+        let key = *key;
+        let is_current = key == current;
+        let marker = if is_current { "\u{2022} " } else { "  " };
+        let row = div()
+            .id(gpui::ElementId::Name(
+                format!("sort-popup-{}", key.label()).into(),
+            ))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .text_color(if is_current {
+                rgb(ACCENT)
+            } else {
+                rgb(ROW_TEXT)
+            })
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(ROW_SELECTED_BG)))
+            .child(format!("{marker}{}", key.label()))
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_, _window, cx: &mut gpui::App| {
+                    if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                        entity.update(cx, |view, cx| view.set_sort_key(key, cx));
+                    }
+                },
+            );
+        card = card.child(row);
+    }
+
+    // Scrim — full window, transparent; absorbs outside clicks.
+    div()
+        .absolute()
+        .inset_0()
+        .on_mouse_down(MouseButton::Left, |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.close_sort_popup(cx));
+            }
+        })
+        .child(card)
 }
 
 /// Summary header (issue #23). Renders
