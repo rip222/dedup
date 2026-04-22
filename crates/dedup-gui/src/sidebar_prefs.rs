@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::app_state::SortKey;
 use crate::recent::config_dir;
 
 /// Default sidebar width in pixels.
@@ -57,6 +58,14 @@ pub struct SidebarPrefs {
     /// the sidebar.
     #[serde(default)]
     pub sidebar_hidden: bool,
+    /// Persisted sidebar sort key (issue #56). `None` means the file
+    /// was written before #56 landed — callers treat that as "keep
+    /// the user's previous Impact-based ordering" rather than
+    /// force-upgrading them to Severity. A fresh install (no file at
+    /// all) skips this struct entirely and gets the in-memory default
+    /// ([`SortKey::Severity`]) via [`Default::default`].
+    #[serde(default)]
+    pub sort_key: Option<SortKey>,
 }
 
 fn default_width() -> f32 {
@@ -68,6 +77,12 @@ impl Default for SidebarPrefs {
         Self {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_hidden: false,
+            // Issue #56 — fresh install defaults to Severity. The load
+            // path that reads an existing file with no `sort_key` field
+            // ([`SidebarPrefs::load_from_path`]) swaps this to
+            // `Some(SortKey::Impact)` to preserve the legacy ordering
+            // for users who already had a saved pref file.
+            sort_key: Some(SortKey::Severity),
         }
     }
 }
@@ -100,6 +115,14 @@ impl SidebarPrefs {
             Ok(body) => match serde_json::from_str::<SidebarPrefs>(&body) {
                 Ok(mut prefs) => {
                     prefs.clamp_in_place();
+                    // Issue #56 — legacy pref files pre-date the
+                    // `sort_key` field. A missing field deserializes
+                    // as `None`; upgrade that to `Some(Impact)` so
+                    // existing users keep their prior "Impact" sort
+                    // rather than silently flipping to Severity.
+                    if prefs.sort_key.is_none() {
+                        prefs.sort_key = Some(SortKey::Impact);
+                    }
                     prefs
                 }
                 Err(e) => {
@@ -237,6 +260,7 @@ mod tests {
         let prefs = SidebarPrefs {
             sidebar_width: 412.0,
             sidebar_hidden: false,
+            sort_key: Some(SortKey::Severity),
         };
         prefs.save_to_path(&path).unwrap();
         let loaded = SidebarPrefs::load_from_path(&path);
@@ -260,6 +284,7 @@ mod tests {
         let prefs = SidebarPrefs {
             sidebar_width: 500.0,
             sidebar_hidden: false,
+            sort_key: Some(SortKey::Severity),
         };
         prefs.save_to_path(&path).unwrap();
 
@@ -281,6 +306,7 @@ mod tests {
         let prefs = SidebarPrefs {
             sidebar_width: 320.0,
             sidebar_hidden: true,
+            sort_key: Some(SortKey::Severity),
         };
         prefs.save_to_path(&path).unwrap();
         let loaded = SidebarPrefs::load_from_path(&path);
@@ -298,6 +324,62 @@ mod tests {
         let prefs = SidebarPrefs::load_from_path(&path);
         assert_eq!(prefs.sidebar_width, 400.0);
         assert!(!prefs.sidebar_hidden);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #56 — persisted sort key.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn default_sort_key_is_severity_for_new_install() {
+        // `Default::default` is what `load_or_default` returns when the
+        // file doesn't exist — i.e. a brand-new install. Issue #56
+        // specifies that brand-new installs default to Severity.
+        assert_eq!(
+            SidebarPrefs::default().sort_key,
+            Some(SortKey::Severity)
+        );
+    }
+
+    #[test]
+    fn legacy_file_without_sort_key_upgrades_to_impact() {
+        // Pre-#56 sidebar.json doesn't have a `sort_key` field. The
+        // load path must interpret that as "keep the user's prior
+        // Impact ordering", not force them onto Severity.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.json");
+        fs::write(&path, r#"{"sidebar_width": 320.0}"#).unwrap();
+        let prefs = SidebarPrefs::load_from_path(&path);
+        assert_eq!(
+            prefs.sort_key,
+            Some(SortKey::Impact),
+            "legacy users keep their persisted Impact sort"
+        );
+    }
+
+    #[test]
+    fn missing_file_returns_severity_for_new_install() {
+        // No file on disk = fresh install. Must land on Severity, not
+        // Impact (the legacy upgrade path is reserved for files that
+        // exist but predate #56).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        let prefs = SidebarPrefs::load_from_path(&path);
+        assert_eq!(prefs.sort_key, Some(SortKey::Severity));
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_preserves_sort_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.json");
+        let prefs = SidebarPrefs {
+            sidebar_width: 320.0,
+            sidebar_hidden: false,
+            sort_key: Some(SortKey::Alphabetical),
+        };
+        prefs.save_to_path(&path).unwrap();
+        let loaded = SidebarPrefs::load_from_path(&path);
+        assert_eq!(loaded.sort_key, Some(SortKey::Alphabetical));
     }
 
     #[test]

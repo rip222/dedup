@@ -75,6 +75,40 @@ pub struct GroupView {
     pub group_hash: Option<u64>,
 }
 
+impl GroupView {
+    /// Severity (issue #56) — `occurrence_count × total_lines_of_code`
+    /// summed across occurrences. Used by [`SortKey::Severity`] to
+    /// surface the highest-leverage duplicates at the top of the
+    /// sidebar. `saturating_*` everywhere so a pathological group
+    /// (millions of 1-line occurrences) never panics in debug builds.
+    ///
+    /// Exposed on `GroupView` (not just a private helper) so the CLI
+    /// + future UI surfaces can render the same number.
+    pub fn severity(&self) -> u64 {
+        let total_lines: u64 = self
+            .occurrences
+            .iter()
+            .map(|o| {
+                (o.end_line
+                    .saturating_sub(o.start_line)
+                    .saturating_add(1))
+                .max(0) as u64
+            })
+            .sum();
+        (self.occurrences.len() as u64).saturating_mul(total_lines)
+    }
+
+    /// First occurrence path, lowercased, for the Severity sort's
+    /// alphabetical tiebreaker (#56 acceptance criterion). Empty
+    /// string for a groupless row so the comparison is total.
+    fn first_path_lower(&self) -> String {
+        self.occurrences
+            .first()
+            .map(|o| o.path.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    }
+}
+
 /// View-model for one occurrence in the detail pane.
 ///
 /// Line numbers are 1-based and inclusive on both ends, matching the
@@ -368,7 +402,9 @@ pub struct AppState {
     /// filtering. Matched case-insensitively against each group's
     /// `label`, every `occurrence.path`, and its `language`.
     pub search_query: String,
-    /// Sidebar sort key (issue #23). Defaults to [`SortKey::Impact`].
+    /// Sidebar sort key (issue #23, #56). Defaults to [`SortKey::Severity`]
+    /// for fresh installs; a loaded pref file can override to any persisted
+    /// variant (see [`crate::sidebar_prefs::SidebarPrefs::sort_key`]).
     pub sort_key: SortKey,
     /// Which pane currently has logical focus — drives ⌘1 / ⌘2 from
     /// issue #23 and mirrors the View menu items. Keyboard-nav actions
@@ -591,17 +627,24 @@ pub enum Pane {
     Detail,
 }
 
-/// Sidebar sort key (issue #23). Default is [`SortKey::Impact`] — the same
-/// "match size × occurrence count" ordering the streaming buffer uses so
-/// switching from streaming → cache-backed preserves ordering.
+/// Sidebar sort key (issue #23, #56). Default is [`SortKey::Severity`] —
+/// `occurrence_count × total_lines_of_code` summed across occurrences
+/// so the highest-leverage dupes surface at the top (#56).
 ///
-/// All five keys use the group's `group_hash` (or `id` for streaming rows)
+/// All variants use the group's `group_hash` (or `id` for streaming rows)
 /// as the deterministic tiebreaker so `sort_groups` is stable for equal
-/// keys across runs (acceptance criterion).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// keys across runs (acceptance criterion). For Severity specifically
+/// ties fall back to path-alphabetical first, then the hash/id tiebreaker.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
 pub enum SortKey {
-    /// Match size × occurrence count. Higher impact sorts first.
+    /// Occurrence count × total duplicated LOC (issue #56). Higher
+    /// severity sorts first. Surfaces the highest-leverage duplicates
+    /// at the top of the sidebar.
     #[default]
+    Severity,
+    /// Match size × occurrence count. Higher impact sorts first.
     Impact,
     /// Number of distinct file paths across the group's occurrences.
     /// Higher counts sort first.
@@ -620,10 +663,11 @@ pub enum SortKey {
 }
 
 impl SortKey {
-    /// All five variants, in the order shown in the dropdown. Kept as
+    /// All variants, in the order shown in the dropdown. Kept as
     /// a slice so tests can iterate without depending on an
     /// `IntoEnumIterator`-style derive.
     pub const ALL: &'static [SortKey] = &[
+        SortKey::Severity,
         SortKey::Impact,
         SortKey::FileCount,
         SortKey::LineCount,
@@ -634,6 +678,7 @@ impl SortKey {
     /// Human-readable label used in the sort dropdown.
     pub fn label(self) -> &'static str {
         match self {
+            SortKey::Severity => "Severity",
             SortKey::Impact => "Impact",
             SortKey::FileCount => "File count",
             SortKey::LineCount => "Line count",
@@ -687,6 +732,18 @@ fn tiebreak_key(g: &GroupView) -> (u64, i64) {
 pub fn sort_groups(groups: &[GroupView], key: SortKey) -> Vec<GroupView> {
     let mut out: Vec<GroupView> = groups.to_vec();
     match key {
+        SortKey::Severity => {
+            out.sort_by(|a, b| {
+                // Descending by severity — higher-leverage dupes first.
+                // Ties fall back to path-alphabetical for stability
+                // (acceptance criterion #56), then the content-hash /
+                // id tiebreaker for determinism across runs.
+                b.severity()
+                    .cmp(&a.severity())
+                    .then_with(|| a.first_path_lower().cmp(&b.first_path_lower()))
+                    .then_with(|| tiebreak_key(a).cmp(&tiebreak_key(b)))
+            });
+        }
         SortKey::Impact => {
             out.sort_by(|a, b| {
                 impact_key(a)
@@ -1176,6 +1233,11 @@ impl AppState {
         let prefs = crate::sidebar_prefs::SidebarPrefs {
             sidebar_width: self.sidebar_width,
             sidebar_hidden: self.sidebar_hidden,
+            // Issue #56 — persist the chosen sort key alongside the
+            // width / visibility. Writing `Some(_)` means a later
+            // load sees the exact variant and skips the legacy
+            // "missing field → Impact" upgrade.
+            sort_key: Some(self.sort_key),
         };
         if let Err(e) = prefs.save_to_disk() {
             tracing::debug!(
@@ -1450,6 +1512,10 @@ impl AppState {
         self.sort_key = key;
         self.sort_popup_open = false;
         self.reclamp_selection();
+        // Note: persistence of the new key is performed by
+        // [`crate::project_view::ProjectView::set_sort_key`] after
+        // this call returns. Keeping disk I/O out of `AppState` keeps
+        // the unit-test path (which runs without a home dir) pure.
     }
 
     /// Toggle the sort-dropdown popup (issue #46). Bound to the
@@ -3011,6 +3077,118 @@ mod tests {
         assert_eq!(out[1].id, 1);
     }
 
+    // -----------------------------------------------------------------
+    // Issue #56 — Severity sort option.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn severity_is_occurrence_count_times_total_lines() {
+        // Two occurrences, 5 lines each (lines 1..=5 inclusive = 5).
+        // Total lines = 10. Severity = 2 * 10 = 20.
+        let g = mkgroup(
+            1,
+            Tier::A,
+            "x",
+            vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5)],
+            Some(0x11),
+        );
+        assert_eq!(g.severity(), 20);
+    }
+
+    #[test]
+    fn severity_zero_for_empty_occurrences() {
+        let g = mkgroup(1, Tier::A, "x", vec![], Some(0x11));
+        assert_eq!(g.severity(), 0);
+    }
+
+    #[test]
+    fn sort_groups_severity_puts_highest_leverage_first() {
+        // low:  2 occs × 5 lines = 10
+        // mid:  2 occs × 50 lines = 100
+        // high: 5 occs × 20 lines = 500
+        let low = mkgroup(
+            1,
+            Tier::A,
+            "low",
+            vec![occ("a.rs", 1, 5), occ("b.rs", 1, 5)],
+            Some(0x11),
+        );
+        let mid = mkgroup(
+            2,
+            Tier::A,
+            "mid",
+            vec![occ("c.rs", 1, 50), occ("d.rs", 1, 50)],
+            Some(0x22),
+        );
+        let high = mkgroup(
+            3,
+            Tier::A,
+            "high",
+            vec![
+                occ("e.rs", 1, 20),
+                occ("f.rs", 1, 20),
+                occ("g.rs", 1, 20),
+                occ("h.rs", 1, 20),
+                occ("i.rs", 1, 20),
+            ],
+            Some(0x33),
+        );
+        let out = sort_groups(
+            &[low.clone(), mid.clone(), high.clone()],
+            SortKey::Severity,
+        );
+        let ids: Vec<i64> = out.iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec![3, 2, 1], "severity descending");
+    }
+
+    #[test]
+    fn sort_groups_severity_tiebreaks_on_path_alphabetical() {
+        // Same severity (1 occ × 10 lines = 10) — path alphabetical
+        // must break the tie so ordering is stable.
+        let z = mkgroup(
+            1,
+            Tier::A,
+            "z",
+            vec![occ("zeta.rs", 1, 10)],
+            Some(0xFFFF),
+        );
+        let a = mkgroup(
+            2,
+            Tier::A,
+            "a",
+            vec![occ("alpha.rs", 1, 10)],
+            Some(0x0001),
+        );
+        // Feed in reverse of the expected order so a naive stable
+        // sort can't accidentally pass the test.
+        let out = sort_groups(&[z, a], SortKey::Severity);
+        let ids: Vec<i64> = out.iter().map(|g| g.id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 1],
+            "alpha.rs wins the path-alphabetical tiebreaker over zeta.rs"
+        );
+    }
+
+    #[test]
+    fn sort_groups_severity_is_default() {
+        assert_eq!(SortKey::default(), SortKey::Severity);
+    }
+
+    #[test]
+    fn sort_key_all_lists_severity_first() {
+        assert_eq!(
+            SortKey::ALL.first().copied(),
+            Some(SortKey::Severity),
+            "dropdown must surface Severity as the top option"
+        );
+    }
+
+    #[test]
+    fn sort_key_label_severity() {
+        assert_eq!(SortKey::Severity.label(), "Severity");
+    }
+
     #[test]
     fn sort_groups_file_count_descending() {
         let one = mkgroup(
@@ -3957,7 +4135,7 @@ mod tests {
         let mut s = AppState::new();
         s.toggle_sort_popup();
         assert!(s.sort_popup_open);
-        assert_eq!(s.sort_key, SortKey::Impact);
+        assert_eq!(s.sort_key, SortKey::Severity);
         s.set_sort_key(SortKey::Alphabetical);
         assert_eq!(s.sort_key, SortKey::Alphabetical);
         assert!(

@@ -112,6 +112,15 @@ pub fn run() {
                         // `sidebar_hidden` has no clamp / invariant to
                         // enforce, so a plain assignment is fine.
                         view.state.sidebar_hidden = initial_sidebar.sidebar_hidden;
+                        // Issue #56 — restore persisted sort key. A
+                        // fresh install leaves the default
+                        // ([`SortKey::Severity`]) in place; a legacy
+                        // file (no `sort_key` field) was upgraded to
+                        // `Some(Impact)` during load so existing users
+                        // keep their prior ordering.
+                        if let Some(key) = initial_sidebar.sort_key {
+                            view.state.sort_key = key;
+                        }
                         if let Some(err) = startup_err.clone() {
                             view.state.startup_error = Some(err);
                         }

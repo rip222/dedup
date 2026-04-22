@@ -881,9 +881,11 @@ impl ProjectView {
 
     /// Update the sidebar sort key. Invoked from the sort-dropdown
     /// menu items (issue #46). Also closes the popup via
-    /// [`AppState::set_sort_key`].
+    /// [`AppState::set_sort_key`] and persists the new key to
+    /// `sidebar.json` (issue #56) so it survives a window reopen.
     pub fn set_sort_key(&mut self, key: SortKey, cx: &mut Context<Self>) {
         self.state.set_sort_key(key);
+        self.state.persist_sidebar_prefs();
         cx.notify();
     }
 

@@ -59,11 +59,36 @@ The main window is split into two resizable panes.
 ### Sidebar (left)
 
 - Search box at the top (⌘F focuses it).
-- Group list sorted by "impact" (stable across runs).
+- Group list sorted by the selected sort key (see "Sort options"
+  below). Default is **Severity** for fresh installs; a pref file
+  from a prior version keeps its previously-persisted key.
 - Each row shows: tier badge, occurrence count, summary of paths,
   and a dismiss button.
 - Per-run filter controls let you hide Tier A, Tier B, or dismissed
   groups.
+
+#### Sort options
+
+The `Sort: <key>` button in the sidebar opens a dropdown (issue #46)
+that lists every variant of
+[`SortKey`](../crates/dedup-gui/src/app_state.rs). Selecting an option
+re-sorts the list in place and persists the choice to `sidebar.json`
+so it survives a window reopen.
+
+| Key | Meaning |
+|---|---|
+| Severity (default) | `occurrence_count × total_duplicated_LOC` summed across occurrences — surfaces the highest-leverage dupes first. Ties fall back to path-alphabetical for stability. |
+| Impact | Alias-style ordering preserved from the streaming buffer (match size × occurrence count). Kept for users who already rely on it. |
+| File count | Descending by distinct file paths across the group's occurrences. |
+| Line count | Descending by total duplicated line count. |
+| Alphabetical | A → Z by the row label. |
+| Recently dismissed last | Main list behaves like Alphabetical; the Dismissed section puts the most recent dismissal last. |
+
+Existing users upgrading from a pre-#56 build keep their previous
+"Impact" ordering — the load path treats a missing `sort_key` field
+in `sidebar.json` as "stay on Impact" rather than force-flipping them
+to Severity. Brand-new installs (no `sidebar.json` yet) start on
+Severity.
 
 ### Detail pane (right — "stacked view")
 
