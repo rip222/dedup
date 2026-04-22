@@ -21,11 +21,14 @@
 //! criteria, "Re-opening an already-cached directory is instant" and
 //! "no re-scan required".
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use crate::detail_rows::DetailRowsCache;
 
 use dedup_core::editor::{EditorConfig, EditorError, EnvPathLookup};
 use dedup_core::{
@@ -418,6 +421,17 @@ pub struct AppState {
     /// loaded at startup (see [`crate::lib`]) and written on drag end
     /// via [`AppState::persist_sidebar_prefs`].
     pub sidebar_width: f32,
+    /// Cached detail-pane rows (issue #49). Populated on the first
+    /// `render_detail` call after the state mutates; invalidated when
+    /// the cache-key fingerprint changes (group selection, per-
+    /// occurrence collapse, occurrence list, selection set, session-
+    /// dismissed set, or `DetailConfig::context_lines`).
+    ///
+    /// `RefCell` because `render_detail` takes `&AppState` and must
+    /// populate the cache on miss without forcing every caller to hold
+    /// `&mut AppState`. Not thread-shared (the GUI view-model lives on
+    /// the main thread), so `RefCell` is sufficient.
+    pub detail_rows_cache: RefCell<Option<DetailRowsCache>>,
 }
 
 impl Default for AppState {
@@ -451,6 +465,7 @@ impl Default for AppState {
             scan_issues: Vec::new(),
             scan_issues_open: false,
             sidebar_width: crate::sidebar_prefs::DEFAULT_SIDEBAR_WIDTH,
+            detail_rows_cache: RefCell::new(None),
         }
     }
 }

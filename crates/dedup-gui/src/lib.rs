@@ -22,6 +22,7 @@ mod logging;
 
 pub mod app_state;
 pub mod detail;
+pub mod detail_rows;
 pub mod empty_state;
 pub mod highlight;
 pub mod menubar;
