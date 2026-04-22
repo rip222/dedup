@@ -1987,32 +1987,66 @@ fn render_loaded(state: &AppState) -> gpui::Div {
         .child(render_detail(state))
 }
 
+/// Partition the sidebar's current groups into `(tier_b, tier_a)`.
+///
+/// While a scan is running we render the cache-backed Tier B set plus
+/// the mid-scan streaming Tier A buffer directly (search / sort
+/// intentionally do not re-apply to the streaming pulse — the final
+/// cache reload brings them back into the `visible_groups` path).
+/// Otherwise both lists come from the filtered + sorted
+/// `visible_groups`, partitioned by tier.
+///
+/// Extracted as a standalone fn so the partition is unit-testable
+/// without instantiating GPUI (#44).
+fn sidebar_tier_partition(state: &AppState) -> (Vec<GroupView>, Vec<GroupView>) {
+    if matches!(state.scan_state, ScanState::Running { .. }) {
+        (
+            state.tier_b_groups().cloned().collect(),
+            state.groups_streaming.clone(),
+        )
+    } else {
+        let visible = state.visible_groups();
+        (
+            visible
+                .iter()
+                .filter(|g| g.tier == Tier::B)
+                .cloned()
+                .collect(),
+            visible
+                .iter()
+                .filter(|g| g.tier == Tier::A)
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+/// Fixed row height for the sidebar group lists. `uniform_list`
+/// measures the first rendered row and reuses that height for every
+/// other row — so the row body must render at exactly this height for
+/// virtualization to line up with the scroll offset. 24 px at 12 px
+/// font + 4 px vertical padding lines up with the prior non-virtual
+/// layout (issue #44).
+const GROUP_ROW_HEIGHT: f32 = 24.0;
+
 fn render_sidebar(state: &AppState) -> gpui::Div {
     // Issue #23 — the sidebar renders the filtered + sorted list from
     // `AppState::visible_groups`. While a scan is running we still fall
     // back to the streaming buffer for Tier A (it arrives mid-scan,
     // before the cache reload), partitioned into the two tier sections
     // underneath the search / sort / summary row.
-    let visible = state.visible_groups();
-    let (tier_b, tier_a): (Vec<&GroupView>, Vec<&GroupView>) =
-        if matches!(state.scan_state, ScanState::Running { .. }) {
-            // Scan in flight — show cache-backed Tier B + streaming
-            // Tier A so the user still sees Impact-sorted rows during
-            // the scan. Search / sort do not re-apply to the streaming
-            // buffer (that's a #22 concern); the final cache reload
-            // brings them back into the `visible` path.
-            (
-                state.tier_b_groups().collect(),
-                state.groups_streaming.iter().collect(),
-            )
-        } else {
-            (
-                visible.iter().filter(|g| g.tier == Tier::B).collect(),
-                visible.iter().filter(|g| g.tier == Tier::A).collect(),
-            )
-        };
+    //
+    // Issue #44 — the two tier lists render through `uniform_list` so
+    // only the visible window of rows is materialized per frame.
+    // Section headers, search / sort / summary, and the dismissed
+    // section stay outside the lists so they keep their fixed layout
+    // and don't pay the virtualization cost.
+    let (tier_b, tier_a) = sidebar_tier_partition(state);
 
     let summary = state.summary();
+    let selected = state.selected_group;
+    let tier_b_count = tier_b.len();
+    let tier_a_count = tier_a.len();
 
     div()
         .w(px(320.0))
@@ -2050,30 +2084,52 @@ fn render_sidebar(state: &AppState) -> gpui::Div {
         .child(render_search_box(state))
         .child(render_sort_dropdown(state))
         .child(render_summary_header(&summary.format()))
-        // Scrollable body: sections + rows + dismissed. Header stays pinned.
-        .child(
-            div()
-                .id("sidebar-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(render_section_header(
-                    "Duplicated functions / classes",
-                    tier_b.len(),
-                ))
-                .children(
-                    tier_b
-                        .iter()
-                        .map(|g| render_group_row(g, state.selected_group == Some(g.id))),
-                )
-                .child(render_section_header("Duplicated blocks", tier_a.len()))
-                .children(
-                    tier_a
-                        .iter()
-                        .map(|g| render_group_row(g, state.selected_group == Some(g.id))),
-                )
-                .child(render_dismissed_section(state)),
-        )
+        // Tier B (functions / classes) — header outside, rows virtualized.
+        .child(render_section_header(
+            "Duplicated functions / classes",
+            tier_b_count,
+        ))
+        .child(render_virtualized_group_list(
+            "sidebar-tier-b",
+            tier_b,
+            selected,
+        ))
+        // Tier A (blocks) — header outside, rows virtualized.
+        .child(render_section_header("Duplicated blocks", tier_a_count))
+        .child(render_virtualized_group_list(
+            "sidebar-tier-a",
+            tier_a,
+            selected,
+        ))
+        // Dismissed section stays outside the lists so its expand/collapse
+        // header and rows render normally.
+        .child(render_dismissed_section(state))
+}
+
+/// Wrap a `uniform_list` of sidebar group rows in a `flex_1` container
+/// so the two tier lists share the sidebar's remaining vertical space
+/// and each virtualizes its own viewport. The `min_h_0` on the wrapper
+/// is required for flex children with scrollable content — without it
+/// the container will grow to fit all rows and defeat virtualization.
+fn render_virtualized_group_list(
+    id: &'static str,
+    groups: Vec<GroupView>,
+    selected: Option<i64>,
+) -> gpui::Div {
+    let count = groups.len();
+    let rows = Rc::new(groups);
+    let rows_for_render = rows.clone();
+    let list = uniform_list(id, count, move |range, _window, _cx| {
+        range
+            .map(|idx| {
+                let g = &rows_for_render[idx];
+                render_group_row(g, selected == Some(g.id))
+            })
+            .collect::<Vec<_>>()
+    })
+    .h_full()
+    .flex_1();
+    div().flex_1().min_h_0().child(list)
 }
 
 /// Search input slot (issue #23).
@@ -2156,9 +2212,16 @@ fn render_section_header(title: &'static str, count: usize) -> gpui::Div {
 fn render_group_row(group: &GroupView, selected: bool) -> gpui::Div {
     let id = group.id;
     let label = group.label.clone();
+    // Fixed row height required by `uniform_list` — it measures the
+    // first row and reuses that height for every row in the list
+    // (#44). Center the label vertically inside the fixed frame so the
+    // visual weight matches the prior `py(px(4.0))` layout.
     let row = div()
+        .h(px(GROUP_ROW_HEIGHT))
         .px(px(16.0))
-        .py(px(4.0))
+        .flex()
+        .flex_row()
+        .items_center()
         .text_size(px(12.0))
         .text_color(rgb(ROW_TEXT))
         .cursor_pointer()
@@ -3544,5 +3607,87 @@ mod detail_row_tests {
         assert!(matches!(rows[0], DetailRow::Summary(_)));
         assert!(matches!(rows[1], DetailRow::OccurrenceHeader { .. }));
         assert!(matches!(rows[2], DetailRow::OccurrenceHeader { .. }));
+    }
+}
+
+#[cfg(test)]
+mod sidebar_partition_tests {
+    //! Pure-data tests for `sidebar_tier_partition` (#44) — the
+    //! partition that feeds the two virtualized `uniform_list`
+    //! instances in `render_sidebar`. The render code itself needs
+    //! GPUI to instantiate; the partition is standalone data logic and
+    //! covered here.
+
+    use super::sidebar_tier_partition;
+    use crate::app_state::{AppState, GroupView, OccurrenceView};
+    use dedup_core::Tier;
+    use std::path::PathBuf;
+
+    fn gv(id: i64, tier: Tier, label: &str) -> GroupView {
+        GroupView {
+            id,
+            tier,
+            label: label.into(),
+            occurrences: vec![OccurrenceView {
+                path: PathBuf::from("x.rs"),
+                start_line: 1,
+                end_line: 2,
+                alpha_rename_spans: Vec::new(),
+            }],
+            language: None,
+            group_hash: Some(id as u64),
+        }
+    }
+
+    #[test]
+    fn partition_idle_splits_visible_by_tier() {
+        let mut s = AppState::new();
+        s.groups = vec![
+            gv(1, Tier::A, "a1"),
+            gv(2, Tier::B, "b1"),
+            gv(3, Tier::A, "a2"),
+            gv(4, Tier::B, "b2"),
+        ];
+        let (tier_b, tier_a) = sidebar_tier_partition(&s);
+        let ids_b: Vec<i64> = tier_b.iter().map(|g| g.id).collect();
+        let ids_a: Vec<i64> = tier_a.iter().map(|g| g.id).collect();
+        assert_eq!(ids_b, vec![2, 4]);
+        assert_eq!(ids_a, vec![1, 3]);
+    }
+
+    #[test]
+    fn partition_idle_respects_search_filter() {
+        let mut s = AppState::new();
+        s.groups = vec![
+            gv(1, Tier::A, "apple"),
+            gv(2, Tier::B, "banana"),
+            gv(3, Tier::A, "apricot"),
+        ];
+        s.set_search_query("ap".into());
+        let (tier_b, tier_a) = sidebar_tier_partition(&s);
+        // Search filter applies through `visible_groups`, so banana
+        // is dropped from Tier B and both ap* rows survive in Tier A.
+        assert!(tier_b.is_empty(), "tier_b should be empty, got {tier_b:?}");
+        let ids_a: Vec<i64> = tier_a.iter().map(|g| g.id).collect();
+        assert_eq!(ids_a, vec![1, 3]);
+    }
+
+    #[test]
+    fn partition_running_uses_streaming_buffer_for_tier_a() {
+        let mut s = AppState::new();
+        // Cache-backed Tier B rows persist across the scan-running
+        // transition; streaming pulse supplies Tier A mid-scan.
+        s.groups = vec![gv(10, Tier::B, "b_cached")];
+        s.groups_streaming = vec![gv(99, Tier::A, "a_stream")];
+        let _ = s.begin_scan().unwrap();
+        assert!(s.scan_state.is_running());
+        // Repopulate streaming after begin_scan() clears it.
+        s.groups_streaming = vec![gv(99, Tier::A, "a_stream")];
+
+        let (tier_b, tier_a) = sidebar_tier_partition(&s);
+        let ids_b: Vec<i64> = tier_b.iter().map(|g| g.id).collect();
+        let ids_a: Vec<i64> = tier_a.iter().map(|g| g.id).collect();
+        assert_eq!(ids_b, vec![10]);
+        assert_eq!(ids_a, vec![99]);
     }
 }
