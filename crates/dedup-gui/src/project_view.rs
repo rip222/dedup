@@ -24,8 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    ClipboardItem, Context, MouseButton, Window, black, div, prelude::*, px, rgb, uniform_list,
-    white,
+    ClipboardItem, Context, FocusHandle, MouseButton, Window, black, div, prelude::*, px, rgb,
+    uniform_list, white,
 };
 
 use crate::app_state::{
@@ -119,13 +119,28 @@ pub struct ProjectView {
     /// no scan is in flight. Stored behind an `Arc<Mutex<_>>` so the
     /// 250 ms polling task can poll it without taking `&mut self`.
     scan_rx: ScanEventRx,
+    /// Focus handle for the root element. GPUI dispatches keyboard
+    /// actions through the focused element's key-context tree — without
+    /// a focus handle bound to a `track_focus` call on the root div,
+    /// every `cx.on_action` handler registered by the menubar would
+    /// silently never fire because the window has no focused element.
+    /// Issue #42.
+    pub focus_handle: FocusHandle,
 }
 
 impl ProjectView {
-    pub fn new() -> Self {
+    /// Construct an empty ProjectView tied to `cx`.
+    ///
+    /// `cx` is required so the view can allocate a [`FocusHandle`] — the
+    /// handle is tracked by the root div in [`Self::render`] (via
+    /// `track_focus`) and focused by `lib.rs::run` after the window
+    /// opens, which is what lets keyboard shortcuts actually fire
+    /// (issue #42).
+    pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             state: AppState::new(),
             scan_rx: Arc::new(Mutex::new(None)),
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -1124,12 +1139,6 @@ async fn spawn_banner_dismiss(this: gpui::WeakEntity<ProjectView>, cx: &mut gpui
     });
 }
 
-impl Default for ProjectView {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // -----------------------------------------------------------------------
 // Global — shared handle so action handlers can reach the root view.
 // -----------------------------------------------------------------------
@@ -1421,6 +1430,16 @@ fn dispatch_open_recent(idx: usize, cx: &mut gpui::App) {
 
 impl Render for ProjectView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // Issue #42 — root focus anchor. GPUI's key dispatch walks from
+        // the focused element up to the window root; without a
+        // `track_focus` anywhere in the tree the window has no focused
+        // element and keystrokes never reach the keymap, so every
+        // `cx.on_action` handler the menubar registers is effectively
+        // dead. Attaching the root `FocusHandle` + a `ProjectView`
+        // key-context here (and focusing the handle from
+        // `lib.rs::run`) gives the keymap a non-empty dispatch path
+        // to resolve bindings against.
+        let root_focus = self.focus_handle.clone();
         // Shell: horizontal split, sidebar on the left + detail on the
         // right. We render the no-folder / empty / no-duplicates / newer-
         // cache / error banners as full-window overlays over the shell so
@@ -1474,6 +1493,8 @@ impl Render for ProjectView {
         };
 
         div()
+            .track_focus(&root_focus)
+            .key_context("ProjectView")
             .size_full()
             .flex()
             .flex_col()

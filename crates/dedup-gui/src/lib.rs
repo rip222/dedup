@@ -88,15 +88,23 @@ pub fn run() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| {
-                    cx.new(|_| {
-                        let mut view = ProjectView::new();
+                |window, cx| {
+                    let entity = cx.new(|cx| {
+                        let mut view = ProjectView::new(cx);
                         view.state.recent_projects = initial_recents.clone();
                         if let Some(err) = startup_err.clone() {
                             view.state.startup_error = Some(err);
                         }
                         view
-                    })
+                    });
+                    // Issue #42 — focus the root handle so GPUI has a
+                    // non-empty dispatch path for key events; without
+                    // this, `cx.on_action` handlers never fire because
+                    // the keymap resolves bindings against the focused
+                    // element's context tree.
+                    let handle = entity.read(cx).focus_handle.clone();
+                    window.focus(&handle, cx);
+                    entity
                 },
             )
             .expect("dedup-gui: failed to open project window");
@@ -166,5 +174,46 @@ mod tests {
                 "missing required shortcut {required} — check SHORTCUTS in menubar.rs"
             );
         }
+    }
+
+    /// Issue #42 — regression guard for keyboard-shortcut dispatch
+    /// wiring. GPUI routes actions via the focused element's
+    /// key-context tree; if `ProjectView::render` ever stops calling
+    /// both `track_focus` and `key_context` on the root div, or
+    /// `lib.rs::run` stops focusing the root handle at window open,
+    /// every `cx.on_action` handler silently goes dead again. The
+    /// three required call sites live in plain-text source so we can
+    /// assert them from a pure-data test without standing up a GPUI
+    /// runtime on a worker thread.
+    #[test]
+    fn project_view_root_establishes_key_context_tree() {
+        let view_src = include_str!("project_view.rs");
+        assert!(
+            view_src.contains(".track_focus(&root_focus)"),
+            "project_view.rs render must call track_focus on the root \
+             div — otherwise GPUI has no focused element and key \
+             bindings never dispatch (issue #42)"
+        );
+        assert!(
+            view_src.contains(".key_context(\"ProjectView\")"),
+            "project_view.rs render must set a key_context on the \
+             root div so the keymap has a non-empty context stack to \
+             match bindings against (issue #42)"
+        );
+        assert!(
+            view_src.contains("focus_handle: FocusHandle"),
+            "ProjectView must own a FocusHandle field so the root \
+             div can track focus and lib.rs::run can focus it on \
+             startup (issue #42)"
+        );
+
+        let lib_src = include_str!("lib.rs");
+        assert!(
+            lib_src.contains("window.focus(&handle, cx)"),
+            "lib.rs::run must focus the ProjectView's root handle \
+             after opening the window — without an initial focus \
+             GPUI's dispatch path is empty and no shortcut fires \
+             (issue #42)"
+        );
     }
 }
