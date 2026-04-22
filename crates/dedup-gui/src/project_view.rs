@@ -1070,6 +1070,52 @@ impl ProjectView {
         cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
     }
 
+    /// Toolbar "Copy as LLM prompt" (#57) — build the markdown prompt
+    /// via [`crate::llm_prompt::llm_prompt`], drop it onto the system
+    /// clipboard, and raise a success toast so the user has visible
+    /// feedback (the clipboard write is otherwise silent).
+    ///
+    /// The button that triggers this is disabled upstream when no
+    /// group is selected or any occurrence source is unavailable, but
+    /// we re-check here so a race (e.g. the file got renamed between
+    /// render + click) can't produce a half-populated prompt.
+    pub fn copy_group_as_llm_prompt(
+        &mut self,
+        group_id: i64,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.state.groups.iter().find(|g| g.id == group_id).cloned() else {
+            return;
+        };
+        let occurrences = self.state.visible_occurrences_of(&group);
+        if occurrences.is_empty() {
+            return;
+        }
+        // Read each occurrence's source through the same helper the
+        // detail-pane render uses, so the clipboard content matches
+        // what the user sees on-screen.
+        let sources: Vec<Option<String>> = occurrences
+            .iter()
+            .map(|o| read_occurrence_source(&self.state, o).map(|(src, _)| src))
+            .collect();
+        if !crate::llm_prompt::all_sources_available(&sources) {
+            // Race with a file rename / delete between render + click.
+            // Surface as a warning toast rather than silently copying a
+            // stub prompt — matches the spirit of the disabled-state
+            // tooltip.
+            self.state.push_warning_toast(
+                "Some source files are unavailable — prompt not copied.",
+            );
+            cx.notify();
+            return;
+        }
+        let prompt = crate::llm_prompt::llm_prompt(&group, &occurrences, &sources);
+        cx.write_to_clipboard(ClipboardItem::new_string(prompt));
+        self.state.push_info_toast("Copied LLM prompt to clipboard.");
+        cx.notify();
+    }
+
     /// Toolbar "Open in editor" — respect checkboxes, fall back to
     /// every visible path when none are checked. Wired to the real
     /// launcher (#29); each target carries the first line number of
@@ -3139,6 +3185,51 @@ fn render_group_toolbar(state: &AppState, group_id: i64) -> gpui::Div {
             .child("Copy paths"),
         "Copy checked paths to clipboard",
     );
+    // Issue #57 — "Copy as LLM prompt". Disabled (greyed out + no
+    // click handler) when any occurrence source is unavailable so the
+    // user can't generate a half-populated prompt. We check via a
+    // cheap `Path::exists` stat per occurrence — a handful of `stat`s
+    // per render is negligible relative to the uniform-list layout
+    // that already runs on every frame, and it avoids reading the
+    // full file contents just to decide whether the button is live.
+    let gid_llm = group_id;
+    let sources_ok = llm_sources_available(state, group_id);
+    let llm_tooltip = if sources_ok {
+        "Copy a markdown prompt containing every occurrence to the clipboard"
+    } else {
+        "One or more source files are unavailable — can't build a complete prompt"
+    };
+    let llm_btn_base = div()
+        .id(("toolbar-btn-llm", gid_llm as u64))
+        .px(px(10.0))
+        .py(px(5.0))
+        .bg(rgb(TOOLBAR_BUTTON_BG))
+        .rounded(px(4.0))
+        .text_size(px(12.0))
+        .child("Copy as LLM prompt");
+    let llm_btn = if sources_ok {
+        with_tooltip(
+            llm_btn_base
+                .text_color(rgb(ROW_TEXT))
+                .cursor_pointer()
+                .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |_, window: &mut Window, cx: &mut gpui::App| {
+                        if let Some(RootHandle(entity)) =
+                            cx.try_global::<RootHandle>().cloned()
+                        {
+                            entity.update(cx, |view, cx| {
+                                view.copy_group_as_llm_prompt(gid_llm, window, cx)
+                            });
+                        }
+                    },
+                ),
+            llm_tooltip,
+        )
+    } else {
+        with_tooltip(llm_btn_base.text_color(rgb(ROW_TEXT_DIM)), llm_tooltip)
+    };
     let collapse_btn = toolbar_button_with_tooltip(
         "Collapse all",
         Some("Collapse every occurrence in this group"),
@@ -3207,9 +3298,34 @@ fn render_group_toolbar(state: &AppState, group_id: i64) -> gpui::Div {
         .child(open_btn)
         .child(dismiss_btn)
         .child(copy_btn)
+        .child(llm_btn)
         .child(collapse_btn)
         .child(expand_btn)
         .child(close_btn)
+}
+
+/// Cheap "every occurrence source is readable" probe for the "Copy as
+/// LLM prompt" button's disabled state (#57).
+///
+/// Uses `Path::exists` rather than a full read because the button only
+/// needs a binary signal at render time — the real read happens once
+/// on click, inside [`ProjectView::copy_group_as_llm_prompt`], which
+/// also falls back to a warning toast on the (racy) case of a file
+/// disappearing between the probe and the click.
+fn llm_sources_available(state: &AppState, group_id: i64) -> bool {
+    let Some(folder) = state.current_folder.as_ref() else {
+        return false;
+    };
+    let Some(group) = state.groups.iter().find(|g| g.id == group_id) else {
+        return false;
+    };
+    let occurrences = state.visible_occurrences_of(group);
+    if occurrences.is_empty() {
+        return false;
+    }
+    occurrences
+        .iter()
+        .all(|o| folder.join(&o.path).exists())
 }
 
 /// Render one flattened row from [`build_detail_rows`].
