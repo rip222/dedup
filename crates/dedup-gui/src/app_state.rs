@@ -1926,6 +1926,24 @@ mod tests {
         }
     }
 
+    /// Build a `dedup_core::Occurrence` for the load-folder test fixtures.
+    ///
+    /// All call sites in this module use the same 1..=10 / 0..100 span,
+    /// so the helper takes only the path. Collapses the duplicated
+    /// struct literals surfaced by #32 dogfood scan (group 56).
+    fn mk_occ(path: &str) -> dedup_core::Occurrence {
+        dedup_core::Occurrence {
+            path: PathBuf::from(path),
+            span: dedup_core::rolling_hash::Span {
+                start_line: 1,
+                end_line: 10,
+                start_byte: 0,
+                end_byte: 100,
+            },
+            alpha_rename_spans: Vec::new(),
+        }
+    }
+
     #[test]
     fn occurrence_label_uses_en_dash() {
         let o = occ("src/auth/login.rs", 42, 58);
@@ -2949,46 +2967,14 @@ mod tests {
         // Integration with cache: write a scan, dismiss one occurrence,
         // reload via `load_folder`. The dismissed occurrence must not
         // reach the GroupView.
-        use dedup_core::rolling_hash::Span;
-        use dedup_core::{MatchGroup as CoreGroup, Occurrence as CoreOcc, ScanResult, Tier};
+        use dedup_core::{MatchGroup as CoreGroup, ScanResult, Tier};
 
         let tmp = tempfile::tempdir().unwrap();
         let scan = ScanResult {
             groups: vec![CoreGroup {
                 hash: 0xfeed_u64,
                 tier: Tier::A,
-                occurrences: vec![
-                    CoreOcc {
-                        path: PathBuf::from("a.rs"),
-                        span: Span {
-                            start_line: 1,
-                            end_line: 10,
-                            start_byte: 0,
-                            end_byte: 100,
-                        },
-                        alpha_rename_spans: Vec::new(),
-                    },
-                    CoreOcc {
-                        path: PathBuf::from("b.rs"),
-                        span: Span {
-                            start_line: 1,
-                            end_line: 10,
-                            start_byte: 0,
-                            end_byte: 100,
-                        },
-                        alpha_rename_spans: Vec::new(),
-                    },
-                    CoreOcc {
-                        path: PathBuf::from("c.rs"),
-                        span: Span {
-                            start_line: 1,
-                            end_line: 10,
-                            start_byte: 0,
-                            end_byte: 100,
-                        },
-                        alpha_rename_spans: Vec::new(),
-                    },
-                ],
+                occurrences: vec![mk_occ("a.rs"), mk_occ("b.rs"), mk_occ("c.rs")],
             }],
             files_scanned: 3,
             issues: Vec::new(),
@@ -3013,36 +2999,14 @@ mod tests {
 
     #[test]
     fn load_folder_drops_group_when_occ_suppressions_bring_below_two() {
-        use dedup_core::rolling_hash::Span;
-        use dedup_core::{MatchGroup as CoreGroup, Occurrence as CoreOcc, ScanResult, Tier};
+        use dedup_core::{MatchGroup as CoreGroup, ScanResult, Tier};
 
         let tmp = tempfile::tempdir().unwrap();
         let scan = ScanResult {
             groups: vec![CoreGroup {
                 hash: 0xfeed_u64,
                 tier: Tier::A,
-                occurrences: vec![
-                    CoreOcc {
-                        path: PathBuf::from("a.rs"),
-                        span: Span {
-                            start_line: 1,
-                            end_line: 10,
-                            start_byte: 0,
-                            end_byte: 100,
-                        },
-                        alpha_rename_spans: Vec::new(),
-                    },
-                    CoreOcc {
-                        path: PathBuf::from("b.rs"),
-                        span: Span {
-                            start_line: 1,
-                            end_line: 10,
-                            start_byte: 0,
-                            end_byte: 100,
-                        },
-                        alpha_rename_spans: Vec::new(),
-                    },
-                ],
+                occurrences: vec![mk_occ("a.rs"), mk_occ("b.rs")],
             }],
             files_scanned: 2,
             issues: Vec::new(),
