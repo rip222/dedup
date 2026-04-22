@@ -89,7 +89,13 @@ pub const CACHE_FILE: &str = "cache.sqlite";
 /// same hash the group-level `suppressions` table keys on so a user
 /// who first dismisses one occurrence and then the whole group never
 /// needs to clean up both.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+///
+/// v4 (#59) adds history-diff foundation: a `scans` table (one row per
+/// successful [`Cache::write_scan_result`] call) and a `scan_groups`
+/// append-only sidecar that links every group hash seen in a scan to
+/// its `scan_id`. Together they power `Cache::lineage` and the
+/// `dedup diff` CLI. Additive — v3 rows survive untouched.
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Backwards-compatible alias for [`CURRENT_SCHEMA_VERSION`]. Kept so
 /// `pub use` consumers of this crate don't break on the #18 rename.
@@ -199,6 +205,53 @@ pub struct FileFingerprint {
     pub mtime: i64,
 }
 
+/// One scan-history row (issue #59). Emitted per successful
+/// `write_scan_result` call. `folder_hash` encodes the scanned repo root
+/// so multiple repos sharing a filesystem can't cross-contaminate; it is
+/// the 64-bit FNV-1a hash of the canonical POSIX path. `git_commit` is
+/// the full 40-char SHA of `HEAD` at scan time when the root is inside
+/// a git work tree, else `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRow {
+    pub scan_id: i64,
+    pub started_at: i64,
+    pub folder_hash: crate::rolling_hash::Hash,
+    pub git_commit: Option<String>,
+}
+
+/// One lineage row (issue #59): a group hash observed in a given scan,
+/// with the per-scan counts that `dedup diff` classifies on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanGroupRow {
+    pub group_hash: crate::rolling_hash::Hash,
+    pub occurrence_count: i64,
+    pub total_lines: i64,
+}
+
+/// Diff classification between two scans (#59). Per group hash; stable
+/// ordering by hash at render time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    /// Present in head, absent from base.
+    New,
+    /// Present in both, head.occurrence_count > base.occurrence_count.
+    Grew,
+    /// Present in both, head.occurrence_count < base.occurrence_count.
+    Shrank,
+    /// Present in base, absent from head.
+    Gone,
+}
+
+/// Single-row classification emitted by [`Cache::diff_scans`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRow {
+    pub group_hash: crate::rolling_hash::Hash,
+    pub kind: DiffKind,
+    /// `(base_count, head_count)`. For `New`, base is 0; for `Gone`, head is 0.
+    pub base_count: i64,
+    pub head_count: i64,
+}
+
 /// A per-file block-hash list alongside the content hash it was computed
 /// under. Fetched on a warm scan so we can skip tokenize + rolling-hash
 /// work. The `block_hashes` vector preserves the order produced by the
@@ -216,6 +269,12 @@ pub struct CachedBlocks {
 /// connection, which is reused for all subsequent operations.
 pub struct Cache {
     conn: Connection,
+    /// Repo root the cache was opened against (issue #59). Used to derive
+    /// `scans.folder_hash` on every `write_scan_result` call and to shell
+    /// out to `git -C <root> rev-parse HEAD` for `scans.git_commit`.
+    /// Stored as an `Option` so `open_readonly` paths (which never write)
+    /// can still construct a `Cache` without a fully-resolved root.
+    repo_root: Option<PathBuf>,
 }
 
 impl Cache {
@@ -268,7 +327,10 @@ impl Cache {
             "cache: opened"
         );
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            repo_root: Some(repo_root.to_path_buf()),
+        })
     }
 
     /// Open the cache read-only for `repo_root`.
@@ -313,7 +375,10 @@ impl Cache {
             });
         }
 
-        Ok(Some(Self { conn }))
+        Ok(Some(Self {
+            conn,
+            repo_root: Some(repo_root.to_path_buf()),
+        }))
     }
 
     /// Read the stored [`FileFingerprint`] for `path`, if any.
@@ -428,12 +493,26 @@ impl Cache {
     /// content-hash column is populated with a placeholder byte string
     /// for now. #14 will wire real per-file content hashes into the
     /// warm-scan skip path; this issue only needs the row to exist.
-    pub fn write_scan_result(&mut self, result: &ScanResult) -> Result<(), CacheError> {
+    pub fn write_scan_result(&mut self, result: &ScanResult) -> Result<i64, CacheError> {
         debug!(
             groups = result.groups.len(),
             files_scanned = result.files_scanned,
             "cache: write_scan_result"
         );
+        // Resolve history metadata up front so the scan row is emitted
+        // with the same folder_hash / git_commit a subsequent
+        // `dedup diff` query will match against. Both are best-effort:
+        // `folder_hash` defaults to 0 if no repo root was stored (should
+        // only happen in hand-built `Cache` values), and `git_commit`
+        // is left `None` when the root isn't a git work tree.
+        let folder_hash = self
+            .repo_root
+            .as_deref()
+            .map(folder_hash_for_path)
+            .unwrap_or(0);
+        let git_commit = self.repo_root.as_deref().and_then(git_commit_for_path);
+        let started_at = now_unix_seconds();
+
         let tx = self.conn.transaction()?;
 
         // Fresh state — occurrences cascade from match_groups. The
@@ -491,8 +570,38 @@ impl Cache {
             }
         }
 
+        // History-diff lineage (#59): append a scans row + one
+        // scan_groups row per observed group hash. Additive — existing
+        // rows are untouched. `(scan_id, group_hash)` is PK so a replay
+        // of the same scan (shouldn't happen — scan_id is fresh) would
+        // be rejected rather than silently double-count.
+        let folder_hash_bytes = folder_hash.to_be_bytes();
+        tx.execute(
+            "INSERT INTO scans (started_at, folder_hash, git_commit) \
+             VALUES (?1, ?2, ?3)",
+            params![started_at, &folder_hash_bytes[..], git_commit],
+        )?;
+        let scan_id = tx.last_insert_rowid();
+        {
+            let mut sg_stmt = tx.prepare(
+                "INSERT INTO scan_groups \
+                    (scan_id, group_hash, occurrence_count, total_lines) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for group in &result.groups {
+                let (total_lines, _) = group_totals(group);
+                let group_hash_bytes = group.hash.to_be_bytes();
+                sg_stmt.execute(params![
+                    scan_id,
+                    &group_hash_bytes[..],
+                    group.occurrences.len() as i64,
+                    total_lines as i64,
+                ])?;
+            }
+        }
+
         tx.commit()?;
-        Ok(())
+        Ok(scan_id)
     }
 
     /// List all persisted group summaries, ordered by tier (A first,
@@ -862,6 +971,172 @@ impl Cache {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         Ok(mode)
     }
+
+    // ---- History-diff foundation (issue #59) -------------------------
+
+    /// Every persisted scan, ordered newest-first (`started_at DESC`).
+    /// The latest row is what `dedup diff` treats as the "head" scan.
+    pub fn list_scans(&self) -> Result<Vec<ScanRow>, CacheError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scan_id, started_at, folder_hash, git_commit \
+             FROM scans \
+             ORDER BY started_at DESC, scan_id DESC",
+        )?;
+        let rows = stmt.query_map([], scan_row_from_sql)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch one scan row by its id, `Ok(None)` when the id is unknown.
+    pub fn get_scan(&self, scan_id: i64) -> Result<Option<ScanRow>, CacheError> {
+        self.conn
+            .query_row(
+                "SELECT scan_id, started_at, folder_hash, git_commit \
+                 FROM scans WHERE scan_id = ?1",
+                params![scan_id],
+                scan_row_from_sql,
+            )
+            .optional()
+            .map_err(CacheError::from)
+    }
+
+    /// Every scan in which `group_hash` appeared, in chronological order
+    /// (oldest first). Implements the "lineage" acceptance criterion of
+    /// issue #59 verbatim.
+    pub fn lineage(
+        &self,
+        group_hash: crate::rolling_hash::Hash,
+    ) -> Result<Vec<i64>, CacheError> {
+        let bytes = group_hash.to_be_bytes();
+        let mut stmt = self.conn.prepare(
+            "SELECT sg.scan_id \
+             FROM scan_groups sg \
+             JOIN scans s ON s.scan_id = sg.scan_id \
+             WHERE sg.group_hash = ?1 \
+             ORDER BY s.started_at ASC, s.scan_id ASC",
+        )?;
+        let rows = stmt.query_map(params![&bytes[..]], |r| r.get::<_, i64>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Every `(group_hash, occurrence_count, total_lines)` row recorded
+    /// for `scan_id`. Returned in a stable hash-ascending order so diff
+    /// output is reproducible across platforms.
+    pub fn scan_groups(&self, scan_id: i64) -> Result<Vec<ScanGroupRow>, CacheError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_hash, occurrence_count, total_lines \
+             FROM scan_groups WHERE scan_id = ?1 \
+             ORDER BY group_hash ASC",
+        )?;
+        let rows = stmt.query_map(params![scan_id], |r| {
+            let bytes: Vec<u8> = r.get(0)?;
+            let occ: i64 = r.get(1)?;
+            let lines: i64 = r.get(2)?;
+            Ok((bytes, occ, lines))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (bytes, occ, lines) = r?;
+            if let Some(h) = blob_to_hash(&bytes) {
+                out.push(ScanGroupRow {
+                    group_hash: h,
+                    occurrence_count: occ,
+                    total_lines: lines,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Classify every group hash that appears in either scan into NEW /
+    /// GREW / SHRANK / GONE. Unchanged groups (same occurrence count)
+    /// are omitted so `dedup diff` output stays signal-dense. Rows are
+    /// sorted by hash ascending for grep-friendly determinism.
+    pub fn diff_scans(
+        &self,
+        base_scan_id: i64,
+        head_scan_id: i64,
+    ) -> Result<Vec<DiffRow>, CacheError> {
+        use std::collections::BTreeMap;
+        let base = self.scan_groups(base_scan_id)?;
+        let head = self.scan_groups(head_scan_id)?;
+        let mut map: BTreeMap<crate::rolling_hash::Hash, (i64, i64)> = BTreeMap::new();
+        for r in &base {
+            map.entry(r.group_hash).or_insert((0, 0)).0 = r.occurrence_count;
+        }
+        for r in &head {
+            map.entry(r.group_hash).or_insert((0, 0)).1 = r.occurrence_count;
+        }
+        let mut out = Vec::with_capacity(map.len());
+        for (hash, (b, h)) in map {
+            let kind = match (b, h) {
+                (0, _) if h > 0 => DiffKind::New,
+                (_, 0) if b > 0 => DiffKind::Gone,
+                (b, h) if h > b => DiffKind::Grew,
+                (b, h) if h < b => DiffKind::Shrank,
+                _ => continue, // unchanged → skip
+            };
+            out.push(DiffRow {
+                group_hash: hash,
+                kind,
+                base_count: b,
+                head_count: h,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Resolve a git commit SHA (or prefix, minimum 4 chars) to the
+    /// single scan_id whose `scans.git_commit` matches. Returns
+    /// `Ok(None)` when no scan row carries that commit. The match is
+    /// anchored at the start of the stored SHA so `abcd` only matches
+    /// commits beginning with `abcd`.
+    pub fn resolve_scan_by_commit_prefix(
+        &self,
+        sha_prefix: &str,
+    ) -> Result<Option<i64>, CacheError> {
+        if sha_prefix.len() < 4 {
+            return Ok(None);
+        }
+        let pattern = format!("{}%", sha_prefix);
+        self.conn
+            .query_row(
+                "SELECT scan_id FROM scans \
+                 WHERE git_commit LIKE ?1 \
+                 ORDER BY started_at DESC, scan_id DESC \
+                 LIMIT 1",
+                params![pattern],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(CacheError::from)
+    }
+
+    /// Latest scan whose `started_at <= cutoff_unix_seconds`. Used to
+    /// resolve `--since <relative-date>` into a concrete scan_id.
+    pub fn latest_scan_at_or_before(
+        &self,
+        cutoff: i64,
+    ) -> Result<Option<i64>, CacheError> {
+        self.conn
+            .query_row(
+                "SELECT scan_id FROM scans \
+                 WHERE started_at <= ?1 \
+                 ORDER BY started_at DESC, scan_id DESC \
+                 LIMIT 1",
+                params![cutoff],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(CacheError::from)
+    }
 }
 
 /// Apply the pragmas every connection needs: WAL journal, foreign keys,
@@ -902,6 +1177,7 @@ const MIGRATIONS: &[(u32, MigrationFn)] = &[
     (0, migrate_v0_to_v1),
     (1, migrate_v1_to_v2),
     (2, migrate_v2_to_v3),
+    (3, migrate_v3_to_v4),
 ];
 
 /// Ensure the cache is at [`CURRENT_SCHEMA_VERSION`].
@@ -1091,6 +1367,46 @@ fn migrate_v2_to_v3(tx: &rusqlite::Transaction<'_>) -> Result<(), CacheError> {
     Ok(())
 }
 
+/// v3 → v4 (#59): history-diff foundation.
+///
+/// Two additive tables:
+///
+/// - `scans(scan_id, started_at, folder_hash, git_commit)` — one row per
+///   successful `write_scan_result` call. `folder_hash` is an 8-byte
+///   big-endian blob (same convention as `match_groups.group_hash`) that
+///   encodes the repo root the scan was run against, so multiple repos
+///   sharing history schema can't cross-contaminate.
+/// - `scan_groups(scan_id, group_hash, occurrence_count, total_lines)` —
+///   append-only lineage. Every group hash observed in a scan gets one
+///   row. `(scan_id, group_hash)` is the primary key; re-writing the
+///   same scan row is idempotent via `INSERT OR REPLACE`.
+///
+/// Indices: `scan_groups_hash_idx` so `lineage(group_hash)` can fetch
+/// all scan ids in one rowid-ordered scan. `scans_started_idx` so the
+/// `--since <relative-date>` lookup can range-scan by timestamp.
+fn migrate_v3_to_v4(tx: &rusqlite::Transaction<'_>) -> Result<(), CacheError> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scans (\
+            scan_id      INTEGER PRIMARY KEY,\
+            started_at   INTEGER NOT NULL,\
+            folder_hash  BLOB NOT NULL,\
+            git_commit   TEXT\
+         );\
+         CREATE INDEX IF NOT EXISTS scans_started_idx \
+            ON scans(started_at);\
+         CREATE TABLE IF NOT EXISTS scan_groups (\
+            scan_id           INTEGER NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,\
+            group_hash        BLOB NOT NULL,\
+            occurrence_count  INTEGER NOT NULL,\
+            total_lines       INTEGER NOT NULL,\
+            PRIMARY KEY (scan_id, group_hash)\
+         );\
+         CREATE INDEX IF NOT EXISTS scan_groups_hash_idx \
+            ON scan_groups(group_hash);",
+    )?;
+    Ok(())
+}
+
 /// Read `PRAGMA user_version` as a `u32`. SQLite stores it as a signed
 /// 32-bit integer; negative values would be a corrupted-header edge case
 /// we'd never write ourselves, so we clamp to 0 rather than surfacing an
@@ -1177,6 +1493,63 @@ fn decode_block_hashes(bytes: &[u8]) -> Vec<crate::rolling_hash::Hash> {
         out.push(u64::from_le_bytes(arr));
     }
     out
+}
+
+/// Stable 64-bit hash of the canonicalized repo-root path, used as
+/// `scans.folder_hash`. Uses FNV-1a so the value doesn't depend on
+/// `std::collections::hash_map::RandomState`'s per-process salt — a
+/// scan written from one process and diffed from another must match.
+pub fn folder_hash_for_path(path: &Path) -> crate::rolling_hash::Hash {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let s = canonical.to_string_lossy().replace('\\', "/");
+    fnv1a_64(s.as_bytes())
+}
+
+/// Shell out to `git -C <path> rev-parse HEAD`. Returns `None` when the
+/// path is not inside a git work tree, when `git` isn't on `PATH`, or
+/// when the command exits non-zero. Best-effort — callers treat absence
+/// as "scan not linkable to a commit".
+pub fn git_commit_for_path(path: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?;
+    let trimmed = sha.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    h
+}
+
+fn scan_row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScanRow> {
+    let scan_id: i64 = r.get(0)?;
+    let started_at: i64 = r.get(1)?;
+    let bytes: Vec<u8> = r.get(2)?;
+    let git_commit: Option<String> = r.get(3)?;
+    let folder_hash = blob_to_hash(&bytes).unwrap_or(0);
+    Ok(ScanRow {
+        scan_id,
+        started_at,
+        folder_hash,
+        git_commit,
+    })
 }
 
 fn now_unix_seconds() -> i64 {
@@ -1995,6 +2368,167 @@ mod tests {
             )
             .unwrap();
         assert_eq!(blocks_count, 1);
+    }
+
+    // ---- History diff (issue #59) ------------------------------------
+
+    /// Build a `ScanResult` with one group per hash in `groups`, where
+    /// `occurrence_count` is the number of synthetic occurrences.
+    /// `files_scanned` is unused for diff assertions so we stub it at 0.
+    fn synthetic_scan(groups: &[(u64, usize)]) -> ScanResult {
+        use crate::rolling_hash::Span;
+        let groups = groups
+            .iter()
+            .map(|(hash, n)| MatchGroup {
+                hash: *hash,
+                tier: Tier::A,
+                occurrences: (0..*n)
+                    .map(|i| Occurrence {
+                        path: PathBuf::from(format!("f{i}.rs")),
+                        span: Span {
+                            start_line: 1,
+                            end_line: 10,
+                            start_byte: 0,
+                            end_byte: 100,
+                        },
+                        alpha_rename_spans: Vec::new(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        ScanResult {
+            groups,
+            files_scanned: 0,
+            issues: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn history_scans_row_emitted_per_write() {
+        // Every successful `write_scan_result` must push exactly one row
+        // into `scans`. Covers the "every successful scan writes a row"
+        // acceptance criterion of #59.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let id1 = cache.write_scan_result(&synthetic_scan(&[(1, 2)])).unwrap();
+        let id2 = cache.write_scan_result(&synthetic_scan(&[(1, 2)])).unwrap();
+        assert_ne!(id1, id2);
+        let scans = cache.list_scans().unwrap();
+        assert_eq!(scans.len(), 2);
+    }
+
+    #[test]
+    fn lineage_returns_every_scan_the_hash_appeared_in() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let s1 = cache.write_scan_result(&synthetic_scan(&[(1, 2), (2, 2)])).unwrap();
+        let s2 = cache.write_scan_result(&synthetic_scan(&[(2, 2), (3, 2)])).unwrap();
+        let s3 = cache.write_scan_result(&synthetic_scan(&[(1, 3), (3, 2)])).unwrap();
+
+        assert_eq!(cache.lineage(1).unwrap(), vec![s1, s3]);
+        assert_eq!(cache.lineage(2).unwrap(), vec![s1, s2]);
+        assert_eq!(cache.lineage(3).unwrap(), vec![s2, s3]);
+        assert!(cache.lineage(0xffff).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_scans_classifies_new_grew_shrank_gone() {
+        // Three synthetic snapshots covering every classification:
+        //   base: {1:2, 2:3, 4:2}
+        //   mid:  {1:2 (unchanged — filtered), 2:2 (shrank), 3:2 (new), 4:0 gone}
+        // Covers the NEW / GREW / SHRANK / GONE acceptance criterion.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let base = cache
+            .write_scan_result(&synthetic_scan(&[(1, 2), (2, 3), (4, 2)]))
+            .unwrap();
+        let head = cache
+            .write_scan_result(&synthetic_scan(&[(1, 2), (2, 2), (3, 2)]))
+            .unwrap();
+
+        let rows = cache.diff_scans(base, head).unwrap();
+        // hash 1 unchanged (2→2) → omitted.
+        // hash 2 shrank, hash 3 new, hash 4 gone.
+        let kinds: Vec<(u64, DiffKind)> =
+            rows.iter().map(|r| (r.group_hash, r.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (2, DiffKind::Shrank),
+                (3, DiffKind::New),
+                (4, DiffKind::Gone),
+            ]
+        );
+        // Order is hash-ascending for grep-friendly determinism.
+        assert!(rows.windows(2).all(|w| w[0].group_hash < w[1].group_hash));
+    }
+
+    #[test]
+    fn diff_grew_when_head_count_exceeds_base() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let base = cache.write_scan_result(&synthetic_scan(&[(42, 2)])).unwrap();
+        let head = cache.write_scan_result(&synthetic_scan(&[(42, 5)])).unwrap();
+        let rows = cache.diff_scans(base, head).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, DiffKind::Grew);
+        assert_eq!(rows[0].base_count, 2);
+        assert_eq!(rows[0].head_count, 5);
+    }
+
+    #[test]
+    fn resolve_scan_by_commit_prefix_requires_min_four_chars() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let _sid = cache.write_scan_result(&synthetic_scan(&[(1, 2)])).unwrap();
+        // No git_commit on synthetic scans (tempdir isn't a git repo),
+        // so commit lookup is expected to miss — but the <4-char bailout
+        // must fire before we even hit SQL.
+        assert_eq!(cache.resolve_scan_by_commit_prefix("abc").unwrap(), None);
+        // Force-write a git_commit column so we can assert the positive
+        // path too: stamp one onto the row we just wrote.
+        cache
+            .conn
+            .execute(
+                "UPDATE scans SET git_commit = 'abc123def456' WHERE scan_id = ?1",
+                params![_sid],
+            )
+            .unwrap();
+        assert_eq!(
+            cache.resolve_scan_by_commit_prefix("abc1").unwrap(),
+            Some(_sid)
+        );
+        assert_eq!(
+            cache.resolve_scan_by_commit_prefix("abc123def456").unwrap(),
+            Some(_sid)
+        );
+        assert_eq!(cache.resolve_scan_by_commit_prefix("dead").unwrap(), None);
+    }
+
+    #[test]
+    fn latest_scan_at_or_before_picks_most_recent_matching() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let s1 = cache.write_scan_result(&synthetic_scan(&[(1, 2)])).unwrap();
+        let s2 = cache.write_scan_result(&synthetic_scan(&[(1, 2)])).unwrap();
+        let s3 = cache.write_scan_result(&synthetic_scan(&[(1, 2)])).unwrap();
+        // Spread the three scans in time so the cutoff test is meaningful.
+        cache
+            .conn
+            .execute("UPDATE scans SET started_at = 100 WHERE scan_id = ?1", params![s1])
+            .unwrap();
+        cache
+            .conn
+            .execute("UPDATE scans SET started_at = 200 WHERE scan_id = ?1", params![s2])
+            .unwrap();
+        cache
+            .conn
+            .execute("UPDATE scans SET started_at = 300 WHERE scan_id = ?1", params![s3])
+            .unwrap();
+        assert_eq!(cache.latest_scan_at_or_before(250).unwrap(), Some(s2));
+        assert_eq!(cache.latest_scan_at_or_before(100).unwrap(), Some(s1));
+        assert_eq!(cache.latest_scan_at_or_before(50).unwrap(), None);
+        assert_eq!(cache.latest_scan_at_or_before(1_000_000).unwrap(), Some(s3));
     }
 
     #[test]

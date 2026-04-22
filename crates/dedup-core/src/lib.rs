@@ -28,8 +28,9 @@ pub mod scanner;
 pub mod tokenizer;
 
 pub use cache::{
-    Cache, CacheError, CachedBlocks, CachedOccurrence, FileFingerprint, GroupDetail, GroupSummary,
-    Suppression,
+    Cache, CacheError, CachedBlocks, CachedOccurrence, DiffKind, DiffRow, FileFingerprint,
+    GroupDetail, GroupSummary, ScanGroupRow, ScanRow, Suppression, folder_hash_for_path,
+    git_commit_for_path,
 };
 pub use config::{
     Config, ConfigError, DetailConfig, Normalization, SCHEMA_VERSION as CONFIG_SCHEMA_VERSION,

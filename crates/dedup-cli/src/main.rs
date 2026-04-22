@@ -11,6 +11,9 @@
 //! - `config`: inspect (`path`) or open (`edit`) the resolved config
 //!   file(s). Never auto-creates: the only place a config file is ever
 //!   materialized is `dedup config edit`, on explicit user action.
+//! - `diff --since <ref>`: compare the latest scan against an earlier
+//!   scan (by scan_id, git commit, or relative date) and print per-group
+//!   NEW / GREW / SHRANK / GONE. See [`run_diff`] and [docs/cli.md].
 //!
 //! # Global flags
 //!
@@ -218,6 +221,20 @@ enum Command {
         #[command(subcommand)]
         action: SuppressionsAction,
     },
+    /// Compare the most recent scan against an earlier scan and print
+    /// per-group NEW / GREW / SHRANK / GONE. `--since` accepts a numeric
+    /// scan_id, a git commit SHA (or prefix ≥ 4 chars), or a relative
+    /// date (`yesterday`, `Nd`, `Nw`, `Nh`, `Nm`). See
+    /// [docs/cli.md#dedup-diff](docs/cli.md).
+    Diff {
+        /// Base reference. Compared against the latest cached scan.
+        #[arg(long, value_name = "REF")]
+        since: String,
+        /// Directory whose `.dedup/cache.sqlite` should be read. Defaults
+        /// to the current directory.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Delete the `.dedup/` cache directory entirely. Prompts for
     /// confirmation when stdin is a TTY; `--yes` skips the prompt.
     Clean {
@@ -338,6 +355,7 @@ fn main() -> ExitCode {
             SuppressionsAction::Clear { path } => run_suppressions_clear(&path),
         },
         Command::Clean { ref path, yes } => run_clean(path, yes),
+        Command::Diff { ref since, ref path } => run_diff(since, path),
     };
 
     match result {
@@ -944,6 +962,190 @@ fn run_clean(path: &Path, yes: bool) -> Result<ExitCode> {
         .with_context(|| format!("failed to remove {}", dedup_dir.display()))?;
     println!("removed {}", dedup_dir.display());
     Ok(ExitCode::SUCCESS)
+}
+
+/// `dedup diff --since <ref>` — classify the latest cached scan against
+/// an earlier one and print one line per changed group.
+///
+/// Resolution of `--since` tries, in order:
+///
+/// 1. A numeric scan_id (`--since 42`).
+/// 2. A git commit SHA or ≥4-char prefix matched against `scans.git_commit`.
+/// 3. A relative-date token (`yesterday`, `Nd`, `Nw`, `Nh`, `Nm`, or
+///    `now`). The first scan at-or-before the resolved timestamp wins.
+///
+/// Output is a fixed four-column layout (`KIND  HASH  BASE→HEAD  DELTA`),
+/// ordered by group hash ascending so repeated runs diff cleanly.
+fn run_diff(since: &str, path: &Path) -> Result<ExitCode> {
+    if let Some(code) = check_newer_schema(path)? {
+        return Ok(code);
+    }
+    let cache = match Cache::open_readonly(path)
+        .with_context(|| format!("failed to open cache at {}", path.display()))?
+    {
+        Some(c) => c,
+        None => {
+            eprintln!("dedup: No cached scan found. Run `dedup scan` first.");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
+    let scans = cache.list_scans().context("failed to list scans")?;
+    let head = match scans.first() {
+        Some(s) => s.scan_id,
+        None => {
+            eprintln!(
+                "dedup: No scan history recorded. Run `dedup scan` at least twice to produce a diff."
+            );
+            return Ok(ExitCode::from(2));
+        }
+    };
+
+    let base = match resolve_since(&cache, since, &scans)? {
+        Some(id) if id == head => {
+            // Only one scan matches the ref — nothing to diff against.
+            eprintln!(
+                "dedup: --since resolved to the latest scan ({head}); need an earlier scan to diff"
+            );
+            return Ok(ExitCode::from(2));
+        }
+        Some(id) => id,
+        None => {
+            eprintln!("dedup: could not resolve --since ref: {since}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
+    let rows = cache
+        .diff_scans(base, head)
+        .context("failed to compute diff")?;
+
+    let mut stdout = std::io::stdout();
+    writeln!(
+        stdout,
+        "# dedup diff: base scan={base} head scan={head} rows={count}",
+        count = rows.len()
+    )
+    .ok();
+    for row in &rows {
+        use dedup_core::DiffKind;
+        let (kind, delta) = match row.kind {
+            DiffKind::New => ("NEW   ".to_string(), format!("+{}", row.head_count)),
+            DiffKind::Gone => ("GONE  ".to_string(), format!("-{}", row.base_count)),
+            DiffKind::Grew => (
+                "GREW  ".to_string(),
+                format!("↑{}", row.head_count - row.base_count),
+            ),
+            DiffKind::Shrank => (
+                "SHRANK".to_string(),
+                format!("↓{}", row.base_count - row.head_count),
+            ),
+        };
+        writeln!(
+            stdout,
+            "{kind}  {hash:016x}  {base}→{head}  {delta}",
+            hash = row.group_hash,
+            base = row.base_count,
+            head = row.head_count,
+        )
+        .ok();
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve the `--since` token to a concrete `scan_id`. Tries scan_id,
+/// then git commit prefix, then relative date. Returns `Ok(None)` if
+/// every strategy fails so the caller can surface a user-friendly
+/// "couldn't resolve" message.
+fn resolve_since(
+    cache: &Cache,
+    token: &str,
+    scans: &[dedup_core::ScanRow],
+) -> Result<Option<i64>> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // 1. Numeric scan_id.
+    if let Ok(id) = trimmed.parse::<i64>()
+        && cache
+            .get_scan(id)
+            .context("failed to look up scan by id")?
+            .is_some()
+    {
+        return Ok(Some(id));
+    }
+
+    // 2. Git commit SHA / prefix. Anything hex-looking & >=4 chars.
+    if trimmed.len() >= 4
+        && trimmed.chars().all(|c| c.is_ascii_hexdigit())
+        && let Some(id) = cache
+            .resolve_scan_by_commit_prefix(trimmed)
+            .context("failed to look up scan by commit")?
+    {
+        return Ok(Some(id));
+    }
+
+    // 3. Relative-date token.
+    if let Some(cutoff) = parse_relative_date(trimmed, now_unix_seconds())
+        && let Some(id) = cache
+            .latest_scan_at_or_before(cutoff)
+            .context("failed to look up scan by timestamp")?
+    {
+        return Ok(Some(id));
+    }
+
+    // 4. Fallback: if `token` also happens to match a full stored SHA
+    //    (non-hex chars etc.), we've already exhausted that. `scans`
+    //    captured here purely so a future `--since HEAD~1` can resolve
+    //    without hitting SQLite; unused at the moment.
+    let _ = scans;
+    Ok(None)
+}
+
+/// Parse a relative-date expression into a Unix-epoch-seconds cutoff.
+///
+/// Accepted shapes (case-insensitive):
+/// - `now`                 → `now`
+/// - `yesterday`           → `now - 1 day`
+/// - `<N><unit>` with unit ∈ {`m`, `h`, `d`, `w`} → `now - N * unit`.
+///
+/// Returns `None` for anything else, so callers can fall through to the
+/// scan-id / git-commit resolvers without ambiguity. Deliberately
+/// inline rather than pulling `chrono` into the dep graph — the
+/// accepted grammar is small enough that a hand-rolled parser is
+/// clearer and keeps the dependency surface tight.
+fn parse_relative_date(token: &str, now: i64) -> Option<i64> {
+    let t = token.to_ascii_lowercase();
+    match t.as_str() {
+        "now" => return Some(now),
+        "yesterday" => return Some(now - 24 * 60 * 60),
+        _ => {}
+    }
+    // <N><unit>
+    let bytes = t.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let unit = *bytes.last()?;
+    let n_str = std::str::from_utf8(&bytes[..bytes.len() - 1]).ok()?;
+    let n: i64 = n_str.parse().ok()?;
+    let secs = match unit {
+        b'm' => 60,
+        b'h' => 60 * 60,
+        b'd' => 24 * 60 * 60,
+        b'w' => 7 * 24 * 60 * 60,
+        _ => return None,
+    };
+    Some(now - n * secs)
+}
+
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// `dedup config path` — print one line per config layer with a

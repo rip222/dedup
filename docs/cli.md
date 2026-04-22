@@ -94,6 +94,53 @@ Manage the set of currently dismissed groups.
   table. Prints the row count. Irreversible — previously hidden
   groups re-surface on the next scan/list.
 
+### `dedup diff --since <REF> [PATH]`
+
+Compare the most recent cached scan against an earlier one. Prints one
+line per group whose occurrence count changed between the two scans,
+classified as `NEW`, `GREW`, `SHRANK`, or `GONE`. Unchanged groups are
+omitted so the output stays signal-dense.
+
+Schema: a `scans` table (one row per successful `dedup scan`) and a
+`scan_groups` sidecar record every group hash observed in each scan.
+`lineage(group_hash)` returns every `scan_id` the hash appeared in; the
+`diff` subcommand classifies the set-difference between the latest scan
+and the resolved base.
+
+`--since <REF>` accepts, in resolution order:
+
+1. **Numeric scan_id** — `--since 42`. Must match an existing row in
+   `scans`.
+2. **Git commit SHA or prefix** — any hex string ≥ 4 chars
+   (`--since deadbeef`). Matched against `scans.git_commit` (populated
+   by `git -C <PATH> rev-parse HEAD` at scan time when `PATH` is inside
+   a git work tree).
+3. **Relative date token** — `yesterday`, `now`, or `<N><unit>` with
+   `unit ∈ {m, h, d, w}` (minutes, hours, days, weeks). Resolves to
+   `now − N × unit` and picks the latest scan whose `started_at` is at
+   or before that cutoff.
+
+Output shape (stable, grep-friendly):
+
+```
+# dedup diff: base scan=<B> head scan=<H> rows=<N>
+<KIND>  <HASH>  <BASE>→<HEAD>  <DELTA>
+```
+
+- `KIND` is one of `NEW   `, `GREW  `, `SHRANK`, `GONE  ` (padded to 6
+  chars for columnar alignment).
+- `HASH` is the group's 16-char lowercase hex `group_hash`.
+- `BASE→HEAD` are the `occurrence_count` in each scan.
+- `DELTA` is `+N` for new, `-N` for gone, `↑N` for grew, `↓N` for shrank.
+
+Rows are ordered by `group_hash` ascending so repeated runs diff cleanly
+and `grep NEW` is reliable.
+
+Exits `2` when: no cached scan is present; no scan history is recorded
+(`scans` table is empty — run `dedup scan` at least twice); `--since`
+resolves to the latest scan (nothing to diff against); or the ref
+cannot be resolved.
+
 ### `dedup clean [PATH] [--yes|-y]`
 
 Delete the entire `<PATH>/.dedup/` directory. Prompting policy:
