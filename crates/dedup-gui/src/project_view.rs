@@ -3350,8 +3350,18 @@ fn render_detail_row(row: &DetailRow) -> gpui::AnyElement {
             label,
             checked,
             path,
-        } => render_occurrence_header_row(*group_id, *occ_idx, label, *checked, path)
-            .into_any_element(),
+            blame_overlay,
+            blame_tooltip,
+        } => render_occurrence_header_row(
+            *group_id,
+            *occ_idx,
+            label,
+            *checked,
+            path,
+            blame_overlay.as_deref(),
+            blame_tooltip.as_deref(),
+        )
+        .into_any_element(),
         DetailRow::Gap => div().h(px(DETAIL_ROW_HEIGHT)).into_any_element(),
         DetailRow::Unavailable => div()
             .h(px(DETAIL_ROW_HEIGHT))
@@ -3378,6 +3388,8 @@ fn render_occurrence_header_row(
     label: &str,
     checked: bool,
     path: &std::path::Path,
+    blame_overlay: Option<&str>,
+    blame_tooltip: Option<&str>,
 ) -> gpui::Stateful<gpui::Div> {
     let key = (group_id as u64) << 32 | occ_idx as u64;
     let group_hover_key = format!("occ-hdr-{group_id}-{occ_idx}");
@@ -3501,8 +3513,94 @@ fn render_occurrence_header_row(
                 .text_color(rgb(ROW_TEXT))
                 .child(label.to_string()),
         )
+        .children(render_blame_overlay(group_id, occ_idx, blame_overlay, blame_tooltip))
         .child(copy_button)
         .child(dismiss)
+}
+
+/// Issue #58 — render the `<author> · <short_sha> · <date>` overlay
+/// appended to an occurrence header when blame is available. Returns
+/// an empty iterator when `overlay_text` is `None` so the surrounding
+/// `.children(...)` call is a no-op (non-git folder, blame timeout,
+/// parse failure all collapse here).
+///
+/// Carries an optional tooltip showing the first line of the commit
+/// message (AC: "Blame text tooltip shows full commit message's first
+/// line"). The tooltip uses the same delayed-hover helper as the rest
+/// of the header controls (#53).
+fn render_blame_overlay(
+    group_id: i64,
+    occ_idx: usize,
+    overlay_text: Option<&str>,
+    tooltip_text: Option<&str>,
+) -> Option<gpui::AnyElement> {
+    use gpui::IntoElement;
+    let text = overlay_text?;
+    let key = (group_id as u64) << 32 | occ_idx as u64;
+    let node = div()
+        .id(("occ-blame", key))
+        .text_size(px(11.0))
+        .text_color(rgb(ROW_TEXT_DIM))
+        .child(text.to_string());
+    // If a commit-summary tooltip is available, attach it; otherwise
+    // the overlay is a plain dim label. `with_tooltip` requires a
+    // `StatefulInteractiveElement`, which `.id(...)` above satisfies.
+    let elem = match tooltip_text {
+        Some(tip) if !tip.is_empty() => with_tooltip(node, tip.to_string()).into_any_element(),
+        _ => node.into_any_element(),
+    };
+    Some(elem)
+}
+
+/// Issue #58 — fetch `(overlay, tooltip)` for a single occurrence's
+/// starting line, consulting `AppState.blame_cache` first and falling
+/// back to a real `git blame` invocation wrapped by the 500 ms
+/// timeout in [`crate::blame::run_git_blame`]. Returns `(None, None)`
+/// for any failure (non-git folder, timeout, parse fail, missing
+/// `current_folder`) so the header renders without an overlay and
+/// without errors.
+fn fetch_blame_for_occurrence(
+    state: &AppState,
+    occ: &crate::app_state::OccurrenceView,
+) -> (Option<String>, Option<String>) {
+    let Some(folder) = state.current_folder.as_ref() else {
+        return (None, None);
+    };
+    let start_line = occ.start_line.max(1) as u32;
+    let abs = folder.join(&occ.path);
+    let key = crate::blame::BlameCacheKey::new(abs, start_line);
+
+    if let Some(hit) = state.blame_cache.borrow().get(&key).cloned() {
+        return blame_to_fields(hit);
+    }
+
+    let provider = crate::blame::GitBlameProvider;
+    let fetched = crate::blame::BlameProvider::blame(&provider, folder, &occ.path, start_line)
+        .ok()
+        .flatten();
+    state
+        .blame_cache
+        .borrow_mut()
+        .insert(key, fetched.clone());
+    blame_to_fields(fetched)
+}
+
+/// Split a cached `Option<BlameInfo>` into the `(overlay_text,
+/// tooltip_text)` pair the row constructor wants.
+fn blame_to_fields(
+    info: Option<crate::blame::BlameInfo>,
+) -> (Option<String>, Option<String>) {
+    match info {
+        Some(b) => {
+            let tooltip = if b.summary.is_empty() {
+                None
+            } else {
+                Some(b.summary.clone())
+            };
+            (Some(b.overlay_text()), tooltip)
+        }
+        None => (None, None),
+    }
 }
 
 /// Render one `[gutter][code]` row with horizontal overflow scrolling
@@ -3666,12 +3764,15 @@ fn build_detail_rows(
             // row, only emitted for non-collapsed occurrences).
             out.push(DetailRow::Gap);
         }
+        let (blame_overlay, blame_tooltip) = fetch_blame_for_occurrence(state, occ);
         out.push(DetailRow::OccurrenceHeader {
             group_id,
             occ_idx: i,
             label: occ.label(),
             checked: state.is_occurrence_selected(group_id, i),
             path: occ.path.clone(),
+            blame_overlay,
+            blame_tooltip,
         });
         if collapsed {
             continue;

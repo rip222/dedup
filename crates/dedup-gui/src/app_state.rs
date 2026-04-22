@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::blame::{BlameCacheKey, BlameInfo};
 use crate::detail_rows::DetailRowsCache;
 
 use dedup_core::editor::{EditorConfig, EditorError, EnvPathLookup};
@@ -526,6 +527,13 @@ pub struct AppState {
     /// `&mut AppState`. Not thread-shared (the GUI view-model lives on
     /// the main thread), so `RefCell` is sufficient.
     pub detail_rows_cache: RefCell<Option<DetailRowsCache>>,
+    /// Git-blame overlay cache (issue #58). Keyed by
+    /// `(abs_path, start_line, file_mtime)` so edits invalidate
+    /// automatically. `Option<BlameInfo>` — `None` is still a cached
+    /// answer (non-git folder, timeout, blame failure) so we don't
+    /// re-shell-out on every frame. Interior mutability: the header
+    /// renderer runs under `&AppState` and populates on miss.
+    pub blame_cache: RefCell<HashMap<BlameCacheKey, Option<BlameInfo>>>,
 }
 
 impl Default for AppState {
@@ -561,6 +569,7 @@ impl Default for AppState {
             sidebar_width: crate::sidebar_prefs::DEFAULT_SIDEBAR_WIDTH,
             sidebar_hidden: false,
             detail_rows_cache: RefCell::new(None),
+            blame_cache: RefCell::new(HashMap::new()),
         }
     }
 }

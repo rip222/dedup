@@ -21,6 +21,7 @@
 mod logging;
 
 pub mod app_state;
+pub mod blame;
 pub mod detail;
 pub mod detail_rows;
 pub mod empty_state;

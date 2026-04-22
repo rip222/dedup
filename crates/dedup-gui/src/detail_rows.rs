@@ -58,13 +58,19 @@ pub enum DetailRow {
     /// the pane.
     Summary(String),
     /// One per occurrence — `path:Lstart–end` + inline checkbox /
-    /// `[Copy path]` / `[×]` controls.
+    /// `[Copy path]` / `[×]` controls. `blame_overlay` is the
+    /// pre-formatted "<author> · <sha> · <date>" string (issue #58)
+    /// appended in dim text; `None` when blame is unavailable (non-
+    /// git folder, timeout, parse failure). `blame_tooltip` carries
+    /// the first line of the commit message for hover.
     OccurrenceHeader {
         group_id: i64,
         occ_idx: usize,
         label: String,
         checked: bool,
         path: PathBuf,
+        blame_overlay: Option<String>,
+        blame_tooltip: Option<String>,
     },
     /// Blank row between consecutive occurrence cards, for visual
     /// separation in the flattened list.
