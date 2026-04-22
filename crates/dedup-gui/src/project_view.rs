@@ -29,10 +29,11 @@ use gpui::{
 };
 
 use crate::app_state::{
-    AppState, AppStatus, GroupView, Pane, ScanState, SortKey, StartupError, UndoKind,
-    format_completion_banner, format_elapsed, group_view_from_match,
-    launch_editor, load_folder,
+    AppState, AppStatus, GoneGroup, GroupView, HistoryBaseline, HistoryFilter, Pane, ScanState,
+    SortKey, StartupError, UndoKind, format_completion_banner, format_elapsed,
+    group_view_from_match, launch_editor, load_folder, unix_now,
 };
+use crate::history_badge::{HistoryBadge, build_badge_map};
 use crate::detail_rows::{
     DetailRow, DetailRowsCache, LineSegment, compute_cache_key,
 };
@@ -934,6 +935,163 @@ impl ProjectView {
     /// (issue #46). Wired to the click-outside scrim.
     pub fn close_sort_popup(&mut self, cx: &mut Context<Self>) {
         self.state.close_sort_popup();
+        cx.notify();
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #62 — history-diff comparator, badges, filter chips.
+    //
+    // The view layer owns the I/O half of the flow:
+    //   * `pick_history_baseline` — resolves the selected baseline via
+    //     `apply_history_baseline_io`, hits the cache for scan_groups
+    //     on both sides, and fills the badge / GONE maps.
+    //   * `toggle_history_comparator` / `close_history_comparator` —
+    //     mirror the sort-dropdown popup helpers.
+    //   * `set_history_filter` — pure delegation plus `cx.notify()`.
+    // `apply_history_baseline_io` is factored out so unit tests can
+    // exercise the map-builder on a synthetic cache without needing a
+    // live `Context<Self>`.
+    // -----------------------------------------------------------------
+
+    /// Open / close the "Compare with…" popup (#62).
+    pub fn toggle_history_comparator(&mut self, cx: &mut Context<Self>) {
+        self.state.toggle_history_comparator();
+        cx.notify();
+    }
+
+    /// Scrim-click handler for the comparator popup (#62).
+    pub fn close_history_comparator(&mut self, cx: &mut Context<Self>) {
+        self.state.close_history_comparator();
+        cx.notify();
+    }
+
+    /// Swap the active filter chip (#62). Pure state + notify.
+    pub fn set_history_filter(&mut self, filter: HistoryFilter, cx: &mut Context<Self>) {
+        self.state.set_history_filter(filter);
+        cx.notify();
+    }
+
+    /// Clear the comparator selection (#62). Wipes badges, GONE rows,
+    /// and the filter chip so the sidebar snaps back to its "no
+    /// baseline" layout.
+    pub fn clear_history_baseline(&mut self, cx: &mut Context<Self>) {
+        self.state.clear_history_baseline();
+        cx.notify();
+    }
+
+    /// Pick a baseline from the comparator (#62). Resolves the variant
+    /// to a concrete scan id, queries the cache for both scans' group
+    /// rows, and populates the badge map + GONE list. No-op when the
+    /// variant can't be resolved (missing commit, empty history) — the
+    /// UI leaves the previous state in place and can surface the
+    /// failure via a toast in a follow-up.
+    pub fn pick_history_baseline(
+        &mut self,
+        baseline: HistoryBaseline,
+        cx: &mut Context<Self>,
+    ) {
+        let now = unix_now();
+        let main_commit = main_branch_commit(self.state.current_folder.as_deref());
+        let Some(base_scan_id) =
+            self.state
+                .resolve_history_baseline(baseline, now, main_commit.as_deref())
+        else {
+            // Keep the popup closed but don't mutate the existing
+            // baseline — acceptance criterion says "Badges update when
+            // baseline changes without re-scanning", silent no-op is
+            // better than wiping on an unresolvable selection.
+            self.state.close_history_comparator();
+            cx.notify();
+            return;
+        };
+        let Some(head_scan_id) = self.state.head_scan_id() else {
+            self.state.close_history_comparator();
+            cx.notify();
+            return;
+        };
+
+        let Some(folder) = self.state.current_folder.clone() else {
+            return;
+        };
+
+        match Cache::open_readonly(&folder) {
+            Ok(Some(cache)) => {
+                let base_rows = cache.scan_groups(base_scan_id).unwrap_or_default();
+                let head_rows = cache.scan_groups(head_scan_id).unwrap_or_default();
+                let badges = build_badge_map(&base_rows, &head_rows);
+                // GONE rows: hashes present in base, absent in head.
+                // Look up the label off the cache's live
+                // `match_groups` table when possible — a hash may still
+                // have a row if the group was dismissed but not
+                // garbage-collected, which lets the sidebar render a
+                // friendlier name than `hash[..12]…`.
+                let mut gone: Vec<GoneGroup> = Vec::new();
+                for (&hash, badge) in &badges {
+                    if *badge == HistoryBadge::Gone {
+                        let base_row = base_rows
+                            .iter()
+                            .find(|r| r.group_hash == hash)
+                            .cloned();
+                        let label = self
+                            .state
+                            .groups
+                            .iter()
+                            .find(|g| g.group_hash == Some(hash))
+                            .map(|g| g.label.clone())
+                            .or_else(|| {
+                                self.state
+                                    .dismissed
+                                    .iter()
+                                    .find(|s| s.hash == hash)
+                                    .map(|s| s.label())
+                            })
+                            .unwrap_or_default();
+                        gone.push(GoneGroup {
+                            hash,
+                            hash_hex: format!("{hash:016x}"),
+                            last_label: label,
+                            base_count: base_row
+                                .as_ref()
+                                .map(|r| r.occurrence_count)
+                                .unwrap_or(0),
+                            base_lines: base_row.as_ref().map(|r| r.total_lines).unwrap_or(0),
+                        });
+                    }
+                }
+                // Deterministic order for render + tests.
+                gone.sort_by_key(|g| g.hash);
+
+                self.state.history_baseline = Some(baseline);
+                self.state.history_baseline_scan = Some(base_scan_id);
+                self.state.history_badges = badges;
+                self.state.history_gone_groups = gone;
+                self.state.history_gone_expanded = false;
+                self.state.selected_gone_hash = None;
+                self.state.history_comparator_open = false;
+            }
+            _ => {
+                // Cache open failed — leave state intact, log and move
+                // on. Mirrors the tolerant error handling of
+                // `apply_folder`'s non-modal paths.
+                log::warn!(
+                    "dedup-gui: failed to open cache for history-diff baseline resolution"
+                );
+                self.state.close_history_comparator();
+            }
+        }
+        cx.notify();
+    }
+
+    /// Click-handler for a "Resolved since baseline" row (#62). Opens
+    /// the baseline snapshot in the detail pane read-only. The detail
+    /// pane consults [`AppState::selected_gone_hash`] to branch into
+    /// the resolved-group banner; the live selection is cleared so the
+    /// two read-only surfaces don't overlap.
+    pub fn select_gone(&mut self, hash: u64, cx: &mut Context<Self>) {
+        self.state.selected_gone_hash = Some(hash);
+        self.state.selected_group = None;
+        self.state.selected_group_idx = None;
+        self.state.focused_pane = Pane::Detail;
         cx.notify();
     }
 
@@ -1889,6 +2047,27 @@ where
 /// their respective actions rather than mutating state inline — that
 /// keeps the render function pure and lets keyboard dispatch surface
 /// the same behaviour if we later bind a shortcut.
+/// Resolve the `main` branch's tip commit for the given folder (#62).
+/// Returns `None` when the folder isn't a git work tree, when `main`
+/// doesn't exist, or when `git rev-parse` otherwise fails. The result
+/// is the full 40-char SHA (matching the form `scans.git_commit` stores).
+fn main_branch_commit(folder: Option<&Path>) -> Option<String> {
+    let folder = folder?;
+    let output = std::process::Command::new("git")
+        .current_dir(folder)
+        .args(["rev-parse", "main"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(sha)
+}
+
 fn render_stale_recent_banner(banner: &crate::app_state::RecentBanner) -> gpui::Div {
     let path = banner.path.display().to_string();
     div()
@@ -2474,6 +2653,10 @@ fn render_sidebar(
                 )
                 .child(render_scan_button(state)),
         )
+        // Issue #62 — history comparator lives above the sort/search
+        // row per the PRD. Hidden when fewer than 2 scans exist.
+        .children(render_history_comparator(state))
+        .children(render_history_filter_chips(state))
         // Issue #23 — search / sort / summary row.
         .child(render_search_box(state, window, search_focus_handle))
         .child(render_sort_dropdown(state))
@@ -2487,6 +2670,7 @@ fn render_sidebar(
             "sidebar-tier-b",
             tier_b,
             selected,
+            state.history_badges.clone(),
         ))
         // Tier A (blocks) — header outside, rows virtualized.
         .child(render_section_header("Duplicated blocks", tier_a_count))
@@ -2494,10 +2678,13 @@ fn render_sidebar(
             "sidebar-tier-a",
             tier_a,
             selected,
+            state.history_badges.clone(),
         ))
         // Dismissed section stays outside the lists so its expand/collapse
         // header and rows render normally.
         .child(render_dismissed_section(state))
+        // Issue #62 — "Resolved since baseline" section below dismissed.
+        .child(render_history_gone_section(state))
 }
 
 /// Wrap a `uniform_list` of sidebar group rows in a `flex_1` container
@@ -2509,15 +2696,21 @@ fn render_virtualized_group_list(
     id: &'static str,
     groups: Vec<GroupView>,
     selected: Option<i64>,
+    badges: std::collections::HashMap<u64, HistoryBadge>,
 ) -> gpui::Div {
     let count = groups.len();
     let rows = Rc::new(groups);
     let rows_for_render = rows.clone();
+    let badges = Rc::new(badges);
+    let badges_for_render = badges.clone();
     let list = uniform_list(id, count, move |range, _window, _cx| {
         range
             .map(|idx| {
                 let g = &rows_for_render[idx];
-                render_group_row(g, selected == Some(g.id))
+                let badge = g
+                    .group_hash
+                    .and_then(|h| badges_for_render.get(&h).copied());
+                render_group_row(g, selected == Some(g.id), badge)
             })
             .collect::<Vec<_>>()
     })
@@ -2653,6 +2846,254 @@ fn render_search_box(
         })
         .on_key_down(key_down)
         .child(text)
+}
+
+/// "Compare with…" comparator button + popup (#62).
+///
+/// Returns `None` (via `Vec::new`) when the cache has fewer than two
+/// scan rows — there's no baseline to compare against. Otherwise emits
+/// a button styled to match the sort dropdown and, when open, a
+/// full-window scrim popup listing the four variants plus a "None"
+/// entry that clears the baseline.
+///
+/// The `children(...)` pattern at the call site accepts any
+/// `IntoIterator<Item = impl IntoElement>`, so we return a `Vec<Div>`
+/// that is either empty (hidden) or carries one or two divs (the
+/// button + the popup when open).
+fn render_history_comparator(state: &AppState) -> Vec<gpui::AnyElement> {
+    if !state.history_comparator_visible() {
+        return Vec::new();
+    }
+    let open = state.history_comparator_open;
+    let border_color = if open { rgb(ACCENT) } else { rgb(ACCENT_DIM) };
+    let label = match state.history_baseline {
+        Some(b) => format!("Compare with: {}", b.label()),
+        None => "Compare with\u{2026}".to_string(),
+    };
+    let button = div()
+        .id("sidebar-history-button")
+        .mx(px(12.0))
+        .mt(px(8.0))
+        .px(px(8.0))
+        .py(px(6.0))
+        .bg(rgb(ACCENT_DIM))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(border_color)
+        .text_size(px(12.0))
+        .text_color(rgb(ROW_TEXT))
+        .cursor_pointer()
+        .child(label)
+        .on_mouse_down(MouseButton::Left, |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.toggle_history_comparator(cx));
+            }
+        });
+
+    let mut out: Vec<gpui::AnyElement> = vec![with_tooltip(button, "Compare groups to a past scan").into_any_element()];
+    if open {
+        out.push(render_history_comparator_popup(state).into_any_element());
+    }
+    out
+}
+
+/// Full-window popup listing the comparator options (#62).
+fn render_history_comparator_popup(state: &AppState) -> gpui::Div {
+    use HistoryBaseline::*;
+    let current = state.history_baseline;
+    let options: Vec<(String, Option<HistoryBaseline>)> = {
+        let mut v: Vec<(String, Option<HistoryBaseline>)> = vec![
+            ("None".to_string(), None),
+            ("Last scan".to_string(), Some(LastScan)),
+            ("Last week".to_string(), Some(LastWeek)),
+            (
+                "Last commit on main".to_string(),
+                Some(LastCommitOnMain),
+            ),
+        ];
+        // Flatten "Pick scan…" into one entry per concrete scan row so
+        // the user can hop directly to any past scan without a
+        // secondary dialog. Excludes the head (the newest scan — it's
+        // the implicit "current" side of the diff).
+        let head = state.head_scan_id();
+        for row in state.history_scans.iter().skip(1) {
+            if head == Some(row.scan_id) {
+                continue;
+            }
+            let label = if let Some(sha) = &row.git_commit {
+                let short: String = sha.chars().take(7).collect();
+                format!("Scan #{} \u{00B7} {short}", row.scan_id)
+            } else {
+                format!("Scan #{}", row.scan_id)
+            };
+            v.push((label, Some(PickScan(row.scan_id))));
+        }
+        v
+    };
+
+    let mut card = div()
+        .id("history-comparator-card")
+        .absolute()
+        .left(px(12.0))
+        .top(px(72.0))
+        .w(px(260.0))
+        .bg(rgb(SIDEBAR_BG))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(rgb(ACCENT))
+        .p(px(4.0))
+        .flex()
+        .flex_col()
+        .on_mouse_down(MouseButton::Left, |_, _, _| {});
+
+    for (i, (label, opt)) in options.into_iter().enumerate() {
+        let is_current = match opt {
+            None => current.is_none(),
+            Some(b) => current == Some(b),
+        };
+        let marker = if is_current { "\u{2022} " } else { "  " };
+        let text_color = if is_current { rgb(ACCENT) } else { rgb(ROW_TEXT) };
+        let row = div()
+            .id(gpui::ElementId::Name(format!("history-opt-{i}").into()))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .text_color(text_color)
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(ROW_SELECTED_BG)))
+            .child(format!("{marker}{label}"))
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                    entity.update(cx, |view, cx| match opt {
+                        None => view.clear_history_baseline(cx),
+                        Some(b) => view.pick_history_baseline(b, cx),
+                    });
+                }
+            });
+        card = card.child(row);
+    }
+
+    div()
+        .absolute()
+        .inset_0()
+        .on_mouse_down(MouseButton::Left, |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.close_history_comparator(cx));
+            }
+        })
+        .child(card)
+}
+
+/// Filter chips row (#62). Hidden when no history baseline is active —
+/// the chips only make sense against a populated badge map.
+fn render_history_filter_chips(state: &AppState) -> Vec<gpui::Div> {
+    if state.history_baseline.is_none() {
+        return Vec::new();
+    }
+    let current = state.history_filter;
+    let mut row = div()
+        .mx(px(12.0))
+        .mt(px(4.0))
+        .flex()
+        .flex_row()
+        .gap(px(4.0));
+    for chip in HistoryFilter::ALL {
+        let chip = *chip;
+        let selected = chip == current;
+        let bg = if selected { ACCENT } else { ACCENT_DIM };
+        let cell = div()
+            .id(gpui::ElementId::Name(
+                format!("history-chip-{}", chip.label()).into(),
+            ))
+            .px(px(8.0))
+            .py(px(3.0))
+            .bg(rgb(bg))
+            .rounded(px(3.0))
+            .text_size(px(11.0))
+            .text_color(rgb(ROW_TEXT))
+            .cursor_pointer()
+            .child(chip.label())
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                    entity.update(cx, |view, cx| view.set_history_filter(chip, cx));
+                }
+            });
+        row = row.child(cell);
+    }
+    vec![row]
+}
+
+/// "Resolved since baseline" collapsible section (#62). Empty (zero
+/// children) when no baseline is active or zero GONE rows were
+/// resolved — keeps the sidebar layout tight in the common case.
+fn render_history_gone_section(state: &AppState) -> gpui::Div {
+    if state.history_baseline.is_none() || state.history_gone_groups.is_empty() {
+        return div();
+    }
+    let expanded = state.history_gone_expanded;
+    let arrow = if expanded { "\u{25BC}" } else { "\u{25B6}" };
+    let count = state.history_gone_groups.len();
+
+    let header = div()
+        .px(px(12.0))
+        .py(px(6.0))
+        .mt(px(4.0))
+        .text_size(px(11.0))
+        .text_color(rgb(SECTION_HEADER))
+        .cursor_pointer()
+        .child(format!(
+            "{arrow} Resolved since baseline ({count})"
+        ))
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| {
+                    view.state.history_gone_expanded = !view.state.history_gone_expanded;
+                    cx.notify();
+                });
+            }
+        });
+
+    let mut wrap = div().flex().flex_col().child(header);
+    if expanded {
+        for g in &state.history_gone_groups {
+            wrap = wrap.child(render_gone_row(g, state.selected_gone_hash == Some(g.hash)));
+        }
+    }
+    wrap
+}
+
+/// One row inside the "Resolved since baseline" section (#62). Clicks
+/// open a read-only snapshot in the detail pane.
+fn render_gone_row(g: &GoneGroup, selected: bool) -> gpui::Div {
+    let hash = g.hash;
+    let label = g.label();
+    let badge_key = g.hash;
+    let row_bg = if selected { rgb(ROW_SELECTED_BG) } else { rgb(0x0) };
+    let label_cell = div()
+        .flex_1()
+        .text_size(px(11.0))
+        .text_color(rgb(ROW_TEXT_DIM))
+        .child(label);
+    let mut row = div()
+        .px(px(16.0))
+        .py(px(4.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .cursor_pointer()
+        .child(label_cell)
+        .child(render_history_badge(HistoryBadge::Gone, badge_key))
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.select_gone(hash, cx));
+            }
+        });
+    if selected {
+        row = row.bg(row_bg);
+    }
+    row
 }
 
 /// Sort-dropdown button (issues #23, #46).
@@ -2831,7 +3272,11 @@ pub fn render_tier_badge(tier: Tier, scope: &str, key: u64) -> gpui::Stateful<gp
     with_tooltip(pill, tier_badge_tooltip(tier))
 }
 
-fn render_group_row(group: &GroupView, selected: bool) -> gpui::Div {
+fn render_group_row(
+    group: &GroupView,
+    selected: bool,
+    history_badge: Option<HistoryBadge>,
+) -> gpui::Div {
     let id = group.id;
     let label = group.label.clone();
     let tier = group.tier;
@@ -2841,7 +3286,7 @@ fn render_group_row(group: &GroupView, selected: bool) -> gpui::Div {
     // (#44). Center the label vertically inside the fixed frame so the
     // visual weight matches the prior `py(px(4.0))` layout.
     let label_cell = div().flex_1().child(label);
-    let row = div()
+    let mut row = div()
         .h(px(GROUP_ROW_HEIGHT))
         .px(px(16.0))
         .flex()
@@ -2851,7 +3296,13 @@ fn render_group_row(group: &GroupView, selected: bool) -> gpui::Div {
         .text_size(px(12.0))
         .text_color(rgb(ROW_TEXT))
         .cursor_pointer()
-        .child(label_cell)
+        .child(label_cell);
+    if let Some(b) = history_badge
+        && b.is_visible()
+    {
+        row = row.child(render_history_badge(b, badge_key));
+    }
+    let row = row
         .child(render_tier_badge(tier, "group", badge_key))
         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
             // Route through the root handle so any other listeners
@@ -2865,6 +3316,32 @@ fn render_group_row(group: &GroupView, selected: bool) -> gpui::Div {
     } else {
         row
     }
+}
+
+/// Render a history-diff pill (#62). Colour-codes `NEW` (green),
+/// `GREW ↑N` (amber), `SHRANK ↓N` (blue), `GONE` (red-dim — rarely
+/// appears in the live list since GONE rows render in their own
+/// section, but we keep the branch for symmetry).
+pub fn render_history_badge(badge: HistoryBadge, key: u64) -> gpui::AnyElement {
+    let (bg, label) = match badge {
+        HistoryBadge::New => (0x15803d_u32, badge.label()),
+        HistoryBadge::Grew { .. } => (0xb45309_u32, badge.label()),
+        HistoryBadge::Shrank { .. } => (0x1e40af_u32, badge.label()),
+        HistoryBadge::Gone => (0x7f1d1d_u32, badge.label()),
+        HistoryBadge::Unchanged => return div().into_any_element(),
+    };
+    div()
+        .id(gpui::ElementId::Name(
+            format!("history-badge-{key:016x}").into(),
+        ))
+        .px(px(6.0))
+        .py(px(1.0))
+        .bg(rgb(bg))
+        .rounded(px(3.0))
+        .text_size(px(10.0))
+        .text_color(rgb(TIER_BADGE_TEXT))
+        .child(label)
+        .into_any_element()
 }
 
 fn render_dismissed_section(state: &AppState) -> gpui::Div {
@@ -3024,6 +3501,67 @@ fn render_completion_banner(
         )
 }
 
+/// Read-only detail-pane banner for a GONE row (#62). The baseline
+/// snapshot only records per-group counts, so we show the hash, the
+/// baseline occurrence/line totals, and a short note — no source code
+/// is available because the cache doesn't retain per-scan occurrence
+/// bodies (only the live head scan has materialized `match_groups`).
+fn render_gone_detail(state: &AppState, g: &GoneGroup) -> gpui::Div {
+    let baseline_label = state
+        .history_baseline
+        .map(|b| b.label())
+        .unwrap_or_else(|| "baseline".to_string());
+    let body = format!(
+        "This group was present in the {baseline_label} snapshot with \
+         {occ} occurrence(s) spanning {lines} line(s), and is no \
+         longer a duplicate in the current scan.",
+        occ = g.base_count,
+        lines = g.base_lines,
+    );
+    let headline = format!(
+        "Resolved since baseline \u{2014} {label} (hash {hash})",
+        label = g.label(),
+        hash = &g.hash_hex[..g.hash_hex.len().min(12)],
+    );
+    let banner = div()
+        .w_full()
+        .bg(rgb(BANNER_BG))
+        .px(px(16.0))
+        .py(px(10.0))
+        .border_b_1()
+        .border_color(black())
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(BANNER_TEXT))
+                .child(headline),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .child(body),
+        );
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(rgb(BG))
+        .flex_1()
+        .child(banner)
+        .child(
+            div()
+                .flex_1()
+                .p(px(16.0))
+                .text_size(px(12.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .child("Baseline snapshots record occurrence counts, not source text \u{2014} rescan to inspect the historical content."),
+        )
+}
+
 // `DetailRow` + `LineSegment` live in `crate::detail_rows` (#49) so
 // `AppState` can own an `Rc<Vec<DetailRow>>` row cache without
 // introducing a circular module dep. Re-imported here locally via the
@@ -3048,6 +3586,18 @@ const DETAIL_GUTTER_WIDTH: f32 = 48.0;
 const CONTEXT_ALPHA: f32 = 0.55;
 
 fn render_detail(state: &AppState) -> gpui::AnyElement {
+    // #62 — a GONE selection takes precedence over the live group
+    // selection. The baseline only stores counts, not occurrences, so
+    // we paint a read-only banner instead of a full code view.
+    if let Some(hash) = state.selected_gone_hash
+        && let Some(g) = state
+            .history_gone_groups
+            .iter()
+            .find(|r| r.hash == hash)
+    {
+        return render_gone_detail(state, g).into_any_element();
+    }
+
     let occurrences = state.selected_occurrences();
     if occurrences.is_empty() {
         return div()

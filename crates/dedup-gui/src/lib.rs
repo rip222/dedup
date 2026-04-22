@@ -26,6 +26,7 @@ pub mod detail;
 pub mod detail_rows;
 pub mod empty_state;
 pub mod highlight;
+pub mod history_badge;
 pub mod llm_prompt;
 pub mod menubar;
 pub mod project_view;

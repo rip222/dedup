@@ -372,12 +372,110 @@ pub fn format_completion_banner(
 /// the I/O step is exercised by pure tests (construct fixtures, feed into
 /// `AppState::set_folder_result`, assert on the resulting status +
 /// sidebar rows).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FolderLoadResult {
     pub folder: PathBuf,
     pub groups: Vec<GroupView>,
     pub dismissed: Vec<SuppressionView>,
     pub status: AppStatus,
+    /// All scan-history rows for this folder (#62). Newest first.
+    /// Empty vec when the cache has no scan rows yet (pre-#59 caches
+    /// or never-scanned folders). Feeds the comparator dropdown.
+    pub scans: Vec<dedup_core::ScanRow>,
+}
+
+/// History-diff baseline selector (#62). Which past scan the sidebar
+/// comparator dropdown is currently anchored to. `None` = "no
+/// comparison", badges disabled. Selecting any variant triggers a
+/// [`Cache::lineage`] / [`Cache::diff_scans`] query at baseline-resolve
+/// time; the resolved `scan_id` lives in
+/// [`AppState::history_baseline_scan`] so the renderer doesn't need to
+/// re-resolve every frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryBaseline {
+    /// The previous scan (second-newest row in `scans`).
+    LastScan,
+    /// Latest scan with `started_at <= now - 7d`.
+    LastWeek,
+    /// Scan whose `git_commit` matches the current `main` branch tip
+    /// (resolved via `git rev-parse main`).
+    LastCommitOnMain,
+    /// User-picked baseline by scan id. The comparator popup exposes a
+    /// "Pick scan…" option that lists every row in `scans` and sets
+    /// this variant.
+    PickScan(i64),
+}
+
+impl HistoryBaseline {
+    /// Short label for the comparator button. `PickScan` renders its
+    /// `scan_id` so the user can tell which row is active.
+    pub fn label(self) -> String {
+        match self {
+            HistoryBaseline::LastScan => "Last scan".to_string(),
+            HistoryBaseline::LastWeek => "Last week".to_string(),
+            HistoryBaseline::LastCommitOnMain => "Last commit on main".to_string(),
+            HistoryBaseline::PickScan(id) => format!("Scan #{id}"),
+        }
+    }
+}
+
+/// Filter-chip state for the sidebar group list (#62). Narrows the
+/// list to rows whose history badge matches the active chip. `All`
+/// disables the filter — every group (with or without a badge) is
+/// shown.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFilter {
+    #[default]
+    All,
+    New,
+    Grew,
+    Gone,
+}
+
+impl HistoryFilter {
+    pub const ALL: &'static [HistoryFilter] = &[
+        HistoryFilter::All,
+        HistoryFilter::New,
+        HistoryFilter::Grew,
+        HistoryFilter::Gone,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HistoryFilter::All => "All",
+            HistoryFilter::New => "New",
+            HistoryFilter::Grew => "Grew",
+            HistoryFilter::Gone => "Gone",
+        }
+    }
+}
+
+/// One "Resolved since baseline" row shown below the dismissed section
+/// when the baseline comparator is active (#62). Built from the union
+/// of the baseline scan's `scan_groups` minus any group hash still
+/// live in the head scan. The `last_label` is a best-effort human
+/// string — when the cache has a historical row matching the hash we
+/// reuse its label, otherwise we fall back to `hash[..12]…`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoneGroup {
+    pub hash: u64,
+    pub hash_hex: String,
+    pub last_label: String,
+    pub base_count: i64,
+    pub base_lines: i64,
+}
+
+impl GoneGroup {
+    /// Label used by the sidebar row — `last_label` fallback-formatted
+    /// so a hash-only row is still informative.
+    pub fn label(&self) -> String {
+        if self.last_label.is_empty() {
+            let short: String = self.hash_hex.chars().take(12).collect();
+            format!("Resolved group (hash {short}\u{2026})")
+        } else {
+            self.last_label.clone()
+        }
+    }
 }
 
 /// Central app state the top-level window reads from.
@@ -552,6 +650,45 @@ pub struct AppState {
     /// because `ToastStack::next_id` is monotonic) but keeping the map
     /// tight makes the test assertions cleaner.
     pub pending_undos: HashMap<u64, UndoKind>,
+    /// History-diff baseline (#62). `None` when comparator is not
+    /// selected; `Some(_)` after the user picks an option from the
+    /// "Compare with…" dropdown. Drives badge computation and GONE
+    /// section rendering.
+    pub history_baseline: Option<HistoryBaseline>,
+    /// Resolved `scan_id` for [`Self::history_baseline`] (#62).
+    /// Populated alongside `history_badges` by
+    /// [`Self::apply_history_baseline`]; left `None` when the variant
+    /// can't be resolved (no matching commit, empty lineage, etc.).
+    pub history_baseline_scan: Option<i64>,
+    /// Whether the comparator popup is open (#62). Toggled by the
+    /// "Compare with…" button; auto-closed when the user picks an
+    /// option or the full-window scrim is clicked.
+    pub history_comparator_open: bool,
+    /// Per-group badge map (#62), keyed by normalized `group_hash`.
+    /// Populated by [`Self::apply_history_baseline`]. Empty when the
+    /// baseline is unset. `Unchanged` entries are included so the
+    /// filter chips can distinguish "was in baseline" from "never
+    /// observed".
+    pub history_badges: HashMap<u64, crate::history_badge::HistoryBadge>,
+    /// Resolved GONE rows (#62) for the "Resolved since baseline"
+    /// section. Empty when no baseline active. Sorted by hash ASC for
+    /// determinism.
+    pub history_gone_groups: Vec<GoneGroup>,
+    /// Whether the GONE section is expanded (#62). Follows the
+    /// dismissed section's collapse-by-default pattern.
+    pub history_gone_expanded: bool,
+    /// Active filter chip (#62). Narrows the sidebar list. Persists
+    /// within the session — not written to disk.
+    pub history_filter: HistoryFilter,
+    /// Cached `scans` rows, newest first (#62). Populated at folder
+    /// open time so the comparator dropdown can render "Pick scan…"
+    /// without re-querying the cache every frame. Empty vec when the
+    /// cache has no scan rows.
+    pub history_scans: Vec<dedup_core::ScanRow>,
+    /// Currently selected GONE row hash (#62). Exclusive with
+    /// `selected_group`: picking a GONE row clears the live selection
+    /// and opens a read-only baseline snapshot in the detail pane.
+    pub selected_gone_hash: Option<u64>,
 }
 
 /// What to restore when the user clicks `[Undo]` on a dismiss toast
@@ -603,6 +740,15 @@ impl Default for AppState {
             detail_rows_cache: RefCell::new(None),
             blame_cache: RefCell::new(HashMap::new()),
             pending_undos: HashMap::new(),
+            history_baseline: None,
+            history_baseline_scan: None,
+            history_comparator_open: false,
+            history_badges: HashMap::new(),
+            history_gone_groups: Vec::new(),
+            history_gone_expanded: false,
+            history_filter: HistoryFilter::default(),
+            history_scans: Vec::new(),
+            selected_gone_hash: None,
         }
     }
 }
@@ -1374,6 +1520,19 @@ impl AppState {
         self.groups = result.groups;
         self.dismissed = result.dismissed;
         self.status = result.status;
+        // #62 — hydrate history-diff state. A fresh folder open always
+        // resets the comparator so the new folder's baseline is chosen
+        // explicitly; badges + GONE rows are rebuilt on demand when
+        // the user picks a baseline from the dropdown.
+        self.history_scans = result.scans;
+        self.history_baseline = None;
+        self.history_baseline_scan = None;
+        self.history_comparator_open = false;
+        self.history_badges.clear();
+        self.history_gone_groups.clear();
+        self.history_gone_expanded = false;
+        self.history_filter = HistoryFilter::default();
+        self.selected_gone_hash = None;
         // Keep the Dismissed section collapsed by default on every open,
         // including re-opens — the user can expand it if they want.
         self.dismissed_expanded = false;
@@ -1592,9 +1751,48 @@ impl AppState {
     /// `filter_groups(sort_groups(source_groups, sort_key), search_query)`
     /// so the order-then-filter behaviour is consistent with how the
     /// streaming buffer is rendered.
+    ///
+    /// #62 — if a history baseline is active, also narrow by the
+    /// [`HistoryFilter`] chip: `All` passes every row, `New` / `Grew`
+    /// keep only rows with the matching badge, `Gone` hides everything
+    /// (GONE rows render in their own "Resolved since baseline" section
+    /// below, not in the live list).
     pub fn visible_groups(&self) -> Vec<GroupView> {
         let sorted = sort_groups(&self.source_groups(), self.sort_key);
-        filter_groups(&sorted, &self.search_query)
+        let filtered = filter_groups(&sorted, &self.search_query);
+        self.apply_history_filter(filtered)
+    }
+
+    /// Narrow `groups` by the active [`HistoryFilter`] chip (#62). Pure
+    /// so the filter logic is unit-testable without a baseline query.
+    /// `HistoryFilter::All` (default) is a no-op passthrough.
+    pub fn apply_history_filter(&self, groups: Vec<GroupView>) -> Vec<GroupView> {
+        use crate::history_badge::HistoryBadge;
+        if self.history_filter == HistoryFilter::All || self.history_baseline.is_none() {
+            return groups;
+        }
+        groups
+            .into_iter()
+            .filter(|g| {
+                let Some(h) = g.group_hash else {
+                    // Streaming rows with no hash can't be classified —
+                    // hide them while a history filter is narrow.
+                    return false;
+                };
+                match self.history_filter {
+                    HistoryFilter::All => true,
+                    HistoryFilter::New => matches!(
+                        self.history_badges.get(&h),
+                        Some(HistoryBadge::New)
+                    ),
+                    HistoryFilter::Grew => matches!(
+                        self.history_badges.get(&h),
+                        Some(HistoryBadge::Grew { .. })
+                    ),
+                    HistoryFilter::Gone => false,
+                }
+            })
+            .collect()
     }
 
     /// Current summary counts — always over the filtered list so the
@@ -2225,24 +2423,21 @@ pub fn load_folder(folder: &Path) -> FolderLoadResult {
         Ok(Some(cache)) => materialize_from_cache(folder.to_path_buf(), &cache),
         Ok(None) => FolderLoadResult {
             folder: folder.to_path_buf(),
-            groups: Vec::new(),
-            dismissed: Vec::new(),
             // No cache file at all → treat as "never scanned / no source
             // files found". The message is identical to the empty-scan
             // case per issue #20 acceptance criterion #5.
             status: AppStatus::Empty,
+            ..Default::default()
         },
         Err(CacheError::NewerSchema { found, supported }) => FolderLoadResult {
             folder: folder.to_path_buf(),
-            groups: Vec::new(),
-            dismissed: Vec::new(),
             status: AppStatus::NewerCache { found, supported },
+            ..Default::default()
         },
         Err(err) => FolderLoadResult {
             folder: folder.to_path_buf(),
-            groups: Vec::new(),
-            dismissed: Vec::new(),
             status: AppStatus::Error(err.to_string()),
+            ..Default::default()
         },
     }
 }
@@ -2256,9 +2451,8 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         Err(e) => {
             return FolderLoadResult {
                 folder,
-                groups: Vec::new(),
-                dismissed: Vec::new(),
                 status: AppStatus::Error(format!("failed to read cache: {e}")),
+                ..Default::default()
             };
         }
     };
@@ -2268,9 +2462,8 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         Err(e) => {
             return FolderLoadResult {
                 folder,
-                groups: Vec::new(),
-                dismissed: Vec::new(),
                 status: AppStatus::Error(format!("failed to read suppressions: {e}")),
+                ..Default::default()
             };
         }
     };
@@ -2284,9 +2477,8 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         Err(e) => {
             return FolderLoadResult {
                 folder,
-                groups: Vec::new(),
-                dismissed: Vec::new(),
                 status: AppStatus::Error(format!("failed to read occurrence suppressions: {e}")),
+                ..Default::default()
             };
         }
     };
@@ -2300,12 +2492,11 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
             Err(e) => {
                 return FolderLoadResult {
                     folder,
-                    groups: Vec::new(),
-                    dismissed: Vec::new(),
                     status: AppStatus::Error(format!(
                         "failed to read hash for group {}: {e}",
                         summary.id
                     )),
+                    ..Default::default()
                 };
             }
         };
@@ -2321,9 +2512,8 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
             Err(e) => {
                 return FolderLoadResult {
                     folder,
-                    groups: Vec::new(),
-                    dismissed: Vec::new(),
                     status: AppStatus::Error(format!("failed to read group {}: {e}", summary.id)),
+                    ..Default::default()
                 };
             }
         };
@@ -2392,11 +2582,10 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
             Err(e) => {
                 return FolderLoadResult {
                     folder,
-                    groups: Vec::new(),
-                    dismissed: Vec::new(),
                     status: AppStatus::Error(format!(
                         "failed to read occurrence suppressions: {e}"
                     )),
+                    ..Default::default()
                 };
             }
         };
@@ -2481,9 +2670,8 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         Err(e) => {
             return FolderLoadResult {
                 folder,
-                groups: Vec::new(),
-                dismissed: Vec::new(),
                 status: AppStatus::Error(format!("failed to read suppressions: {e}")),
+                ..Default::default()
             };
         }
     };
@@ -2494,11 +2682,136 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         AppStatus::Loaded
     };
 
+    // #62 — history-diff foundation. Best-effort list of scan rows;
+    // surfaces in the comparator dropdown. Empty on error so a broken
+    // schema doesn't break the whole load.
+    let scans = cache.list_scans().unwrap_or_default();
+
     FolderLoadResult {
         folder,
         groups,
         dismissed,
         status,
+        scans,
+    }
+}
+
+/// Seconds in a 7-day window. Shared between
+/// [`AppState::resolve_history_baseline`] and its tests so the `Last
+/// week` cutoff is exactly one constant off.
+pub const ONE_WEEK_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+impl AppState {
+    // -----------------------------------------------------------------
+    // Issue #62 — history-diff comparator, badges, filter chips.
+    // -----------------------------------------------------------------
+
+    /// Whether the comparator dropdown is eligible to render. Acceptance
+    /// criterion: "hidden when cache has fewer than 2 scans". We need a
+    /// baseline candidate distinct from the current head scan, so the
+    /// floor is 2.
+    pub fn history_comparator_visible(&self) -> bool {
+        self.history_scans.len() >= 2
+    }
+
+    /// The head scan used as "current" for history-diff (#62). That's
+    /// the newest row in [`Self::history_scans`] — `list_scans` returns
+    /// them `started_at DESC`, so index 0.
+    pub fn head_scan_id(&self) -> Option<i64> {
+        self.history_scans.first().map(|s| s.scan_id)
+    }
+
+    /// Toggle the comparator popup (#62). Mirrors
+    /// [`Self::toggle_sort_popup`] — independent open state so both
+    /// dropdowns can be closed / opened without cross-talk.
+    pub fn toggle_history_comparator(&mut self) {
+        self.history_comparator_open = !self.history_comparator_open;
+    }
+
+    pub fn close_history_comparator(&mut self) {
+        self.history_comparator_open = false;
+    }
+
+    /// Swap the active filter chip (#62). Persists within the session
+    /// via the plain field write. Also clears the transient GONE
+    /// selection so the detail pane doesn't linger on a baseline
+    /// snapshot when the user pivots to `New` / `Grew` / `All`.
+    pub fn set_history_filter(&mut self, filter: HistoryFilter) {
+        self.history_filter = filter;
+        if filter != HistoryFilter::Gone {
+            self.selected_gone_hash = None;
+        }
+        self.reclamp_selection();
+    }
+
+    /// Resolve a [`HistoryBaseline`] variant to a concrete `scan_id`
+    /// using the cached [`Self::history_scans`] list + an optional
+    /// commit SHA (the GUI layer calls `git rev-parse main` before
+    /// invoking this; tests pass `None` and exercise the other
+    /// variants directly).
+    ///
+    /// `now_unix` / `main_commit` are parameters rather than I/O so the
+    /// resolver is pure and testable.
+    pub fn resolve_history_baseline(
+        &self,
+        baseline: HistoryBaseline,
+        now_unix: i64,
+        main_commit: Option<&str>,
+    ) -> Option<i64> {
+        let head = self.head_scan_id()?;
+        match baseline {
+            HistoryBaseline::LastScan => {
+                // Second-newest row, skipping the head. `history_scans`
+                // is ordered newest-first so we walk past index 0.
+                self.history_scans
+                    .iter()
+                    .find(|s| s.scan_id != head)
+                    .map(|s| s.scan_id)
+            }
+            HistoryBaseline::LastWeek => {
+                let cutoff = now_unix.saturating_sub(ONE_WEEK_SECONDS);
+                // Latest scan with `started_at <= cutoff`, excluding the
+                // head (the head is typically newer than any week-old
+                // cutoff, but the guard is cheap and makes the semantics
+                // explicit).
+                self.history_scans
+                    .iter()
+                    .find(|s| s.scan_id != head && s.started_at <= cutoff)
+                    .map(|s| s.scan_id)
+            }
+            HistoryBaseline::LastCommitOnMain => {
+                let needle = main_commit?;
+                self.history_scans
+                    .iter()
+                    .find(|s| {
+                        s.scan_id != head
+                            && s.git_commit.as_deref() == Some(needle)
+                    })
+                    .map(|s| s.scan_id)
+            }
+            HistoryBaseline::PickScan(id) => {
+                // User already picked a concrete id; trust it provided
+                // it exists in the cache and isn't the head.
+                self.history_scans
+                    .iter()
+                    .find(|s| s.scan_id == id && s.scan_id != head)
+                    .map(|s| s.scan_id)
+            }
+        }
+    }
+
+    /// Clear history-diff state (#62). Public so the comparator's
+    /// "None" option and the folder-change path route through one
+    /// entry point.
+    pub fn clear_history_baseline(&mut self) {
+        self.history_baseline = None;
+        self.history_baseline_scan = None;
+        self.history_badges.clear();
+        self.history_gone_groups.clear();
+        self.history_gone_expanded = false;
+        self.history_filter = HistoryFilter::default();
+        self.selected_gone_hash = None;
+        self.history_comparator_open = false;
     }
 }
 
@@ -2763,6 +3076,7 @@ mod tests {
             ],
             dismissed: vec![],
             status: AppStatus::Loaded,
+            scans: vec![],
         };
         s.set_folder_result(result);
         assert_eq!(s.selected_group, Some(7));
@@ -2782,6 +3096,7 @@ mod tests {
             groups: vec![],
             dismissed: vec![],
             status: AppStatus::NoDuplicates,
+            scans: vec![],
         });
         assert_eq!(s.selected_group, None);
         assert_eq!(s.status, AppStatus::NoDuplicates);
@@ -3467,6 +3782,7 @@ mod tests {
             groups,
             dismissed: vec![],
             status: AppStatus::Loaded,
+            scans: vec![],
         };
         s.set_folder_result(result);
         s
@@ -4392,5 +4708,218 @@ mod tests {
         // Past the undo TTL — auto-dismissed.
         s.tick_toasts(t0 + Duration::from_secs(7));
         assert_eq!(s.toasts.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #62 — history comparator / filter chip state helpers.
+    // -----------------------------------------------------------------
+
+    fn scan_row(id: i64, at: i64, commit: Option<&str>) -> dedup_core::ScanRow {
+        dedup_core::ScanRow {
+            scan_id: id,
+            started_at: at,
+            folder_hash: 0,
+            git_commit: commit.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn history_comparator_hidden_when_single_scan() {
+        let mut s = AppState::new();
+        s.history_scans = vec![scan_row(1, 1_000, None)];
+        assert!(!s.history_comparator_visible());
+    }
+
+    #[test]
+    fn history_comparator_visible_at_two_scans() {
+        let mut s = AppState::new();
+        s.history_scans = vec![scan_row(2, 2_000, None), scan_row(1, 1_000, None)];
+        assert!(s.history_comparator_visible());
+    }
+
+    #[test]
+    fn resolve_last_scan_picks_second_newest() {
+        let mut s = AppState::new();
+        s.history_scans = vec![
+            scan_row(10, 3_000, None),
+            scan_row(9, 2_000, None),
+            scan_row(8, 1_000, None),
+        ];
+        let id = s.resolve_history_baseline(HistoryBaseline::LastScan, 4_000, None);
+        assert_eq!(id, Some(9));
+    }
+
+    #[test]
+    fn resolve_last_week_respects_cutoff() {
+        let mut s = AppState::new();
+        let now = 1_000_000;
+        // Head scan at `now`; one scan older than 7 days (matches),
+        // one scan younger than 7 days (does not).
+        s.history_scans = vec![
+            scan_row(30, now, None),
+            scan_row(20, now - 3 * 24 * 3600, None),
+            scan_row(10, now - 10 * 24 * 3600, None),
+        ];
+        let id = s.resolve_history_baseline(HistoryBaseline::LastWeek, now, None);
+        assert_eq!(
+            id,
+            Some(10),
+            "Last week must pick the newest scan at or before now-7d"
+        );
+    }
+
+    #[test]
+    fn resolve_last_week_none_when_nothing_old_enough() {
+        let mut s = AppState::new();
+        let now = 1_000_000;
+        s.history_scans = vec![
+            scan_row(30, now, None),
+            scan_row(20, now - 3 * 24 * 3600, None),
+        ];
+        let id = s.resolve_history_baseline(HistoryBaseline::LastWeek, now, None);
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn resolve_last_commit_on_main_matches_exact_sha() {
+        let mut s = AppState::new();
+        s.history_scans = vec![
+            scan_row(30, 3_000, Some("a".repeat(40).as_str())),
+            scan_row(20, 2_000, Some("b".repeat(40).as_str())),
+            scan_row(10, 1_000, None),
+        ];
+        let id = s.resolve_history_baseline(
+            HistoryBaseline::LastCommitOnMain,
+            3_100,
+            Some("b".repeat(40).as_str()),
+        );
+        assert_eq!(id, Some(20));
+    }
+
+    #[test]
+    fn resolve_last_commit_on_main_none_when_no_match() {
+        let mut s = AppState::new();
+        s.history_scans = vec![
+            scan_row(30, 3_000, Some("aaaaaaaa".repeat(5).as_str())),
+            scan_row(20, 2_000, None),
+        ];
+        let id = s.resolve_history_baseline(
+            HistoryBaseline::LastCommitOnMain,
+            3_100,
+            Some("c".repeat(40).as_str()),
+        );
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn resolve_pick_scan_accepts_existing_id_only() {
+        let mut s = AppState::new();
+        s.history_scans = vec![scan_row(10, 3_000, None), scan_row(9, 2_000, None)];
+        assert_eq!(
+            s.resolve_history_baseline(HistoryBaseline::PickScan(9), 0, None),
+            Some(9)
+        );
+        // Head can't be picked as its own baseline.
+        assert_eq!(
+            s.resolve_history_baseline(HistoryBaseline::PickScan(10), 0, None),
+            None
+        );
+        // Unknown ids resolve to None.
+        assert_eq!(
+            s.resolve_history_baseline(HistoryBaseline::PickScan(42), 0, None),
+            None
+        );
+    }
+
+    #[test]
+    fn clear_history_baseline_wipes_every_derived_field() {
+        let mut s = AppState::new();
+        s.history_baseline = Some(HistoryBaseline::LastScan);
+        s.history_baseline_scan = Some(7);
+        s.history_comparator_open = true;
+        s.history_filter = HistoryFilter::Grew;
+        s.history_badges.insert(
+            0xAA,
+            crate::history_badge::HistoryBadge::Grew { delta: 2 },
+        );
+        s.history_gone_groups.push(GoneGroup {
+            hash: 0xBB,
+            hash_hex: "bb".into(),
+            last_label: String::new(),
+            base_count: 3,
+            base_lines: 30,
+        });
+        s.history_gone_expanded = true;
+        s.selected_gone_hash = Some(0xBB);
+
+        s.clear_history_baseline();
+
+        assert!(s.history_baseline.is_none());
+        assert!(s.history_baseline_scan.is_none());
+        assert!(!s.history_comparator_open);
+        assert_eq!(s.history_filter, HistoryFilter::All);
+        assert!(s.history_badges.is_empty());
+        assert!(s.history_gone_groups.is_empty());
+        assert!(!s.history_gone_expanded);
+        assert!(s.selected_gone_hash.is_none());
+    }
+
+    #[test]
+    fn apply_history_filter_narrows_by_chip() {
+        use crate::history_badge::HistoryBadge;
+        let mut s = AppState::new();
+        s.history_baseline = Some(HistoryBaseline::LastScan);
+        let make = |id: i64, hash: u64| GroupView {
+            id,
+            tier: Tier::A,
+            label: format!("g{id}"),
+            occurrences: vec![],
+            language: None,
+            group_hash: Some(hash),
+        };
+        let g1 = make(1, 0x11);
+        let g2 = make(2, 0x22);
+        let g3 = make(3, 0x33);
+        s.history_badges.insert(0x11, HistoryBadge::New);
+        s.history_badges.insert(0x22, HistoryBadge::Grew { delta: 2 });
+        s.history_badges
+            .insert(0x33, HistoryBadge::Unchanged);
+
+        let all = vec![g1.clone(), g2.clone(), g3.clone()];
+
+        s.history_filter = HistoryFilter::All;
+        assert_eq!(s.apply_history_filter(all.clone()).len(), 3);
+
+        s.history_filter = HistoryFilter::New;
+        let only_new = s.apply_history_filter(all.clone());
+        assert_eq!(only_new.len(), 1);
+        assert_eq!(only_new[0].id, 1);
+
+        s.history_filter = HistoryFilter::Grew;
+        let only_grew = s.apply_history_filter(all.clone());
+        assert_eq!(only_grew.len(), 1);
+        assert_eq!(only_grew[0].id, 2);
+
+        s.history_filter = HistoryFilter::Gone;
+        // GONE filter hides every live row — GONE rows render in their
+        // own section below.
+        assert!(s.apply_history_filter(all).is_empty());
+    }
+
+    #[test]
+    fn apply_history_filter_passthrough_without_baseline() {
+        let mut s = AppState::new();
+        // No baseline set — even a narrow filter acts as a no-op.
+        s.history_filter = HistoryFilter::New;
+        let g = GroupView {
+            id: 1,
+            tier: Tier::A,
+            label: "g1".into(),
+            occurrences: vec![],
+            language: None,
+            group_hash: Some(0x11),
+        };
+        let out = s.apply_history_filter(vec![g.clone()]);
+        assert_eq!(out.len(), 1);
     }
 }
