@@ -29,7 +29,7 @@ use gpui::{
 };
 
 use crate::app_state::{
-    AppState, AppStatus, GroupView, Pane, ScanState, SortKey, StartupError,
+    AppState, AppStatus, GroupView, Pane, ScanState, SortKey, StartupError, UndoKind,
     format_completion_banner, format_elapsed, group_view_from_match,
     launch_editor, load_folder,
 };
@@ -45,8 +45,8 @@ use crate::menubar::{
 };
 use crate::toast::{
     ACTION_CACHE_DELETE_AND_RESCAN, ACTION_CACHE_RESCAN, ACTION_CONFIG_FIX, ACTION_CONFIG_RESET,
-    ACTION_REMOVE_STALE_RECENT, ACTION_SHOW_ISSUES, Toast, ToastKind, format_issues_clipboard,
-    panic_message,
+    ACTION_REMOVE_STALE_RECENT, ACTION_SHOW_ISSUES, ACTION_UNDO_DISMISS, Toast, ToastKind,
+    format_issues_clipboard, panic_message,
 };
 use crate::tooltip::with_tooltip;
 use dedup_core::{
@@ -332,9 +332,30 @@ impl ProjectView {
         toast_id: u64,
         cx: &mut Context<Self>,
     ) {
-        // Dismiss first — every action either opens a modal or kicks
-        // off a follow-up flow; leaving the toast up would be
-        // confusing.
+        // Pull the pending-undo payload *before* dismissing the toast,
+        // because `dismiss_toast` also GCs the `pending_undos` entry
+        // (so a manual `[×]` close on the toast cannot undo). For the
+        // other actions, remove the toast first — every other branch
+        // either opens a modal or kicks off a follow-up flow; leaving
+        // the toast up would be confusing.
+        if action_name == ACTION_UNDO_DISMISS {
+            let payload = self.state.take_pending_undo(toast_id);
+            self.state.dismiss_toast(toast_id);
+            match payload {
+                Some(UndoKind::Group { hash }) => self.restore_group_click(hash, cx),
+                Some(UndoKind::Occurrence { hash, path }) => {
+                    self.restore_occurrence_click(hash, path, cx)
+                }
+                None => {
+                    log::warn!(
+                        "dedup-gui: undo toast {toast_id} clicked but no pending payload \
+                         registered"
+                    );
+                }
+            }
+            cx.notify();
+            return;
+        }
         self.state.dismiss_toast(toast_id);
         match action_name {
             ACTION_CACHE_DELETE_AND_RESCAN => self.delete_cache_and_rescan(cx),
@@ -921,8 +942,20 @@ impl ProjectView {
     }
 
     /// Dismiss the whole group via the toolbar's `[Dismiss group]`
-    /// button. Ignores checkbox state per issue #27.
+    /// button. Ignores checkbox state per issue #27. Also pushes the
+    /// undo-dismiss toast (#60) so the user has a 6s window to roll
+    /// back the action.
     pub fn dismiss_group_toolbar(&mut self, group_id: i64, cx: &mut Context<Self>) {
+        // Capture the sidebar label *before* `dismiss_group` drops the
+        // row from `groups` — the toast title needs the human-readable
+        // name, and looking it up after the mutation would miss.
+        let label = self
+            .state
+            .groups
+            .iter()
+            .find(|g| g.id == group_id)
+            .map(|g| g.label.clone())
+            .unwrap_or_else(|| format!("group {group_id}"));
         let Some((hash, gid)) = self.state.dismiss_group(group_id) else {
             return;
         };
@@ -938,6 +971,7 @@ impl ProjectView {
                 }
             }
         }
+        self.state.push_undo_toast_for_group(hash, label);
         cx.notify();
     }
 
@@ -1021,7 +1055,8 @@ impl ProjectView {
         cx.notify();
     }
 
-    /// Dismiss a single occurrence via the per-row `[×]` button.
+    /// Dismiss a single occurrence via the per-row `[×]` button. Also
+    /// pushes the undo-dismiss toast (#60).
     pub fn dismiss_occurrence(&mut self, group_id: i64, occ_idx: usize, cx: &mut Context<Self>) {
         let Some((hash, path)) = self.state.dismiss_occurrence(group_id, occ_idx) else {
             return;
@@ -1041,6 +1076,12 @@ impl ProjectView {
                 ),
             }
         }
+        let label = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.state
+            .push_undo_toast_for_occurrence(hash, path, label);
         cx.notify();
     }
 

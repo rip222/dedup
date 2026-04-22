@@ -39,7 +39,8 @@ use dedup_core::{
 
 use crate::toast::{
     ACTION_CACHE_DELETE_AND_RESCAN, ACTION_CACHE_RESCAN, ACTION_REMOVE_STALE_RECENT,
-    ACTION_SHOW_ISSUES, CacheErrorClass, ToastAction, ToastKind, ToastStack, classify_cache_error,
+    ACTION_SHOW_ISSUES, ACTION_UNDO_DISMISS, CacheErrorClass, ToastAction, ToastKind, ToastStack,
+    UNDO_TTL, classify_cache_error,
 };
 
 /// View-model for one duplicate group as shown in the sidebar.
@@ -534,6 +535,30 @@ pub struct AppState {
     /// re-shell-out on every frame. Interior mutability: the header
     /// renderer runs under `&AppState` and populates on miss.
     pub blame_cache: RefCell<HashMap<BlameCacheKey, Option<BlameInfo>>>,
+    /// Pending undo payloads keyed by the live toast id (issue #60).
+    /// Populated by [`AppState::push_undo_toast_for_group`] /
+    /// [`AppState::push_undo_toast_for_occurrence`] at dismiss time and
+    /// drained by [`AppState::take_pending_undo`] when the user clicks
+    /// the toast's `[Undo]` button. [`AppState::tick_toasts`] GCs
+    /// entries whose toast auto-dismissed without the user acting — a
+    /// stale entry is otherwise harmless (the `toast_id` never recycles
+    /// because `ToastStack::next_id` is monotonic) but keeping the map
+    /// tight makes the test assertions cleaner.
+    pub pending_undos: HashMap<u64, UndoKind>,
+}
+
+/// What to restore when the user clicks `[Undo]` on a dismiss toast
+/// (issue #60). Stored in [`AppState::pending_undos`] keyed by toast
+/// id; the view layer's action dispatcher looks the entry up and
+/// routes to `restore_group_click` / `restore_occurrence_click`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoKind {
+    /// Undo a whole-group dismissal. Restores the row via
+    /// `Cache::undismiss(hash)`.
+    Group { hash: u64 },
+    /// Undo a per-occurrence dismissal. Restores via
+    /// `Cache::undismiss_occurrence(hash, path)`.
+    Occurrence { hash: u64, path: PathBuf },
 }
 
 impl Default for AppState {
@@ -570,6 +595,7 @@ impl Default for AppState {
             sidebar_hidden: false,
             detail_rows_cache: RefCell::new(None),
             blame_cache: RefCell::new(HashMap::new()),
+            pending_undos: HashMap::new(),
         }
     }
 }
@@ -1032,15 +1058,80 @@ impl AppState {
             .push_full(ToastKind::Info, title.into(), body, action)
     }
 
-    /// Advance the toast auto-dismiss clock. Called by the project
-    /// view's 500ms timer; wraps [`ToastStack::tick`].
-    pub fn tick_toasts(&mut self, now: Instant) {
-        self.toasts.tick(now);
+    /// Push a whole-group undo toast (#60) and register the restore
+    /// payload under the resulting toast id. `label` is the
+    /// human-readable group name (usually `GroupView::label`). Returns
+    /// the toast id so tests can round-trip through
+    /// [`Self::take_pending_undo`].
+    pub fn push_undo_toast_for_group(&mut self, hash: u64, label: impl Into<String>) -> u64 {
+        let title = format!("Dismissed \u{2018}{}\u{2019}", label.into());
+        let id = self.toasts.push_full_with_ttl(
+            ToastKind::Info,
+            title,
+            None,
+            Some(ToastAction {
+                label: "Undo".to_string(),
+                action_name: ACTION_UNDO_DISMISS,
+            }),
+            UNDO_TTL,
+        );
+        self.pending_undos.insert(id, UndoKind::Group { hash });
+        id
     }
 
-    /// Dismiss a specific toast by id.
+    /// Push a per-occurrence undo toast (#60). `path_label` is rendered
+    /// verbatim in the toast title — callers typically pass
+    /// `PathBuf::display().to_string()` or a pre-shortened display
+    /// label.
+    pub fn push_undo_toast_for_occurrence(
+        &mut self,
+        hash: u64,
+        path: PathBuf,
+        path_label: impl Into<String>,
+    ) -> u64 {
+        let title = format!("Dismissed occurrence \u{2018}{}\u{2019}", path_label.into());
+        let id = self.toasts.push_full_with_ttl(
+            ToastKind::Info,
+            title,
+            None,
+            Some(ToastAction {
+                label: "Undo".to_string(),
+                action_name: ACTION_UNDO_DISMISS,
+            }),
+            UNDO_TTL,
+        );
+        self.pending_undos
+            .insert(id, UndoKind::Occurrence { hash, path });
+        id
+    }
+
+    /// Remove and return the pending-undo entry for `toast_id`, if
+    /// any. Called by the view layer's action dispatcher when the user
+    /// clicks `[Undo]`; the dispatcher then routes the returned
+    /// [`UndoKind`] through the matching `restore_*_click` handler so
+    /// the in-memory state + on-disk cache both roll back.
+    pub fn take_pending_undo(&mut self, toast_id: u64) -> Option<UndoKind> {
+        self.pending_undos.remove(&toast_id)
+    }
+
+    /// Advance the toast auto-dismiss clock. Called by the project
+    /// view's 500ms timer; wraps [`ToastStack::tick`] and GCs any
+    /// pending-undo entries whose underlying toast auto-dismissed
+    /// without the user clicking `[Undo]` — per #60 that's the
+    /// "dismissal stays persisted" branch.
+    pub fn tick_toasts(&mut self, now: Instant) {
+        self.toasts.tick(now);
+        self.pending_undos
+            .retain(|toast_id, _| self.toasts.contains(*toast_id));
+    }
+
+    /// Dismiss a specific toast by id. Also drops any matching entry
+    /// in [`Self::pending_undos`] — closing the toast manually
+    /// (via the `[×]` button) means the user consciously passed on
+    /// the undo, so the dismissal stays persisted (#60).
     pub fn dismiss_toast(&mut self, id: u64) {
         self.toasts.dismiss(id);
+        self.pending_undos.remove(&id);
     }
 
     /// Classify `err` and push the matching toast for the newer-schema
@@ -4161,5 +4252,134 @@ mod tests {
         s.toggle_sort_popup();
         s.set_sort_key(s.sort_key);
         assert!(!s.sort_popup_open);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #60 — undo toast after dismiss.
+    //
+    // Covers: push-undo-toast registers a `pending_undos` entry keyed
+    // by the toast id; `take_pending_undo` drains it; `tick_toasts`
+    // GCs stale entries when the toast auto-dismisses without action;
+    // manual `dismiss_toast` also drops the pending entry (so `[×]`
+    // on the undo toast commits to the dismissal).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn push_undo_toast_for_group_registers_pending_payload() {
+        let mut s = AppState::new();
+        let id = s.push_undo_toast_for_group(0xAA, "my-group");
+        assert_eq!(s.toasts.len(), 1);
+        let toast = &s.toasts.toasts[0];
+        assert!(toast.title.contains("my-group"));
+        assert_eq!(
+            toast.action.as_ref().map(|a| a.action_name),
+            Some(ACTION_UNDO_DISMISS)
+        );
+        assert_eq!(
+            s.pending_undos.get(&id).cloned(),
+            Some(UndoKind::Group { hash: 0xAA })
+        );
+    }
+
+    #[test]
+    fn push_undo_toast_for_occurrence_registers_pending_payload() {
+        let mut s = AppState::new();
+        let id = s.push_undo_toast_for_occurrence(
+            0xBB,
+            PathBuf::from("src/a.rs"),
+            "a.rs",
+        );
+        let toast = &s.toasts.toasts[0];
+        assert!(toast.title.contains("a.rs"));
+        assert_eq!(
+            s.pending_undos.get(&id).cloned(),
+            Some(UndoKind::Occurrence {
+                hash: 0xBB,
+                path: PathBuf::from("src/a.rs"),
+            })
+        );
+    }
+
+    #[test]
+    fn take_pending_undo_drains_entry_on_click() {
+        let mut s = AppState::new();
+        let id = s.push_undo_toast_for_group(0xAA, "g");
+        let taken = s.take_pending_undo(id);
+        assert_eq!(taken, Some(UndoKind::Group { hash: 0xAA }));
+        // Second drain is None — payload has moved.
+        assert_eq!(s.take_pending_undo(id), None);
+    }
+
+    #[test]
+    fn tick_toasts_gcs_pending_undo_when_toast_auto_dismisses() {
+        // 6s UNDO_TTL — tick past that and both the toast and the
+        // pending-undo entry should be gone. Simulates the "user
+        // walked away" branch: the dismissal stays persisted because
+        // no undo was ever fired.
+        let mut s = AppState::new();
+        let t0 = Instant::now();
+        let id = s.push_undo_toast_for_group(0xAA, "g");
+        assert!(s.pending_undos.contains_key(&id));
+        s.tick_toasts(t0 + Duration::from_secs(7));
+        assert!(!s.pending_undos.contains_key(&id));
+        assert_eq!(s.toasts.len(), 0);
+    }
+
+    #[test]
+    fn dismiss_toast_also_drops_pending_undo() {
+        // Clicking the `[×]` on an undo toast should *not* leave a
+        // stale payload behind — the user consciously passed on undo.
+        let mut s = AppState::new();
+        let id = s.push_undo_toast_for_group(0xAA, "g");
+        s.dismiss_toast(id);
+        assert!(!s.pending_undos.contains_key(&id));
+    }
+
+    #[test]
+    fn multiple_undo_toasts_queue_independently() {
+        // Rapid-fire dismissals must not clobber older undo payloads —
+        // the pending-undos map is keyed by toast id, so three
+        // concurrent toasts yield three live entries that each
+        // `take_pending_undo` drains independently.
+        let mut s = AppState::new();
+        let a = s.push_undo_toast_for_group(0x01, "a");
+        let b = s.push_undo_toast_for_group(0x02, "b");
+        let c = s.push_undo_toast_for_occurrence(
+            0x03,
+            PathBuf::from("c.rs"),
+            "c.rs",
+        );
+        assert_eq!(s.toasts.len(), 3);
+        assert_eq!(s.pending_undos.len(), 3);
+        assert_eq!(
+            s.take_pending_undo(b),
+            Some(UndoKind::Group { hash: 0x02 })
+        );
+        // Other two still intact.
+        assert_eq!(
+            s.take_pending_undo(a),
+            Some(UndoKind::Group { hash: 0x01 })
+        );
+        assert_eq!(
+            s.take_pending_undo(c),
+            Some(UndoKind::Occurrence {
+                hash: 0x03,
+                path: PathBuf::from("c.rs"),
+            })
+        );
+    }
+
+    #[test]
+    fn undo_toast_ttl_is_six_seconds() {
+        // Guardrail: Info default is 3s, undo override is 6s.
+        let mut s = AppState::new();
+        let t0 = Instant::now();
+        s.push_undo_toast_for_group(0xAA, "g");
+        // Past the default Info TTL — still live.
+        s.tick_toasts(t0 + Duration::from_secs(4));
+        assert_eq!(s.toasts.len(), 1);
+        // Past the undo TTL — auto-dismissed.
+        s.tick_toasts(t0 + Duration::from_secs(7));
+        assert_eq!(s.toasts.len(), 0);
     }
 }

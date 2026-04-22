@@ -36,6 +36,9 @@ use dedup_core::{CacheError, FileIssue, FileIssueKind};
 pub const WARNING_TTL: Duration = Duration::from_secs(5);
 /// Auto-dismiss timer for info toasts. Matches the PRD (3 seconds).
 pub const INFO_TTL: Duration = Duration::from_secs(3);
+/// Auto-dismiss timer for undo toasts (#60). Longer than `INFO_TTL` so
+/// the user has a comfortable window to hit `[Undo]` after a dismiss.
+pub const UNDO_TTL: Duration = Duration::from_secs(6);
 
 /// Tier of a toast. Drives colour, icon, and auto-dismiss behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +144,44 @@ impl ToastStack {
         id
     }
 
+    /// Push a toast with an explicit auto-dismiss TTL that overrides the
+    /// per-[`ToastKind`] default. Used by the undo-dismiss surface (#60)
+    /// which pushes an Info toast but wants a 6s window rather than the
+    /// standard 3s. `ttl` is treated as `Some(duration)` — callers that
+    /// want a persistent toast should use [`ToastStack::push_full`] with
+    /// [`ToastKind::Error`] instead.
+    pub fn push_full_with_ttl(
+        &mut self,
+        kind: ToastKind,
+        title: String,
+        body: Option<String>,
+        action: Option<ToastAction>,
+        ttl: Duration,
+    ) -> u64 {
+        let now = Instant::now();
+        let id = self.next_id;
+        self.next_id += 1;
+        self.toasts.push(Toast {
+            id,
+            kind,
+            title,
+            body,
+            action,
+            auto_dismiss_at: Some(now + ttl),
+            created_at: now,
+        });
+        id
+    }
+
+    /// True if the toast with `id` is still live on the stack. Used by
+    /// the view layer to GC its per-toast side-tables (e.g. the
+    /// `pending_undos` map that backs `ACTION_UNDO_DISMISS`) when the
+    /// underlying toast has auto-dismissed without the user acting on
+    /// it.
+    pub fn contains(&self, id: u64) -> bool {
+        self.toasts.iter().any(|t| t.id == id)
+    }
+
     /// Remove the toast with the given id. No-op if the id is missing
     /// (e.g. already auto-dismissed). Returns `true` if a toast was
     /// removed.
@@ -189,6 +230,10 @@ pub const ACTION_CONFIG_FIX: &str = "config.fix";
 pub const ACTION_CONFIG_RESET: &str = "config.reset";
 /// Post-scan issues link → opens the issues dialog.
 pub const ACTION_SHOW_ISSUES: &str = "scan.show_issues";
+/// Undo button on a dismiss toast (#60). The view layer owns the
+/// `toast_id -> UndoKind` map and routes the click to
+/// `restore_group` / `restore_occurrence`.
+pub const ACTION_UNDO_DISMISS: &str = "dismiss.undo";
 
 // ---------------------------------------------------------------------------
 // Error classification
@@ -399,6 +444,42 @@ mod tests {
         assert_eq!(ToastKind::Error.auto_dismiss(), None);
         assert_eq!(WARNING_TTL, Duration::from_secs(5));
         assert_eq!(INFO_TTL, Duration::from_secs(3));
+        assert_eq!(UNDO_TTL, Duration::from_secs(6));
+    }
+
+    #[test]
+    fn push_full_with_ttl_overrides_default_ttl() {
+        // The undo surface (#60) pushes an Info toast but wants a 6s
+        // window, not the 3s Info default. `push_full_with_ttl` should
+        // stamp the explicit ttl verbatim.
+        let mut stack = ToastStack::new();
+        let t0 = Instant::now();
+        stack.push_full_with_ttl(
+            ToastKind::Info,
+            "Dismissed 'foo' — Undo".to_string(),
+            None,
+            Some(ToastAction {
+                label: "Undo".to_string(),
+                action_name: ACTION_UNDO_DISMISS,
+            }),
+            UNDO_TTL,
+        );
+        // Past the 3s Info default — still present (proves override).
+        stack.tick(t0 + Duration::from_secs(4));
+        assert_eq!(stack.len(), 1);
+        // Past the 6s override — gone.
+        stack.tick(t0 + Duration::from_secs(7));
+        assert_eq!(stack.len(), 0);
+    }
+
+    #[test]
+    fn contains_tracks_live_toasts() {
+        let mut stack = ToastStack::new();
+        let id = stack.push(ToastKind::Info, "hi");
+        assert!(stack.contains(id));
+        assert!(!stack.contains(id + 42));
+        stack.dismiss(id);
+        assert!(!stack.contains(id));
     }
 
     #[test]
