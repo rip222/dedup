@@ -940,15 +940,16 @@ impl ProjectView {
         }
     }
 
-    /// Toolbar "Collapse all".
+    /// Toolbar "Collapse all" — collapses every occurrence in the
+    /// active group only (per #45). Other groups keep their state.
     pub fn collapse_all(&mut self, cx: &mut Context<Self>) {
-        self.state.collapse_all();
+        self.state.collapse_all_in_active_group();
         cx.notify();
     }
 
-    /// Toolbar "Expand all".
+    /// Toolbar "Expand all" — inverse of [`Self::collapse_all`].
     pub fn expand_all(&mut self, cx: &mut Context<Self>) {
-        self.state.expand_all();
+        self.state.expand_all_in_active_group();
         cx.notify();
     }
 
@@ -958,10 +959,16 @@ impl ProjectView {
         cx.notify();
     }
 
-    /// Per-group header toggle — collapse/expand a single group's
-    /// detail body.
-    pub fn toggle_group_collapse(&mut self, group_id: i64, cx: &mut Context<Self>) {
-        self.state.toggle_collapse(group_id);
+    /// Per-occurrence header toggle — collapse/expand a single
+    /// occurrence's code body. Wired to a click anywhere on the
+    /// occurrence-header row (child controls stop propagation).
+    pub fn toggle_occurrence_collapse(
+        &mut self,
+        group_id: i64,
+        occ_idx: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.toggle_occurrence_collapse(group_id, occ_idx);
         cx.notify();
     }
 }
@@ -2425,17 +2432,12 @@ fn render_detail(state: &AppState) -> gpui::AnyElement {
     // Safe: `selected_occurrences()` is only non-empty when
     // `selected_group` is Some.
     let group_id = state.selected_group.unwrap_or(-1);
-    let collapsed = state.is_group_collapsed(group_id);
 
-    let rows: Vec<DetailRow> = if collapsed {
-        // Collapsed — render only the toolbar + occurrence headers
-        // (for the checkbox row shape). The `uniform_list` below still
-        // receives a trivial rows list so the detail-pane layout is
-        // unchanged; users re-expand to see the code.
-        Vec::new()
-    } else {
-        build_detail_rows(state, group_id, &occurrences)
-    };
+    // #45 — rows always include the summary and every occurrence
+    // header; per-occurrence collapse only suppresses that
+    // occurrence's `CodeLine` / `Gap` / `Unavailable` rows, so
+    // headers stay clickable even when collapsed.
+    let rows: Vec<DetailRow> = build_detail_rows(state, group_id, &occurrences);
     let rows = Rc::new(rows);
     let row_count = rows.len();
     let rows_for_render = rows.clone();
@@ -2602,34 +2604,41 @@ fn render_group_toolbar(state: &AppState, group_id: i64) -> gpui::Div {
 
 /// Render one flattened row from [`build_detail_rows`].
 ///
-/// Returns a fixed-height `Div` — `uniform_list` assumes every row is
-/// the same height, so all four variants use [`DETAIL_ROW_HEIGHT`].
-fn render_detail_row(row: &DetailRow) -> gpui::Div {
+/// Returns a fixed-height element — `uniform_list` assumes every row
+/// is the same height, so all variants use [`DETAIL_ROW_HEIGHT`]. The
+/// header variant returns a `Stateful<Div>` (for the click handler)
+/// while the others are plain `Div`, so we erase to `AnyElement` at
+/// this boundary.
+fn render_detail_row(row: &DetailRow) -> gpui::AnyElement {
+    use gpui::IntoElement;
     match row {
         DetailRow::Summary(text) => div()
             .h(px(DETAIL_ROW_HEIGHT))
             .text_size(px(12.0))
             .text_color(rgb(ROW_TEXT_DIM))
-            .child(text.clone()),
+            .child(text.clone())
+            .into_any_element(),
         DetailRow::OccurrenceHeader {
             group_id,
             occ_idx,
             label,
             checked,
             path,
-        } => render_occurrence_header_row(*group_id, *occ_idx, label, *checked, path),
-        DetailRow::Gap => div().h(px(DETAIL_ROW_HEIGHT)),
+        } => render_occurrence_header_row(*group_id, *occ_idx, label, *checked, path)
+            .into_any_element(),
+        DetailRow::Gap => div().h(px(DETAIL_ROW_HEIGHT)).into_any_element(),
         DetailRow::Unavailable => div()
             .h(px(DETAIL_ROW_HEIGHT))
             .px(px(8.0))
             .text_size(px(11.0))
             .text_color(rgb(ROW_TEXT_DIM))
-            .child("(file not available)"),
+            .child("(file not available)")
+            .into_any_element(),
         DetailRow::CodeLine {
             line_number,
             is_context,
             segments,
-        } => render_code_line(*line_number, *is_context, segments),
+        } => render_code_line(*line_number, *is_context, segments).into_any_element(),
     }
 }
 
@@ -2643,7 +2652,7 @@ fn render_occurrence_header_row(
     label: &str,
     checked: bool,
     path: &std::path::Path,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     let key = (group_id as u64) << 32 | occ_idx as u64;
     let group_hover_key = format!("occ-hdr-{group_id}-{occ_idx}");
 
@@ -2668,6 +2677,9 @@ fn render_occurrence_header_row(
         .cursor_pointer()
         .child(check_mark.to_string())
         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            // #45 — don't let the checkbox click bubble up to the
+            // header row's collapse-toggle handler.
+            cx.stop_propagation();
             if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
                 entity.update(cx, |view, cx| view.toggle_occurrence(group_id, occ_idx, cx));
             }
@@ -2686,6 +2698,9 @@ fn render_occurrence_header_row(
         .group_hover(group_hover_key.clone(), |s| s.visible())
         .child("Copy path")
         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            // #45 — keep the header click-to-collapse from firing
+            // when the user clicks `[Copy path]`.
+            cx.stop_propagation();
             if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
                 let p = path_for_copy.clone();
                 entity.update(cx, |view, cx| view.copy_single_path(p, cx));
@@ -2707,6 +2722,9 @@ fn render_occurrence_header_row(
         .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
         .child("\u{00D7}")
         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            // #45 — stop the header click-to-collapse from firing
+            // when the user clicks `[×]`.
+            cx.stop_propagation();
             if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
                 entity.update(cx, |view, cx| {
                     view.dismiss_occurrence(group_id, occ_idx, cx)
@@ -2714,8 +2732,14 @@ fn render_occurrence_header_row(
             }
         });
 
+    // #45 — header is the whole-row click target for collapse. We
+    // need a [`Stateful`] div (via `.id(...)`) so `on_mouse_down`
+    // actually fires, and `w_full` so the bar spans the detail pane
+    // rather than hugging its contents.
     div()
+        .id(("occ-header", key))
         .group(group_hover_key)
+        .w_full()
         .h(px(DETAIL_ROW_HEIGHT))
         .flex()
         .flex_row()
@@ -2723,6 +2747,14 @@ fn render_occurrence_header_row(
         .gap(px(8.0))
         .px(px(8.0))
         .bg(rgb(SIDEBAR_BG))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| {
+                    view.toggle_occurrence_collapse(group_id, occ_idx, cx)
+                });
+            }
+        })
         .child(checkbox)
         .child(
             div()
@@ -2805,7 +2837,12 @@ fn build_detail_rows(
 
     let context_lines = state.detail_config.context_lines;
     for (i, occ) in occurrences.iter().enumerate() {
-        if i > 0 {
+        let collapsed = state.is_occurrence_collapsed(group_id, i);
+        if i > 0 && !collapsed {
+            // Gap sits between consecutive code bodies — skip it when
+            // the next occurrence is collapsed so we don't leave a
+            // blank band above a lone header (#45 AC: Gap is a "code"
+            // row, only emitted for non-collapsed occurrences).
             out.push(DetailRow::Gap);
         }
         out.push(DetailRow::OccurrenceHeader {
@@ -2815,6 +2852,9 @@ fn build_detail_rows(
             checked: state.is_occurrence_selected(group_id, i),
             path: occ.path.clone(),
         });
+        if collapsed {
+            continue;
+        }
         match read_occurrence_source(state, occ) {
             Some((source, lang_hint)) => {
                 let slice = crate::detail::extract_with_context(
@@ -3389,5 +3429,120 @@ mod tint_overlay_tests {
         let end = pieces.last().unwrap().range.end;
         assert_eq!(start, 10);
         assert_eq!(end, 30);
+    }
+}
+
+#[cfg(test)]
+mod detail_row_tests {
+    //! `build_detail_rows` row-shape tests for #45 — verify the
+    //! collapse state only suppresses code/gap/unavailable rows and
+    //! never hides the occurrence headers.
+    //!
+    //! Runs without GPUI — `build_detail_rows` is a pure function of
+    //! `AppState`.
+
+    use super::{DetailRow, build_detail_rows};
+    use crate::app_state::{AppState, GroupView, OccurrenceView};
+    use dedup_core::Tier;
+    use std::path::PathBuf;
+
+    fn occ(path: &str) -> OccurrenceView {
+        OccurrenceView {
+            path: PathBuf::from(path),
+            start_line: 1,
+            end_line: 5,
+            alpha_rename_spans: Vec::new(),
+        }
+    }
+
+    /// Two-occurrence group loaded into `AppState` with `selected_group
+    /// = Some(group_id)`. `current_folder` stays `None` so
+    /// `read_occurrence_source` returns `None` and every non-collapsed
+    /// occurrence emits a single [`DetailRow::Unavailable`] — keeping
+    /// the row-shape assertions tight and independent of the host FS.
+    fn state_with_two_occurrences(group_id: i64) -> AppState {
+        let mut s = AppState::new();
+        s.groups = vec![GroupView {
+            id: group_id,
+            tier: Tier::A,
+            label: "g".into(),
+            occurrences: vec![occ("a.rs"), occ("b.rs")],
+            language: None,
+            group_hash: Some(0x1),
+        }];
+        s.selected_group = Some(group_id);
+        s
+    }
+
+    fn header_indices(rows: &[DetailRow]) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                DetailRow::OccurrenceHeader { .. } => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_detail_rows_none_collapsed_has_code_between_headers() {
+        let state = state_with_two_occurrences(1);
+        let occurrences = state.selected_occurrences();
+        let rows = build_detail_rows(&state, 1, &occurrences);
+
+        // Summary + 2 headers + 2 Unavailable rows + 1 Gap between
+        // them.
+        assert!(matches!(rows[0], DetailRow::Summary(_)));
+        let headers = header_indices(&rows);
+        assert_eq!(headers.len(), 2);
+        // Unavailable sits right after each header when both are
+        // expanded.
+        assert!(matches!(rows[headers[0] + 1], DetailRow::Unavailable));
+        assert!(matches!(rows[headers[1] + 1], DetailRow::Unavailable));
+        // Gap precedes the second header.
+        assert!(matches!(rows[headers[1] - 1], DetailRow::Gap));
+    }
+
+    #[test]
+    fn build_detail_rows_one_collapsed_keeps_both_headers() {
+        let mut state = state_with_two_occurrences(1);
+        state.toggle_occurrence_collapse(1, 0);
+        let occurrences = state.selected_occurrences();
+        let rows = build_detail_rows(&state, 1, &occurrences);
+
+        // Both headers still present, but the collapsed occurrence
+        // emits no Unavailable row (and no leading Gap — the gap is
+        // skipped when the following occurrence is collapsed).
+        let headers = header_indices(&rows);
+        assert_eq!(headers.len(), 2);
+        // The first (collapsed) header must not be followed by
+        // Unavailable / CodeLine — the next row is the second
+        // occurrence's Gap or Header.
+        let after_first = &rows[headers[0] + 1];
+        assert!(
+            !matches!(
+                after_first,
+                DetailRow::Unavailable | DetailRow::CodeLine { .. }
+            ),
+            "collapsed header should not be followed by code/unavailable, got {after_first:?}"
+        );
+        // The second (expanded) occurrence still renders its
+        // Unavailable row.
+        assert!(matches!(rows[headers[1] + 1], DetailRow::Unavailable));
+    }
+
+    #[test]
+    fn build_detail_rows_all_collapsed_has_only_summary_plus_headers() {
+        let mut state = state_with_two_occurrences(1);
+        state.collapse_all_in_active_group();
+        let occurrences = state.selected_occurrences();
+        let rows = build_detail_rows(&state, 1, &occurrences);
+
+        // Exactly Summary + 2 headers — no gap, no code, no
+        // unavailable.
+        assert_eq!(rows.len(), 3, "rows: {rows:#?}");
+        assert!(matches!(rows[0], DetailRow::Summary(_)));
+        assert!(matches!(rows[1], DetailRow::OccurrenceHeader { .. }));
+        assert!(matches!(rows[2], DetailRow::OccurrenceHeader { .. }));
     }
 }

@@ -346,11 +346,17 @@ pub struct AppState {
     /// ids because occurrences don't expose their own id to the view
     /// model.
     pub selected_occurrence_indices: HashMap<i64, HashSet<usize>>,
-    /// Groups whose detail section is collapsed (#27). Default is
-    /// "none collapsed". `collapse_all()` populates this with every
-    /// visible group id; `expand_all()` clears it; per-group header
-    /// clicks toggle membership.
-    pub collapsed_groups: HashSet<i64>,
+    /// Occurrences whose code body is collapsed (#45). Keyed by
+    /// `(group_id, occ_idx)` where `occ_idx` is the visible-list
+    /// position within that group. Default is "none collapsed".
+    /// `collapse_all_in_active_group` populates this with every
+    /// occurrence of the active group; `expand_all_in_active_group`
+    /// clears those entries; per-header clicks toggle a single pair.
+    ///
+    /// Per-occurrence (rather than per-group) so each card collapses
+    /// independently — the old group-level model hid every row of
+    /// every occurrence at once, including the headers.
+    pub collapsed_occurrences: HashSet<(i64, usize)>,
     /// GUI detail-pane tunables (issue #26). Cached on folder open —
     /// not reloaded per frame. Currently carries just
     /// [`DetailConfig::context_lines`] (number of dimmed before/after
@@ -1039,7 +1045,7 @@ impl AppState {
         self.session_dismissed.clear();
         self.session_occurrence_dismissed.clear();
         self.selected_occurrence_indices.clear();
-        self.collapsed_groups.clear();
+        self.collapsed_occurrences.clear();
         self.selected_group_idx = if self.groups.is_empty() {
             None
         } else {
@@ -1427,7 +1433,8 @@ impl AppState {
             last_group_id: Some(group.id),
         });
         self.selected_occurrence_indices.remove(&group_id);
-        self.collapsed_groups.remove(&group_id);
+        self.collapsed_occurrences
+            .retain(|(gid, _)| *gid != group_id);
         if self.selected_group == Some(group_id) {
             self.selected_group = None;
         }
@@ -1486,28 +1493,45 @@ impl AppState {
         Some((hash, occ.path))
     }
 
-    /// Toggle whether `group_id`'s detail section is collapsed.
-    pub fn toggle_collapse(&mut self, group_id: i64) {
-        if !self.collapsed_groups.insert(group_id) {
-            self.collapsed_groups.remove(&group_id);
+    /// Toggle whether a single occurrence's code body is collapsed.
+    /// Headers always stay visible; only the `CodeLine` / `Gap` /
+    /// `Unavailable` rows are suppressed when collapsed.
+    pub fn toggle_occurrence_collapse(&mut self, group_id: i64, occ_idx: usize) {
+        let key = (group_id, occ_idx);
+        if !self.collapsed_occurrences.insert(key) {
+            self.collapsed_occurrences.remove(&key);
         }
     }
 
-    /// Whether the given group's detail section is currently collapsed.
-    pub fn is_group_collapsed(&self, group_id: i64) -> bool {
-        self.collapsed_groups.contains(&group_id)
+    /// Whether a single occurrence's code body is currently collapsed.
+    pub fn is_occurrence_collapsed(&self, group_id: i64, occ_idx: usize) -> bool {
+        self.collapsed_occurrences.contains(&(group_id, occ_idx))
     }
 
-    /// Collapse every currently-visible group.
-    pub fn collapse_all(&mut self) {
-        for g in self.visible_groups() {
-            self.collapsed_groups.insert(g.id);
+    /// Collapse every occurrence in the currently-selected group only.
+    /// Other groups' collapse state is left untouched — per #45 the
+    /// button scope is the active group, not the whole project.
+    pub fn collapse_all_in_active_group(&mut self) {
+        let Some(group_id) = self.selected_group else {
+            return;
+        };
+        let Some(group) = self.groups.iter().find(|g| g.id == group_id).cloned() else {
+            return;
+        };
+        let count = self.visible_occurrences_of(&group).len();
+        for i in 0..count {
+            self.collapsed_occurrences.insert((group_id, i));
         }
     }
 
-    /// Expand every group (clears the collapsed set).
-    pub fn expand_all(&mut self) {
-        self.collapsed_groups.clear();
+    /// Expand every occurrence in the currently-selected group only —
+    /// drops every `(active_group_id, _)` entry.
+    pub fn expand_all_in_active_group(&mut self) {
+        let Some(group_id) = self.selected_group else {
+            return;
+        };
+        self.collapsed_occurrences
+            .retain(|(gid, _)| *gid != group_id);
     }
 
     /// Close the group-detail pane — clears the selection. Reached by
@@ -2892,25 +2916,44 @@ mod tests {
     }
 
     #[test]
-    fn collapse_all_and_expand_all_toggle_state() {
+    fn toggle_occurrence_collapse_is_per_pair() {
         let mut s = loaded_with_multi_occ();
-        assert!(s.collapsed_groups.is_empty());
-        s.collapse_all();
-        assert!(s.is_group_collapsed(1));
-        assert!(s.is_group_collapsed(2));
-        s.expand_all();
-        assert!(!s.is_group_collapsed(1));
-        assert!(s.collapsed_groups.is_empty());
+        // Independent toggles — collapsing (1, 0) leaves (1, 1) and
+        // (2, 0) untouched.
+        s.toggle_occurrence_collapse(1, 0);
+        assert!(s.is_occurrence_collapsed(1, 0));
+        assert!(!s.is_occurrence_collapsed(1, 1));
+        assert!(!s.is_occurrence_collapsed(2, 0));
+        // Second call flips off.
+        s.toggle_occurrence_collapse(1, 0);
+        assert!(!s.is_occurrence_collapsed(1, 0));
     }
 
     #[test]
-    fn toggle_collapse_flips_single_group() {
+    fn collapse_all_in_active_group_only_touches_active_group() {
         let mut s = loaded_with_multi_occ();
-        s.toggle_collapse(1);
-        assert!(s.is_group_collapsed(1));
-        assert!(!s.is_group_collapsed(2));
-        s.toggle_collapse(1);
-        assert!(!s.is_group_collapsed(1));
+        // Active group is 1 (three occurrences); group 2 should stay
+        // fully expanded.
+        assert_eq!(s.selected_group, Some(1));
+        s.collapse_all_in_active_group();
+        assert!(s.is_occurrence_collapsed(1, 0));
+        assert!(s.is_occurrence_collapsed(1, 1));
+        assert!(s.is_occurrence_collapsed(1, 2));
+        assert!(!s.is_occurrence_collapsed(2, 0));
+        assert!(!s.is_occurrence_collapsed(2, 1));
+    }
+
+    #[test]
+    fn expand_all_in_active_group_only_clears_active_group() {
+        let mut s = loaded_with_multi_occ();
+        // Seed collapse state across both groups, then swap the active
+        // group and expand — the inactive group's collapse must stick.
+        s.toggle_occurrence_collapse(1, 0);
+        s.toggle_occurrence_collapse(2, 0);
+        s.selected_group = Some(2);
+        s.expand_all_in_active_group();
+        assert!(s.is_occurrence_collapsed(1, 0));
+        assert!(!s.is_occurrence_collapsed(2, 0));
     }
 
     #[test]
