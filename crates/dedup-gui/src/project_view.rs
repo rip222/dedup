@@ -1028,6 +1028,44 @@ impl ProjectView {
                 let base_rows = cache.scan_groups(base_scan_id).unwrap_or_default();
                 let head_rows = cache.scan_groups(head_scan_id).unwrap_or_default();
                 let badges = build_badge_map(&base_rows, &head_rows);
+
+                // #64 — per-group lineage metadata for the detail-pane
+                // header. For every hash live in the head scan, look
+                // up its earliest recorded scan via `cache.lineage`
+                // and pair that scan's `started_at` with the baseline
+                // / current occurrence counts. `lineage` returns a
+                // chronologically-sorted vec; the first entry is the
+                // first-seen scan. A cache miss on either side is
+                // tolerated silently — the header row falls back to
+                // the baseline-inactive layout rather than erroring.
+                let mut group_meta: std::collections::HashMap<
+                    u64,
+                    crate::app_state::HistoryGroupMeta,
+                > = std::collections::HashMap::new();
+                for head_row in &head_rows {
+                    let first_seen = match cache.lineage(head_row.group_hash) {
+                        Ok(scan_ids) => scan_ids
+                            .first()
+                            .copied()
+                            .and_then(|sid| cache.get_scan(sid).ok().flatten())
+                            .map(|s| s.started_at)
+                            .unwrap_or(0),
+                        Err(_) => 0,
+                    };
+                    let baseline_count = base_rows
+                        .iter()
+                        .find(|r| r.group_hash == head_row.group_hash)
+                        .map(|r| r.occurrence_count)
+                        .unwrap_or(0);
+                    group_meta.insert(
+                        head_row.group_hash,
+                        crate::app_state::HistoryGroupMeta {
+                            first_seen,
+                            baseline_count,
+                            current_count: head_row.occurrence_count,
+                        },
+                    );
+                }
                 // GONE rows: hashes present in base, absent in head.
                 // Look up the label off the cache's live
                 // `match_groups` table when possible — a hash may still
@@ -1073,10 +1111,19 @@ impl ProjectView {
                 self.state.history_baseline = Some(baseline);
                 self.state.history_baseline_scan = Some(base_scan_id);
                 self.state.history_badges = badges;
+                self.state.history_group_meta = group_meta;
                 self.state.history_gone_groups = gone;
                 self.state.history_gone_expanded = false;
                 self.state.selected_gone_hash = None;
                 self.state.history_comparator_open = false;
+                // #64 — the detail-rows summary embeds the
+                // "N new occurrences since baseline" banner, so the
+                // cached row vec from the pre-baseline state must be
+                // dropped. `compute_cache_key` doesn't fold the
+                // baseline in (adding it would widen the key for
+                // every frame even with no baseline); a manual clear
+                // here is the cheaper path.
+                *self.state.detail_rows_cache.borrow_mut() = None;
             }
             _ => {
                 // Cache open failed — leave state intact, log and move
@@ -3930,12 +3977,47 @@ fn toolbar_button_with_tooltip(
 fn render_group_toolbar(state: &AppState, group_id: i64) -> gpui::Div {
     let (files, dup_lines) = state.group_toolbar_counts(group_id);
 
-    let info_text = format!(
+    let mut info_text = format!(
         "{files} file{fplural} \u{00B7} {lines} duplicated line{lplural}",
         fplural = if files == 1 { "" } else { "s" },
         lines = dup_lines,
         lplural = if dup_lines == 1 { "" } else { "s" },
     );
+
+    // #64 — when a history-diff baseline is active, prepend this
+    // group's lineage metadata. `history_group_meta` is populated by
+    // `pick_history_baseline` and cleared by `clear_history_baseline`
+    // / folder reopen, so the whole block is skipped cleanly once the
+    // comparator is turned off. Baseline == current scan is the same
+    // code path — the delta is `0` and renders as
+    // "Occurrences: N (unchanged since baseline)", which reads as a
+    // sensible no-op rather than a visual regression.
+    if state.history_baseline.is_some()
+        && let Some(group) = state.groups.iter().find(|g| g.id == group_id)
+        && let Some(hash) = group.group_hash
+        && let Some(meta) = state.history_group_meta.get(&hash)
+    {
+        let first_seen_label = if meta.first_seen > 0 {
+            crate::blame::format_unix_date(meta.first_seen)
+        } else {
+            // `lineage` came back empty or the scan-id lookup missed —
+            // render a neutral placeholder rather than `1970-01-01`.
+            "unknown".to_string()
+        };
+        let delta = meta.delta();
+        let delta_label = match delta {
+            0 => "unchanged since baseline".to_string(),
+            d if d > 0 => format!("\u{2191}{d} since baseline"),
+            d => format!("\u{2193}{} since baseline", d.abs()),
+        };
+        info_text = format!(
+            "First seen: {first_seen} \u{00B7} Occurrences: {n} ({delta}) \u{00B7} {base}",
+            first_seen = first_seen_label,
+            n = meta.current_count,
+            delta = delta_label,
+            base = info_text,
+        );
+    }
 
     let gid_open = group_id;
     let gid_dismiss = group_id;
@@ -4529,15 +4611,58 @@ fn get_or_build_detail_rows(
 /// read produce a `DetailRow::Unavailable` row and contribute `None`
 /// to the diff input, so the other occurrences in the group still diff
 /// against each other without panicking.
+/// Summary row text for the detail-pane preamble (#49).
+///
+/// Baseline inactive -> plain `"{N} occurrences"`.
+///
+/// Baseline active + `HistoryGroupMeta` for this group -> plain summary
+/// plus a fallback banner because per-occurrence lineage is not
+/// available from the cache schema (`scan_groups` persists aggregate
+/// `occurrence_count` / `total_lines` only, see `migrate_v3_to_v4` in
+/// `dedup-core::cache`). The banner shape depends on the signed delta:
+///
+/// - `delta > 0` -> `" \u{00B7} {delta} new occurrences since baseline"`
+/// - `delta < 0` -> `" \u{00B7} {|delta|} occurrences removed since baseline"`
+/// - `delta == 0` -> banner suppressed (baseline == current is a
+///   no-visual-regression AC).
+///
+/// Kept pure so the `detail_row_tests` module can exercise both sides
+/// without spinning up a cache.
+fn build_detail_summary_text(state: &AppState, group_id: i64, n: usize) -> String {
+    let base = format!("{n} occurrences");
+    if state.history_baseline.is_none() {
+        return base;
+    }
+    let Some(group) = state.groups.iter().find(|g| g.id == group_id) else {
+        return base;
+    };
+    let Some(hash) = group.group_hash else {
+        return base;
+    };
+    let Some(meta) = state.history_group_meta.get(&hash) else {
+        return base;
+    };
+    let delta = meta.delta();
+    match delta {
+        0 => base,
+        d if d > 0 => format!("{base} \u{00B7} {d} new occurrences since baseline"),
+        d => format!(
+            "{base} \u{00B7} {} occurrences removed since baseline",
+            d.abs()
+        ),
+    }
+}
+
 fn build_detail_rows(
     state: &AppState,
     group_id: i64,
     occurrences: &[crate::app_state::OccurrenceView],
 ) -> Vec<DetailRow> {
     let mut out = Vec::with_capacity(occurrences.len() * 8);
-    out.push(DetailRow::Summary(format!(
-        "{} occurrences",
-        occurrences.len()
+    out.push(DetailRow::Summary(build_detail_summary_text(
+        state,
+        group_id,
+        occurrences.len(),
     )));
 
     let context_lines = state.detail_config.context_lines;
@@ -5453,6 +5578,90 @@ mod detail_row_tests {
         // `third` would require storing every historical cache entry,
         // which defeats the point of a single-slot cache.
         assert_eq!(first.len(), third.len());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #64 — summary-row fallback banner.
+    //
+    // `build_detail_summary_text` is the one banner entry point. Per-
+    // occurrence lineage is impossible to recover from the v4 cache
+    // schema, so the detail pane falls back to a count-based banner
+    // driven by `HistoryGroupMeta`. Tests cover all four branches:
+    // baseline inactive, delta == 0 (AC: no regression), delta > 0
+    // (NEW/GREW), delta < 0 (SHRANK).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn summary_no_banner_when_baseline_inactive() {
+        let state = state_with_two_occurrences(1);
+        let text = super::build_detail_summary_text(&state, 1, 2);
+        assert_eq!(text, "2 occurrences");
+    }
+
+    #[test]
+    fn summary_no_banner_when_delta_is_zero() {
+        use crate::app_state::{HistoryBaseline, HistoryGroupMeta};
+        let mut state = state_with_two_occurrences(1);
+        state.history_baseline = Some(HistoryBaseline::LastScan);
+        state.history_group_meta.insert(
+            0x1,
+            HistoryGroupMeta {
+                first_seen: 1_700_000_000,
+                baseline_count: 2,
+                current_count: 2,
+            },
+        );
+        let text = super::build_detail_summary_text(&state, 1, 2);
+        // AC: baseline == current scan renders as a pure no-op.
+        assert_eq!(text, "2 occurrences");
+    }
+
+    #[test]
+    fn summary_banner_when_delta_positive() {
+        use crate::app_state::{HistoryBaseline, HistoryGroupMeta};
+        let mut state = state_with_two_occurrences(1);
+        state.history_baseline = Some(HistoryBaseline::LastScan);
+        state.history_group_meta.insert(
+            0x1,
+            HistoryGroupMeta {
+                first_seen: 1_700_000_000,
+                baseline_count: 2,
+                current_count: 5,
+            },
+        );
+        let text = super::build_detail_summary_text(&state, 1, 5);
+        assert_eq!(text, "5 occurrences \u{00B7} 3 new occurrences since baseline");
+    }
+
+    #[test]
+    fn summary_banner_when_delta_negative() {
+        use crate::app_state::{HistoryBaseline, HistoryGroupMeta};
+        let mut state = state_with_two_occurrences(1);
+        state.history_baseline = Some(HistoryBaseline::LastScan);
+        state.history_group_meta.insert(
+            0x1,
+            HistoryGroupMeta {
+                first_seen: 1_700_000_000,
+                baseline_count: 5,
+                current_count: 2,
+            },
+        );
+        let text = super::build_detail_summary_text(&state, 1, 2);
+        assert_eq!(
+            text,
+            "2 occurrences \u{00B7} 3 occurrences removed since baseline"
+        );
+    }
+
+    #[test]
+    fn summary_no_banner_when_group_missing_meta() {
+        use crate::app_state::HistoryBaseline;
+        let mut state = state_with_two_occurrences(1);
+        state.history_baseline = Some(HistoryBaseline::LastScan);
+        // `history_group_meta` intentionally empty — e.g. cache miss on
+        // `lineage` for this hash. Banner suppressed cleanly.
+        let text = super::build_detail_summary_text(&state, 1, 2);
+        assert_eq!(text, "2 occurrences");
     }
 }
 

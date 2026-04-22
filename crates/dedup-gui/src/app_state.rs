@@ -454,6 +454,47 @@ impl HistoryFilter {
     }
 }
 
+/// Per-group lineage metadata surfaced in the detail pane header when
+/// a history-diff baseline is active (#64). Populated by
+/// [`ProjectView::pick_history_baseline`] alongside [`AppState::history_badges`];
+/// consulted by the group toolbar renderer and by
+/// [`build_detail_rows`] when emitting the summary row.
+///
+/// `first_seen` is the `started_at` of the earliest scan in which
+/// `group_hash` appeared (see [`Cache::lineage`]). `baseline_count` is
+/// the group's `occurrence_count` in the baseline scan — `0` when the
+/// group is NEW (not present in baseline). `current_count` is the same
+/// value in the head scan. `delta` is `current - baseline`.
+///
+/// Limitation: the cache schema records per-scan aggregate counts, not
+/// individual occurrence locations (`scan_groups` carries
+/// `occurrence_count` and `total_lines` only — see `migrate_v3_to_v4`
+/// in `dedup-core::cache`). That makes per-path "added since baseline"
+/// / "removed since baseline" marking impossible from persisted state.
+/// The detail pane accordingly renders a count-based banner
+/// ("N new occurrences since baseline") rather than per-occurrence
+/// gutter bars. A future schema bump that records occurrence paths in
+/// `scan_groups` would let the renderer upgrade to real gutter marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryGroupMeta {
+    /// Earliest `started_at` from [`Cache::lineage`] for this group
+    /// hash. Unix epoch seconds.
+    pub first_seen: i64,
+    /// Occurrence count in the baseline scan. `0` for NEW groups.
+    pub baseline_count: i64,
+    /// Occurrence count in the head scan. Always matches the live
+    /// `GroupView::occurrences.len()` for non-GONE groups.
+    pub current_count: i64,
+}
+
+impl HistoryGroupMeta {
+    /// Signed delta in occurrence count since baseline. Positive = the
+    /// group grew, negative = it shrank, zero = unchanged.
+    pub fn delta(self) -> i64 {
+        self.current_count.saturating_sub(self.baseline_count)
+    }
+}
+
 /// One "Resolved since baseline" row shown below the dismissed section
 /// when the baseline comparator is active (#62). Built from the union
 /// of the baseline scan's `scan_groups` minus any group hash still
@@ -674,6 +715,15 @@ pub struct AppState {
     /// filter chips can distinguish "was in baseline" from "never
     /// observed".
     pub history_badges: HashMap<u64, crate::history_badge::HistoryBadge>,
+    /// Per-group lineage metadata (#64), keyed by normalized
+    /// `group_hash`. Populated alongside [`Self::history_badges`] by
+    /// [`ProjectView::pick_history_baseline`]. Empty when no baseline
+    /// is active. The detail pane consumes this to render
+    /// "First seen: …" + "Occurrences: N (↑M since baseline)" in the
+    /// group toolbar and a "N new occurrences since baseline" banner
+    /// above the code bodies. See [`HistoryGroupMeta`] for the
+    /// occurrence-level fallback rationale.
+    pub history_group_meta: HashMap<u64, HistoryGroupMeta>,
     /// Resolved GONE rows (#62) for the "Resolved since baseline"
     /// section. Empty when no baseline active. Sorted by hash ASC for
     /// determinism.
@@ -762,6 +812,7 @@ impl Default for AppState {
             history_baseline_scan: None,
             history_comparator_open: false,
             history_badges: HashMap::new(),
+            history_group_meta: HashMap::new(),
             history_gone_groups: Vec::new(),
             history_gone_expanded: false,
             history_filter: HistoryFilter::default(),
@@ -1558,6 +1609,7 @@ impl AppState {
         self.history_baseline_scan = None;
         self.history_comparator_open = false;
         self.history_badges.clear();
+        self.history_group_meta.clear();
         self.history_gone_groups.clear();
         self.history_gone_expanded = false;
         self.history_filter = HistoryFilter::default();
@@ -2893,11 +2945,18 @@ impl AppState {
         self.history_baseline = None;
         self.history_baseline_scan = None;
         self.history_badges.clear();
+        self.history_group_meta.clear();
         self.history_gone_groups.clear();
         self.history_gone_expanded = false;
         self.history_filter = HistoryFilter::default();
         self.selected_gone_hash = None;
         self.history_comparator_open = false;
+        // #49 — the detail-rows cache encodes the active baseline in
+        // its fingerprint (the summary row's text embeds the delta
+        // banner). Clearing the baseline changes that text, so a
+        // stale cache entry would otherwise survive into the next
+        // selection.
+        *self.detail_rows_cache.borrow_mut() = None;
     }
 }
 
@@ -4940,6 +4999,14 @@ mod tests {
         });
         s.history_gone_expanded = true;
         s.selected_gone_hash = Some(0xBB);
+        s.history_group_meta.insert(
+            0xAA,
+            HistoryGroupMeta {
+                first_seen: 1_700_000_000,
+                baseline_count: 2,
+                current_count: 5,
+            },
+        );
 
         s.clear_history_baseline();
 
@@ -4951,6 +5018,29 @@ mod tests {
         assert!(s.history_gone_groups.is_empty());
         assert!(!s.history_gone_expanded);
         assert!(s.selected_gone_hash.is_none());
+        assert!(s.history_group_meta.is_empty());
+    }
+
+    #[test]
+    fn history_group_meta_delta_sign() {
+        let grew = HistoryGroupMeta {
+            first_seen: 0,
+            baseline_count: 2,
+            current_count: 5,
+        };
+        assert_eq!(grew.delta(), 3);
+        let shrank = HistoryGroupMeta {
+            first_seen: 0,
+            baseline_count: 5,
+            current_count: 2,
+        };
+        assert_eq!(shrank.delta(), -3);
+        let flat = HistoryGroupMeta {
+            first_seen: 0,
+            baseline_count: 4,
+            current_count: 4,
+        };
+        assert_eq!(flat.delta(), 0);
     }
 
     // -----------------------------------------------------------------
