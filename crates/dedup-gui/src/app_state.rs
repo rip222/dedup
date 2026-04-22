@@ -288,7 +288,7 @@ pub struct FolderLoadResult {
 /// the selected group id, and the derived [`AppStatus`]. All fields are
 /// plain `pub` so the `Render` impls can project them directly into view
 /// tree without ceremony — this is a pure-data view-model, not an object.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AppState {
     pub current_folder: Option<PathBuf>,
     pub groups: Vec<GroupView>,
@@ -409,6 +409,50 @@ pub struct AppState {
     /// Whether the post-scan issues dialog is open (issue #30). Toggled
     /// by the sidebar "N files had issues" link.
     pub scan_issues_open: bool,
+    /// Current sidebar width in pixels (issue #47). Mutated through
+    /// [`AppState::set_sidebar_width`], which clamps into
+    /// [`crate::sidebar_prefs::MIN_SIDEBAR_WIDTH`] ..=
+    /// [`crate::sidebar_prefs::MAX_SIDEBAR_WIDTH`] and returns early on
+    /// no-op writes so the drag-move handler doesn't churn the view.
+    /// Persistence lives in [`crate::sidebar_prefs::SidebarPrefs`] —
+    /// loaded at startup (see [`crate::lib`]) and written on drag end
+    /// via [`AppState::persist_sidebar_prefs`].
+    pub sidebar_width: f32,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            current_folder: None,
+            groups: Vec::new(),
+            dismissed: Vec::new(),
+            selected_group: None,
+            status: AppStatus::default(),
+            dismissed_expanded: false,
+            scan_state: ScanState::default(),
+            groups_streaming: Vec::new(),
+            search_query: String::new(),
+            sort_key: SortKey::default(),
+            focused_pane: Pane::default(),
+            selected_group_idx: None,
+            session_dismissed: std::collections::HashSet::new(),
+            session_occurrence_dismissed: HashSet::new(),
+            selected_occurrence_indices: HashMap::new(),
+            collapsed_occurrences: HashSet::new(),
+            detail_config: DetailConfig::default(),
+            recent_projects: crate::recent::RecentProjects::default(),
+            recent_banner: None,
+            editor_banner: None,
+            editor_config: EditorConfig::default(),
+            preferences_open: false,
+            sort_popup_open: false,
+            toasts: ToastStack::default(),
+            startup_error: None,
+            scan_issues: Vec::new(),
+            scan_issues_open: false,
+            sidebar_width: crate::sidebar_prefs::DEFAULT_SIDEBAR_WIDTH,
+        }
+    }
 }
 
 /// Startup-error payload surfaced when `Config::load` fails at launch.
@@ -1017,6 +1061,42 @@ impl AppState {
             tracing::debug!(
                 error = %e,
                 "dedup-gui: failed to persist recent.json — keeping in-memory MRU",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #47 — resizable sidebar helpers.
+    //
+    // Width lives in-state as a plain `f32` so the render path reads it
+    // without allocation. Persistence is punted to drag-end (via
+    // [`Self::persist_sidebar_prefs`]) rather than every move event —
+    // per-frame disk writes would be wasteful, and the acceptance
+    // criteria only require the value to persist across sessions.
+    // -----------------------------------------------------------------
+
+    /// Set the sidebar width in pixels, clamped into
+    /// [`crate::sidebar_prefs::MIN_SIDEBAR_WIDTH`] ..=
+    /// [`crate::sidebar_prefs::MAX_SIDEBAR_WIDTH`]. Called per
+    /// mouse-move event from the splitter's drag-move handler. This is
+    /// the only sanctioned write path for `sidebar_width`; direct field
+    /// writes would bypass the clamp.
+    pub fn set_sidebar_width(&mut self, width: f32) {
+        self.sidebar_width = crate::sidebar_prefs::clamp_width(width);
+    }
+
+    /// Persist the current `sidebar_width` to `sidebar.json`. Called on
+    /// drag end (mouse up) so the value survives restarts. Errors are
+    /// swallowed with a `debug!` line — persistence is a hint, not a
+    /// requirement for the session.
+    pub fn persist_sidebar_prefs(&self) {
+        let prefs = crate::sidebar_prefs::SidebarPrefs {
+            sidebar_width: self.sidebar_width,
+        };
+        if let Err(e) = prefs.save_to_disk() {
+            tracing::debug!(
+                error = %e,
+                "dedup-gui: failed to persist sidebar.json — keeping in-memory width",
             );
         }
     }
@@ -1959,7 +2039,55 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidebar_prefs::{
+        DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH,
+    };
     use std::path::PathBuf;
+
+    // -----------------------------------------------------------------
+    // Issue #47 — set_sidebar_width clamping.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn set_sidebar_width_clamps_below_min() {
+        let mut s = AppState::new();
+        s.set_sidebar_width(10.0);
+        assert_eq!(s.sidebar_width, MIN_SIDEBAR_WIDTH);
+    }
+
+    #[test]
+    fn set_sidebar_width_clamps_at_min_boundary() {
+        let mut s = AppState::new();
+        s.set_sidebar_width(MIN_SIDEBAR_WIDTH);
+        assert_eq!(s.sidebar_width, MIN_SIDEBAR_WIDTH);
+    }
+
+    #[test]
+    fn set_sidebar_width_clamps_above_max() {
+        let mut s = AppState::new();
+        s.set_sidebar_width(5_000.0);
+        assert_eq!(s.sidebar_width, MAX_SIDEBAR_WIDTH);
+    }
+
+    #[test]
+    fn set_sidebar_width_clamps_at_max_boundary() {
+        let mut s = AppState::new();
+        s.set_sidebar_width(MAX_SIDEBAR_WIDTH);
+        assert_eq!(s.sidebar_width, MAX_SIDEBAR_WIDTH);
+    }
+
+    #[test]
+    fn set_sidebar_width_accepts_in_range_value() {
+        let mut s = AppState::new();
+        s.set_sidebar_width(400.0);
+        assert_eq!(s.sidebar_width, 400.0);
+    }
+
+    #[test]
+    fn default_sidebar_width_matches_preset() {
+        let s = AppState::new();
+        assert_eq!(s.sidebar_width, DEFAULT_SIDEBAR_WIDTH);
+    }
 
     fn occ(path: &str, s: i64, e: i64) -> OccurrenceView {
         OccurrenceView {

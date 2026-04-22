@@ -1451,7 +1451,7 @@ fn dispatch_open_recent(idx: usize, cx: &mut gpui::App) {
 // -----------------------------------------------------------------------
 
 impl Render for ProjectView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #42 — root focus anchor. GPUI's key dispatch walks from
         // the focused element up to the window root; without a
         // `track_focus` anywhere in the tree the window has no focused
@@ -1533,6 +1533,20 @@ impl Render for ProjectView {
             .flex_col()
             .bg(rgb(BG))
             .text_color(white())
+            // Issue #47 — sidebar splitter drag. The handler fires once
+            // per move event while a `SidebarResizeDrag` is active, no
+            // matter whether the cursor is inside the splitter hitbox.
+            // `event.position.x` is in window coordinates; the root div
+            // is anchored at `x = 0` so that's the new width directly,
+            // minus half the splitter so the cursor stays centered.
+            .on_drag_move::<SidebarResizeDrag>(cx.listener(
+                |view, e: &gpui::DragMoveEvent<SidebarResizeDrag>, _window, cx| {
+                    let new_w =
+                        f32::from(e.event.position.x) - SIDEBAR_SPLITTER_WIDTH / 2.0;
+                    view.state.set_sidebar_width(new_w);
+                    cx.notify();
+                },
+            ))
             .children(stale)
             .children(editor_banner)
             .children(overlay)
@@ -2011,8 +2025,63 @@ fn render_loaded(state: &AppState) -> gpui::Div {
         .flex()
         .flex_row()
         .child(render_sidebar(state))
+        .child(render_sidebar_splitter())
         .child(render_detail(state))
 }
+
+/// Issue #47 — draggable splitter between the sidebar and the detail
+/// pane.
+///
+/// A thin 4-px column with the `ResizeLeftRight` cursor. Starting a
+/// drag on it activates a [`SidebarResizeDrag`] payload; the actual
+/// "turn window-x into new width" translation lives on the root
+/// [`ProjectView`] `on_drag_move` handler so the handler has a stable
+/// reference frame regardless of where the sidebar currently ends
+/// (the root div is anchored at `x = 0` in window coordinates, so
+/// `event.position.x` is the new width directly). On mouse up we
+/// persist the final width to `sidebar.json`.
+///
+/// The dragged-view constructor returns an empty [`Empty`] view —
+/// we want the drag state machinery, not a drag ghost, and there's
+/// no GPUI primitive for "no drag preview" short of rendering nothing.
+pub(crate) const SIDEBAR_SPLITTER_WIDTH: f32 = 4.0;
+
+fn render_sidebar_splitter() -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("sidebar-splitter")
+        .w(px(SIDEBAR_SPLITTER_WIDTH))
+        .h_full()
+        .bg(rgb(BG))
+        .cursor_ew_resize()
+        // Start a drag with a [`SidebarResizeDrag`] marker payload.
+        // The `Empty` view keeps GPUI happy about the generic `W: Render`
+        // bound without adding a visible drag ghost.
+        .on_drag(SidebarResizeDrag, |_, _, _window, cx| {
+            cx.stop_propagation();
+            cx.new(|_| gpui::EmptyView)
+        })
+        // Stop-propagate the click so the initial mouse-down doesn't
+        // bubble to any siblings. The drag state machine handles the
+        // rest.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            cx.stop_propagation();
+        })
+        // Persist on mouse up so the value survives a restart. The
+        // root handler has already been updating state per move event.
+        .on_mouse_up(MouseButton::Left, |_, _, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, _| view.state.persist_sidebar_prefs());
+            }
+        })
+}
+
+/// Marker payload attached to an active sidebar-splitter drag. Carries
+/// no data — the root `on_drag_move::<SidebarResizeDrag>` handler
+/// reads the event position directly. Tagged as a distinct type (not
+/// `()`) so `DragMoveEvent<SidebarResizeDrag>` type-dispatches to the
+/// right handler.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SidebarResizeDrag;
 
 /// Partition the sidebar's current groups into `(tier_b, tier_a)`.
 ///
@@ -2076,7 +2145,7 @@ fn render_sidebar(state: &AppState) -> gpui::Div {
     let tier_a_count = tier_a.len();
 
     div()
-        .w(px(320.0))
+        .w(px(state.sidebar_width))
         .h_full()
         .bg(rgb(SIDEBAR_BG))
         .border_r_1()

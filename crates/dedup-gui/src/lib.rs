@@ -27,6 +27,7 @@ pub mod highlight;
 pub mod menubar;
 pub mod project_view;
 pub mod recent;
+pub mod sidebar_prefs;
 pub mod tint;
 pub mod toast;
 
@@ -40,6 +41,9 @@ pub use app_state::{
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};
 pub use recent::{MAX_RECENTS, RecentProject, RecentProjects, config_dir, recent_file_path};
+pub use sidebar_prefs::{
+    DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, SidebarPrefs, sidebar_file_path,
+};
 pub use toast::{
     CacheErrorClass, Toast, ToastAction, ToastKind, ToastStack, classify_cache_error,
     format_issues_clipboard, panic_message,
@@ -71,6 +75,10 @@ pub fn run() {
         // mutations call `menubar::rebuild_menus` (see `project_view`).
         let initial_recents = recent::RecentProjects::load_from_disk();
 
+        // Issue #47 — hydrate the persisted sidebar width. Missing /
+        // corrupt file → default (320 px); never a panic.
+        let initial_sidebar = sidebar_prefs::SidebarPrefs::load_or_default();
+
         // Install menubar + global action handlers first so shortcuts
         // work even before a window is focused.
         menubar::install(cx, &initial_recents.entries);
@@ -92,6 +100,11 @@ pub fn run() {
                     let entity = cx.new(|cx| {
                         let mut view = ProjectView::new(cx);
                         view.state.recent_projects = initial_recents.clone();
+                        // Seed the persisted sidebar width into state;
+                        // `set_sidebar_width` re-clamps just in case
+                        // `load_or_default` returned an unclamped value
+                        // (it shouldn't, but defence-in-depth).
+                        view.state.set_sidebar_width(initial_sidebar.sidebar_width);
                         if let Some(err) = startup_err.clone() {
                             view.state.startup_error = Some(err);
                         }
