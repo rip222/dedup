@@ -256,12 +256,25 @@ fn register_keybindings(cx: &mut App) {
             "ToggleSidebar" => KeyBinding::new(keystroke, ToggleSidebar, None),
             "FocusSidebar" => KeyBinding::new(keystroke, FocusSidebar, None),
             "FocusDetail" => KeyBinding::new(keystroke, FocusDetail, None),
+            // `FindInSidebar` is global (cmd-f) — context predicate `None`
+            // so it fires regardless of whether the search input already
+            // owns focus (issue #50).
             "FindInSidebar" => KeyBinding::new(keystroke, FindInSidebar, None),
-            "NextGroup" => KeyBinding::new(keystroke, NextGroup, None),
-            "PrevGroup" => KeyBinding::new(keystroke, PrevGroup, None),
-            "ActivateGroup" => KeyBinding::new(keystroke, ActivateGroup, None),
-            "DismissCurrentGroup" => KeyBinding::new(keystroke, DismissCurrentGroup, None),
-            "OpenSelectedInEditor" => KeyBinding::new(keystroke, OpenSelectedInEditor, None),
+            // The sidebar-navigation bindings carry a `!SearchInput`
+            // predicate so plain `j`/`k`/`x`/`o`/`enter`/arrow keys go to
+            // the real text input when it is focused instead of
+            // triggering list navigation (issue #50 acceptance criterion
+            // "printable keystrokes go to the input and do not trigger
+            // j/k/x/o actions").
+            "NextGroup" => KeyBinding::new(keystroke, NextGroup, Some("!SearchInput")),
+            "PrevGroup" => KeyBinding::new(keystroke, PrevGroup, Some("!SearchInput")),
+            "ActivateGroup" => KeyBinding::new(keystroke, ActivateGroup, Some("!SearchInput")),
+            "DismissCurrentGroup" => {
+                KeyBinding::new(keystroke, DismissCurrentGroup, Some("!SearchInput"))
+            }
+            "OpenSelectedInEditor" => {
+                KeyBinding::new(keystroke, OpenSelectedInEditor, Some("!SearchInput"))
+            }
             other => unreachable!("unmapped shortcut action {other}"),
         }
     }));

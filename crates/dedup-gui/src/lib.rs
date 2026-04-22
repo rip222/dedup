@@ -190,6 +190,93 @@ mod tests {
         }
     }
 
+    /// Issue #50 — regression guard for the real sidebar search
+    /// input. The acceptance criteria require:
+    ///   * a GPUI text input (thin wrapper over `div` with a
+    ///     `FocusHandle` + `on_key_down`).
+    ///   * ⌘F focuses it (registered on the root div so the handler
+    ///     has a `&mut Window`).
+    ///   * j/k/x/o/enter/arrow bindings carry `!SearchInput` so
+    ///     printable keys do not trigger list navigation when the
+    ///     input owns focus.
+    ///   * `Search…` placeholder shows only when empty (checked via
+    ///     the render string literal).
+    /// All four points are observable as substrings in the source, so
+    /// the guard runs as a pure-data test without spinning up GPUI on
+    /// a worker thread.
+    #[test]
+    fn search_input_wired_and_suppresses_nav_keys() {
+        let view_src = include_str!("project_view.rs");
+        assert!(
+            view_src.contains("search_focus_handle: FocusHandle"),
+            "ProjectView must own a dedicated FocusHandle for the \
+             sidebar search input (issue #50) — otherwise ⌘F has \
+             nothing to focus and key events don't route to the \
+             input."
+        );
+        assert!(
+            view_src.contains(".track_focus(search_focus_handle)"),
+            "render_search_box must call track_focus on the search \
+             input's FocusHandle so GPUI routes key events into it \
+             (issue #50)."
+        );
+        assert!(
+            view_src.contains(".key_context(\"SearchInput\")"),
+            "render_search_box must set key_context(\"SearchInput\") \
+             so the j/k/x/o/enter/arrow bindings' `!SearchInput` \
+             predicate matches and short-circuits list navigation \
+             while the input is focused (issue #50)."
+        );
+        assert!(
+            view_src.contains("window.focus(&self.search_focus_handle, cx)"),
+            "find_in_sidebar must move keyboard focus onto the \
+             search input's handle via window.focus so ⌘F actually \
+             lands the caret in the input (issue #50)."
+        );
+        assert!(
+            view_src.contains("Search\\u{2026}"),
+            "render_search_box must keep the `Search…` placeholder \
+             string — only rendered when `search_query` is empty \
+             (issue #50 acceptance criterion)."
+        );
+
+        let menubar_src = include_str!("menubar.rs");
+        for action in [
+            "NextGroup",
+            "PrevGroup",
+            "ActivateGroup",
+            "DismissCurrentGroup",
+            "OpenSelectedInEditor",
+        ] {
+            let needle = format!("\"{action}\"");
+            assert!(
+                menubar_src.contains(&needle),
+                "menubar.rs must still mention {action} so this \
+                 test is looking at the right match arm"
+            );
+            // The predicate `!SearchInput` must appear on the same
+            // binding construction — look for it anywhere in the
+            // match arm body. We don't anchor to the exact text
+            // because rustfmt may split the arm across lines.
+            let arm = menubar_src
+                .split(&needle)
+                .nth(1)
+                .expect("action appears at least once");
+            // Restrict the search window to a short prefix of the
+            // arm body so we don't accidentally pick up a
+            // `!SearchInput` from a later arm.
+            let slice_end = arm.len().min(200);
+            let arm_body = &arm[..slice_end];
+            assert!(
+                arm_body.contains("Some(\"!SearchInput\")"),
+                "keybinding for {action} must be gated on the \
+                 `!SearchInput` context predicate so printable keys \
+                 don't hijack list navigation when the search input \
+                 is focused (issue #50). Arm body: {arm_body:?}"
+            );
+        }
+    }
+
     /// Issue #42 — regression guard for keyboard-shortcut dispatch
     /// wiring. GPUI routes actions via the focused element's
     /// key-context tree; if `ProjectView::render` ever stops calling

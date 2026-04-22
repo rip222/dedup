@@ -129,6 +129,14 @@ pub struct ProjectView {
     /// silently never fire because the window has no focused element.
     /// Issue #42.
     pub focus_handle: FocusHandle,
+    /// Focus handle for the sidebar search input (issue #50). When
+    /// focused, the search `<div>` is painted with an active border,
+    /// `on_key_down` routes printable keys into
+    /// [`AppState::search_query`], and the `!SearchInput` context
+    /// predicate on the j/k/x/o/enter/arrow bindings causes those
+    /// keys to short-circuit back into text entry instead of triggering
+    /// list navigation.
+    pub search_focus_handle: FocusHandle,
 }
 
 impl ProjectView {
@@ -144,6 +152,7 @@ impl ProjectView {
             state: AppState::new(),
             scan_rx: Arc::new(Mutex::new(None)),
             focus_handle: cx.focus_handle(),
+            search_focus_handle: cx.focus_handle(),
         }
     }
 
@@ -724,14 +733,47 @@ impl ProjectView {
         cx.notify();
     }
 
-    /// ⌘F handler — flip focus to the sidebar + mark the search box as
-    /// the intended input target. The actual text-entry hookup is out
-    /// of scope for the issue (search_query is updated via the input
-    /// element's on-change callback), but flipping focus is enough to
-    /// satisfy the acceptance criterion "⌘F focuses the search box".
-    pub fn find_in_sidebar(&mut self, cx: &mut Context<Self>) {
+    /// ⌘F handler — flip pane focus to the sidebar and move GPUI's
+    /// actual keyboard focus onto the search input's handle so
+    /// subsequent keystrokes land in [`AppState::search_query`] (issue
+    /// #50). The `!SearchInput` context predicate on `j`/`k`/`x`/`o`/
+    /// `enter`/arrow bindings takes care of not eating the keystrokes
+    /// as list-navigation actions.
+    pub fn find_in_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.focus_pane(Pane::Sidebar);
+        window.focus(&self.search_focus_handle, cx);
         cx.notify();
+    }
+
+    /// Clear the search input and return focus to the root handle
+    /// (issue #50). Invoked from the search input's `escape` key
+    /// handler; clearing on `Escape` matches the acceptance criterion
+    /// "Clearing the input returns the full group list (no re-scan)"
+    /// and gives the user an obvious way to abandon a filter.
+    pub fn blur_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.set_search_query(String::new());
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Append a single character to the live search query. Called by
+    /// the search input's `on_key_down` handler for printable keys
+    /// (issue #50).
+    pub fn search_input_push(&mut self, ch: char, cx: &mut Context<Self>) {
+        let mut q = self.state.search_query.clone();
+        q.push(ch);
+        self.state.set_search_query(q);
+        cx.notify();
+    }
+
+    /// Remove the last character from the live search query on
+    /// `backspace` (issue #50). No-op when the query is empty.
+    pub fn search_input_backspace(&mut self, cx: &mut Context<Self>) {
+        let mut q = self.state.search_query.clone();
+        if q.pop().is_some() {
+            self.state.set_search_query(q);
+            cx.notify();
+        }
     }
 
     pub fn next_group(&mut self, cx: &mut Context<Self>) {
@@ -1255,11 +1297,12 @@ pub fn register_root(entity: gpui::Entity<ProjectView>, cx: &mut gpui::App) {
             entity.update(cx, |view, cx| view.focus_detail(cx));
         }
     });
-    cx.on_action(|_: &FindInSidebar, cx: &mut gpui::App| {
-        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-            entity.update(cx, |view, cx| view.find_in_sidebar(cx));
-        }
-    });
+    // `FindInSidebar` (⌘F) must land keyboard focus on the search
+    // input's `FocusHandle`, which requires a `&mut Window`. The
+    // app-scope `cx.on_action` handler only has access to `&mut App`,
+    // so this action is registered on the root `div` via
+    // `InteractiveElement::on_action` instead (see
+    // [`ProjectView::render`]). Intentionally left unregistered here.
     cx.on_action(|_: &NextGroup, cx: &mut gpui::App| {
         if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
             entity.update(cx, |view, cx| view.next_group(cx));
@@ -1454,7 +1497,7 @@ fn dispatch_open_recent(idx: usize, cx: &mut gpui::App) {
 // -----------------------------------------------------------------------
 
 impl Render for ProjectView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Issue #42 — root focus anchor. GPUI's key dispatch walks from
         // the focused element up to the window root; without a
         // `track_focus` anywhere in the tree the window has no focused
@@ -1477,7 +1520,10 @@ impl Render for ProjectView {
                 render_newer_cache(*found, *supported).into_any_element()
             }
             AppStatus::Error(msg) => render_error(msg).into_any_element(),
-            AppStatus::Loaded => render_loaded(&self.state).into_any_element(),
+            AppStatus::Loaded => {
+                render_loaded(&self.state, window, &self.search_focus_handle)
+                    .into_any_element()
+            }
         };
 
         // Scan progress + completion banners float above the body so
@@ -1536,6 +1582,18 @@ impl Render for ProjectView {
             .flex_col()
             .bg(rgb(BG))
             .text_color(white())
+            // Issue #50 — `FindInSidebar` (⌘F) must end up with
+            // keyboard focus on the search input's handle. The
+            // app-scope `cx.on_action` registration in
+            // [`register_root`] only sees `&mut App`; attaching here
+            // on the root div gives us `&mut Window` so
+            // `view.find_in_sidebar(window, cx)` can call
+            // `window.focus(&search_focus_handle, cx)`.
+            .on_action(cx.listener(
+                |view, _: &FindInSidebar, window: &mut Window, cx| {
+                    view.find_in_sidebar(window, cx);
+                },
+            ))
             // Issue #47 — sidebar splitter drag. The handler fires once
             // per move event while a `SidebarResizeDrag` is active, no
             // matter whether the cursor is inside the splitter hitbox.
@@ -2022,12 +2080,16 @@ fn render_scan_button(state: &AppState) -> gpui::Div {
 // Loaded view — sidebar + detail
 // ---------------------------------------------------------------------------
 
-fn render_loaded(state: &AppState) -> gpui::Div {
+fn render_loaded(
+    state: &AppState,
+    window: &Window,
+    search_focus_handle: &FocusHandle,
+) -> gpui::Div {
     div()
         .size_full()
         .flex()
         .flex_row()
-        .child(render_sidebar(state))
+        .child(render_sidebar(state, window, search_focus_handle))
         .child(render_sidebar_splitter())
         .child(render_detail(state))
 }
@@ -2128,7 +2190,11 @@ fn sidebar_tier_partition(state: &AppState) -> (Vec<GroupView>, Vec<GroupView>) 
 /// layout (issue #44).
 const GROUP_ROW_HEIGHT: f32 = 24.0;
 
-fn render_sidebar(state: &AppState) -> gpui::Div {
+fn render_sidebar(
+    state: &AppState,
+    window: &Window,
+    search_focus_handle: &FocusHandle,
+) -> gpui::Div {
     // Issue #23 — the sidebar renders the filtered + sorted list from
     // `AppState::visible_groups`. While a scan is running we still fall
     // back to the streaming buffer for Tier A (it arrives mid-scan,
@@ -2180,7 +2246,7 @@ fn render_sidebar(state: &AppState) -> gpui::Div {
                 .child(render_scan_button(state)),
         )
         // Issue #23 — search / sort / summary row.
-        .child(render_search_box(state))
+        .child(render_search_box(state, window, search_focus_handle))
         .child(render_sort_dropdown(state))
         .child(render_summary_header(&summary.format()))
         // Tier B (functions / classes) — header outside, rows virtualized.
@@ -2231,26 +2297,116 @@ fn render_virtualized_group_list(
     div().flex_1().min_h_0().child(list)
 }
 
-/// Search input slot (issue #23).
+/// Live sidebar search input (issues #23, #50).
 ///
-/// We render a read-only label showing the current query plus a
-/// placeholder "Search…" when empty. The real text-entry binding —
-/// GPUI's input widget plumbing — is follow-up work; the slot exists
-/// today so ⌘F has something visible to focus + the state field is
-/// reachable. Unit tests exercise `set_search_query` directly.
-fn render_search_box(state: &AppState) -> gpui::Div {
-    let (text, dim) = if state.search_query.is_empty() {
-        ("Search\u{2026}".to_string(), true)
+/// Zed's upstream `ui::TextField` primitive is not re-exported from the
+/// vendored `gpui` crate we pin, so this is a thin wrapper over a
+/// plain `div` with:
+///
+/// * `track_focus` on [`ProjectView::search_focus_handle`] so GPUI
+///   paints focus styling + routes key events here.
+/// * `key_context("SearchInput")` so the j/k/x/o/enter/arrow
+///   keybindings installed by [`crate::menubar`] (all carry a
+///   `!SearchInput` predicate) do **not** fire while the input owns
+///   focus — printable keys fall through to the `on_key_down` handler
+///   and land in [`AppState::search_query`] instead.
+/// * An `on_key_down` handler that interprets each keystroke:
+///   `escape` clears the query + blurs back to the root focus handle;
+///   `backspace` / `delete` pops the last character; plain printable
+///   keys append the character and re-render the filtered sidebar.
+///   Keystrokes that carry `cmd` / `ctrl` are ignored so `cmd-w`,
+///   `cmd-q`, etc. still dispatch to the menubar when the search
+///   input is focused.
+///
+/// The placeholder "Search…" shows only when the query is empty.
+fn render_search_box(
+    state: &AppState,
+    window: &Window,
+    search_focus_handle: &FocusHandle,
+) -> gpui::Div {
+    let empty = state.search_query.is_empty();
+    let text = if empty {
+        "Search\u{2026}".to_string()
     } else {
-        (state.search_query.clone(), false)
+        state.search_query.clone()
     };
-    let focused = state.focused_pane == Pane::Sidebar;
-    let border_color = if focused {
+    let is_focused = search_focus_handle.is_focused(window);
+    let border_color = if is_focused {
         rgb(ACCENT)
     } else {
         rgb(ACCENT_DIM)
     };
+    let text_color = if empty {
+        rgb(ROW_TEXT_DIM)
+    } else {
+        rgb(ROW_TEXT)
+    };
+
+    // The on_key_down handler fires only while the search input owns
+    // focus (GPUI routes key events through the focused element's
+    // dispatch tree). It uses the app-global `RootHandle` to hop back
+    // into `ProjectView` so we don't have to thread a `cx.listener`
+    // through every `render_sidebar` parameter.
+    let key_down = |event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut gpui::App| {
+        let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        let modifiers = &event.keystroke.modifiers;
+        // Ignore modifier combos other than shift — `cmd-q`, `cmd-w`,
+        // `ctrl-c`, etc. should still reach the menubar. `shift` is
+        // allowed so capital letters can be typed.
+        let has_command_mod = modifiers.control
+            || modifiers.platform
+            || modifiers.function
+            || modifiers.alt;
+
+        if key == "escape" {
+            entity.update(cx, |view, cx| view.blur_search(window, cx));
+            return;
+        }
+
+        if has_command_mod {
+            // Leave to the keymap — e.g. `cmd-w` closes the window.
+            return;
+        }
+
+        if key == "backspace" || key == "delete" {
+            entity.update(cx, |view, cx| view.search_input_backspace(cx));
+            return;
+        }
+
+        // Printable character branch — `key_char` holds the codepoint
+        // the platform IME produced (`"s"` for `s`, `"S"` for
+        // `shift-s`, `"ß"` for `option-s`, etc.). We fall back to
+        // `key` for layouts / keystrokes where `key_char` is `None`
+        // (macOS returns `None` for IME-consuming keys and for
+        // non-printable keys like `tab` / `escape` / `enter`).
+        let typed = event
+            .keystroke
+            .key_char
+            .clone()
+            .unwrap_or_else(|| key.to_string());
+        // Reject multi-codepoint / zero-length / control inputs. A
+        // well-formed printable keystroke is always exactly one
+        // `char`, so filtering on `chars().count() == 1` matches every
+        // ASCII letter / digit / punctuation plus every single-
+        // codepoint unicode char (e.g. `ß`, `é`) without letting
+        // escape-sequence names like `"tab"` or `"enter"` through.
+        let mut it = typed.chars();
+        let Some(ch) = it.next() else { return };
+        if it.next().is_some() {
+            return;
+        }
+        if ch.is_control() {
+            return;
+        }
+        entity.update(cx, |view, cx| view.search_input_push(ch, cx));
+    };
+
     div()
+        .track_focus(search_focus_handle)
+        .key_context("SearchInput")
         .mx(px(12.0))
         .px(px(8.0))
         .py(px(6.0))
@@ -2259,11 +2415,14 @@ fn render_search_box(state: &AppState) -> gpui::Div {
         .border_1()
         .border_color(border_color)
         .text_size(px(12.0))
-        .text_color(if dim {
-            rgb(ROW_TEXT_DIM)
-        } else {
-            rgb(ROW_TEXT)
+        .text_color(text_color)
+        .on_mouse_down(MouseButton::Left, {
+            let handle = search_focus_handle.clone();
+            move |_, window, cx: &mut gpui::App| {
+                window.focus(&handle, cx);
+            }
         })
+        .on_key_down(key_down)
         .child(text)
 }
 

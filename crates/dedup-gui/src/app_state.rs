@@ -2839,6 +2839,61 @@ mod tests {
     }
 
     #[test]
+    fn live_typing_filters_and_clearing_restores_all(
+    ) {
+        // Issue #50 — simulate the character-by-character typing flow
+        // the real `on_key_down` handler runs: each keystroke pushes a
+        // char, `set_search_query` reclamps the selection, and
+        // `visible_groups` must re-filter on the fly. Clearing the
+        // query (equivalent to `escape`) returns the full list
+        // without a re-scan.
+        let mut s = loaded_state_with(vec![
+            mkgroup(1, Tier::A, "apple", vec![occ("a.rs", 1, 5)], Some(0x1)),
+            mkgroup(2, Tier::A, "banana", vec![occ("b.py", 1, 5)], Some(0x2)),
+            mkgroup(3, Tier::A, "apricot", vec![occ("c.rs", 1, 5)], Some(0x3)),
+        ]);
+        assert_eq!(s.visible_groups().len(), 3);
+
+        // Type "a"  → still matches all three.
+        let mut q = String::new();
+        q.push('a');
+        s.set_search_query(q.clone());
+        assert_eq!(s.visible_groups().len(), 3);
+
+        // Type "p"  → "a" + "p" → apple + apricot.
+        q.push('p');
+        s.set_search_query(q.clone());
+        let ids: Vec<i64> = s.visible_groups().iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+
+        // Type "ri" → "apri" → apricot only.
+        q.push('r');
+        q.push('i');
+        s.set_search_query(q.clone());
+        let ids: Vec<i64> = s.visible_groups().iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec![3]);
+
+        // Simulate `escape` → clear the query. Full list restored.
+        s.set_search_query(String::new());
+        assert_eq!(s.visible_groups().len(), 3);
+
+        // Simulate `backspace` after re-typing: the handler pops the
+        // last char and re-calls `set_search_query`. The underlying
+        // `source_groups` list must not be mutated — only the filter
+        // view changes — which is what the call-count-invariant below
+        // encodes (three calls, three different filtered lengths, no
+        // side effect on `groups`).
+        let original_len = s.groups.len();
+        s.set_search_query("apri".into());
+        assert_eq!(s.visible_groups().len(), 1);
+        s.set_search_query("apr".into());
+        assert_eq!(s.visible_groups().len(), 1);
+        s.set_search_query("ap".into());
+        assert_eq!(s.visible_groups().len(), 2);
+        assert_eq!(s.groups.len(), original_len);
+    }
+
+    #[test]
     fn summary_updates_with_filter() {
         let mut s = loaded_state_with(vec![
             mkgroup(
