@@ -143,6 +143,28 @@ chrome. Includes "Collapse all" / "Expand all" buttons (issue #27).
 |---|---|
 | Esc | Dismiss the top-most toast (no-op if none) |
 
+## Tooltips on icon buttons
+
+Every icon button in the GUI — the per-occurrence `×`, the per-group
+`Dismiss group` / `Copy paths` / close `×` row, the sort dropdown,
+the per-toast `×` — carries a short delayed-hover tooltip that names
+the exact action. Tooltips appear after ~500 ms of hover (GPUI's
+built-in delay; issue #53) and disappear as soon as the cursor
+leaves. Examples:
+
+- Per-occurrence `×` → "Dismiss this occurrence"
+- Per-group toolbar `×` → "Close detail pane"
+- Per-group `Dismiss group` → "Dismiss this group (hide from sidebar)"
+- `Copy path` → "Copy path to clipboard"
+- Sort dropdown → "Sort groups"
+- Toast `×` → "Dismiss notification"
+
+Source: `crates/dedup-gui/src/tooltip.rs` exposes a single
+`with_tooltip(element, text)` wrapper that any `.id(...)`-ed element
+can opt into. Convention: whenever a new icon button lands, wrap it
+in `with_tooltip` so the user never has to guess which `×` does
+what.
+
 ## Preferences dialog (⌘,)
 
 The Preferences overlay surfaces an "Edit config file…" action that

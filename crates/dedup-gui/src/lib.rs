@@ -31,6 +31,7 @@ pub mod recent;
 pub mod sidebar_prefs;
 pub mod tint;
 pub mod toast;
+pub mod tooltip;
 
 pub use app_state::{
     AppState, AppStatus, EditorBanner, FolderLoadResult, GroupView, OccurrenceView, Pane,

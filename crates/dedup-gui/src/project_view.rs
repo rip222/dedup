@@ -48,6 +48,7 @@ use crate::toast::{
     ACTION_REMOVE_STALE_RECENT, ACTION_SHOW_ISSUES, Toast, ToastKind, format_issues_clipboard,
     panic_message,
 };
+use crate::tooltip::with_tooltip;
 use dedup_core::{
     Cache, Config, FileIssue, MatchGroup, ScanConfig, ScanError, ScanResult, Scanner, Tier,
     TierAStreamCallback,
@@ -2460,7 +2461,7 @@ fn render_search_box(
 fn render_sort_dropdown(state: &AppState) -> gpui::Stateful<gpui::Div> {
     let open = state.sort_popup_open;
     let border_color = if open { rgb(ACCENT) } else { rgb(ACCENT_DIM) };
-    div()
+    let button = div()
         .id("sidebar-sort-button")
         .mx(px(12.0))
         .mt(px(4.0))
@@ -2483,7 +2484,10 @@ fn render_sort_dropdown(state: &AppState) -> gpui::Stateful<gpui::Div> {
             if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
                 entity.update(cx, |view, cx| view.toggle_sort_popup(cx));
             }
-        })
+        });
+    // Issue #53 — sort-control tooltip. The label uses the same verb
+    // the menubar does so the hint matches the user's mental model.
+    with_tooltip(button, "Sort groups")
 }
 
 /// Sort-dropdown popup menu (issue #46). Full-window transparent
@@ -2857,14 +2861,25 @@ const CHECKBOX_CHECKED_BG: u32 = ACCENT;
 const CHECKBOX_UNCHECKED_BG: u32 = 0x444452;
 
 /// Build a single toolbar button (rounded, coloured rect with on-click).
-fn toolbar_button(
+/// Toolbar pill button with an optional delayed-hover tooltip.
+///
+/// All toolbar buttons wire a tooltip today (#53) — the `tooltip`
+/// arg is `Option` rather than required so the helper still reads as
+/// a generic "pill button" and a future, truly-self-describing label
+/// can pass `None::<&str>` without a contrived string.
+///
+/// The tooltip is rendered via [`crate::tooltip::with_tooltip`], which
+/// preserves the button's click + hover handlers and just layers a
+/// delayed-hover label on top.
+fn toolbar_button_with_tooltip(
     label: impl Into<String>,
+    tooltip: Option<impl Into<gpui::SharedString>>,
     bg: u32,
     action: impl Fn(&mut gpui::App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     let label = label.into();
     let id_key = label.clone();
-    div()
+    let button = div()
         .id(("toolbar-btn", id_key.len() as u64))
         .px(px(10.0))
         .py(px(5.0))
@@ -2877,7 +2892,11 @@ fn toolbar_button(
         .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
             action(cx)
         })
-        .child(id_key)
+        .child(id_key);
+    match tooltip {
+        Some(text) => with_tooltip(button, text),
+        None => button,
+    }
 }
 
 /// Group-level toolbar (#27): info label + action buttons.
@@ -2901,69 +2920,102 @@ fn render_group_toolbar(state: &AppState, group_id: i64) -> gpui::Div {
     let gid_copy = group_id;
 
     // Buttons dispatch through RootHandle so any pane can observe the
-    // resulting state change.
-    let open_btn = toolbar_button("Open in editor", TOOLBAR_BUTTON_BG, move |cx| {
-        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-            entity.update(cx, |view, cx| view.open_group_in_editor(gid_open, cx));
-        }
-    });
-    let dismiss_btn = toolbar_button("Dismiss group", TOOLBAR_DANGER_BG, move |cx| {
-        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-            entity.update(cx, |view, cx| view.dismiss_group_toolbar(gid_dismiss, cx));
-        }
-    });
+    // resulting state change. Tooltips (#53) disambiguate each action
+    // from the rest — particularly `Dismiss group` vs the per-
+    // occurrence `×` and the toolbar's close-the-detail `×`.
+    let open_btn = toolbar_button_with_tooltip(
+        "Open in editor",
+        Some("Open checked paths in your editor"),
+        TOOLBAR_BUTTON_BG,
+        move |cx| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.open_group_in_editor(gid_open, cx));
+            }
+        },
+    );
+    let dismiss_btn = toolbar_button_with_tooltip(
+        "Dismiss group",
+        Some("Dismiss this group (hide from sidebar)"),
+        TOOLBAR_DANGER_BG,
+        move |cx| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.dismiss_group_toolbar(gid_dismiss, cx));
+            }
+        },
+    );
     // Clipboard needs a Window reference; route it through a dedicated
     // mouse-down handler that has access to the window param.
-    let copy_btn = div()
-        .id(("toolbar-btn-copy", gid_copy as u64))
-        .px(px(10.0))
-        .py(px(5.0))
-        .bg(rgb(TOOLBAR_BUTTON_BG))
-        .rounded(px(4.0))
-        .text_size(px(12.0))
-        .text_color(rgb(ROW_TEXT))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
-        .on_mouse_down(
-            MouseButton::Left,
-            move |_, window: &mut Window, cx: &mut gpui::App| {
-                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-                    entity.update(cx, |view, cx| {
-                        view.copy_paths_for_group(gid_copy, window, cx)
-                    });
-                }
-            },
-        )
-        .child("Copy paths");
-    let collapse_btn = toolbar_button("Collapse all", TOOLBAR_BUTTON_BG, move |cx| {
-        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-            entity.update(cx, |view, cx| view.collapse_all(cx));
-        }
-    });
-    let expand_btn = toolbar_button("Expand all", TOOLBAR_BUTTON_BG, move |cx| {
-        if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-            entity.update(cx, |view, cx| view.expand_all(cx));
-        }
-    });
-    let close_btn = div()
-        .id(("toolbar-close", group_id as u64))
-        .w(px(22.0))
-        .h(px(22.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(TOOLBAR_BUTTON_BG))
-        .rounded(px(4.0))
-        .text_size(px(14.0))
-        .text_color(rgb(ROW_TEXT))
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
-        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+    let copy_btn = with_tooltip(
+        div()
+            .id(("toolbar-btn-copy", gid_copy as u64))
+            .px(px(10.0))
+            .py(px(5.0))
+            .bg(rgb(TOOLBAR_BUTTON_BG))
+            .rounded(px(4.0))
+            .text_size(px(12.0))
+            .text_color(rgb(ROW_TEXT))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_, window: &mut Window, cx: &mut gpui::App| {
+                    if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                        entity.update(cx, |view, cx| {
+                            view.copy_paths_for_group(gid_copy, window, cx)
+                        });
+                    }
+                },
+            )
+            .child("Copy paths"),
+        "Copy checked paths to clipboard",
+    );
+    let collapse_btn = toolbar_button_with_tooltip(
+        "Collapse all",
+        Some("Collapse every occurrence in this group"),
+        TOOLBAR_BUTTON_BG,
+        move |cx| {
             if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-                entity.update(cx, |view, cx| view.close_group_detail(cx));
+                entity.update(cx, |view, cx| view.collapse_all(cx));
             }
-        })
-        .child("\u{00D7}");
+        },
+    );
+    let expand_btn = toolbar_button_with_tooltip(
+        "Expand all",
+        Some("Expand every occurrence in this group"),
+        TOOLBAR_BUTTON_BG,
+        move |cx| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.expand_all(cx));
+            }
+        },
+    );
+    // Issue #53 — this toolbar `×` is the *close-the-detail-pane*
+    // action; its meaning is distinct from both the per-occurrence
+    // `×` (dismiss one occurrence) and the per-toast `×` (dismiss a
+    // toast). The tooltip is what keeps the three visually-identical
+    // glyphs from collapsing into the same mystery button.
+    let close_btn = with_tooltip(
+        div()
+            .id(("toolbar-close", group_id as u64))
+            .w(px(22.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(TOOLBAR_BUTTON_BG))
+            .rounded(px(4.0))
+            .text_size(px(14.0))
+            .text_color(rgb(ROW_TEXT))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                    entity.update(cx, |view, cx| view.close_group_detail(cx));
+                }
+            })
+            .child("\u{00D7}"),
+        "Close detail pane",
+    );
 
     div()
         .flex()
@@ -3074,51 +3126,63 @@ fn render_occurrence_header_row(
         });
 
     let path_for_copy = path.to_path_buf();
-    let copy_button = div()
-        .id(("occ-copy", key))
-        .px(px(6.0))
-        .bg(rgb(TOOLBAR_BUTTON_BG))
-        .rounded(px(3.0))
-        .text_size(px(10.0))
-        .text_color(rgb(ROW_TEXT))
-        .cursor_pointer()
-        .invisible()
-        .group_hover(group_hover_key.clone(), |s| s.visible())
-        .child("Copy path")
-        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
-            // #45 — keep the header click-to-collapse from firing
-            // when the user clicks `[Copy path]`.
-            cx.stop_propagation();
-            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-                let p = path_for_copy.clone();
-                entity.update(cx, |view, cx| view.copy_single_path(p, cx));
-            }
-        });
+    // Issue #53 — tooltip text is the exact wording the spec calls
+    // for (`Copy path to clipboard`) so this is the authoritative
+    // occurrence of the phrase — search here if the UX changes.
+    let copy_button = with_tooltip(
+        div()
+            .id(("occ-copy", key))
+            .px(px(6.0))
+            .bg(rgb(TOOLBAR_BUTTON_BG))
+            .rounded(px(3.0))
+            .text_size(px(10.0))
+            .text_color(rgb(ROW_TEXT))
+            .cursor_pointer()
+            .invisible()
+            .group_hover(group_hover_key.clone(), |s| s.visible())
+            .child("Copy path")
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                // #45 — keep the header click-to-collapse from firing
+                // when the user clicks `[Copy path]`.
+                cx.stop_propagation();
+                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                    let p = path_for_copy.clone();
+                    entity.update(cx, |view, cx| view.copy_single_path(p, cx));
+                }
+            }),
+        "Copy path to clipboard",
+    );
 
-    let dismiss = div()
-        .id(("occ-dismiss", key))
-        .w(px(16.0))
-        .h(px(16.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(rgb(TOOLBAR_DANGER_BG))
-        .rounded(px(3.0))
-        .text_size(px(11.0))
-        .text_color(white())
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
-        .child("\u{00D7}")
-        .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
-            // #45 — stop the header click-to-collapse from firing
-            // when the user clicks `[×]`.
-            cx.stop_propagation();
-            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
-                entity.update(cx, |view, cx| {
-                    view.dismiss_occurrence(group_id, occ_idx, cx)
-                });
-            }
-        });
+    // Issue #53 — per-occurrence dismiss. The tooltip spells out
+    // "this occurrence" so users can tell it apart from the group
+    // dismiss and the detail-close `×` sharing the same toolbar row.
+    let dismiss = with_tooltip(
+        div()
+            .id(("occ-dismiss", key))
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(TOOLBAR_DANGER_BG))
+            .rounded(px(3.0))
+            .text_size(px(11.0))
+            .text_color(white())
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+            .child("\u{00D7}")
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                // #45 — stop the header click-to-collapse from firing
+                // when the user clicks `[×]`.
+                cx.stop_propagation();
+                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                    entity.update(cx, |view, cx| {
+                        view.dismiss_occurrence(group_id, occ_idx, cx)
+                    });
+                }
+            }),
+        "Dismiss this occurrence",
+    );
 
     // #45 — header is the whole-row click target for collapse. We
     // need a [`Stateful`] div (via `.id(...)`) so `on_mouse_down`
@@ -3569,7 +3633,7 @@ fn render_toast_card(toast: &Toast) -> gpui::Div {
                 .child(icon.to_string()),
         )
         .child(div().flex_1().child(body_col))
-        .child(
+        .child(with_tooltip(
             div()
                 .id(gpui::SharedString::from(close_id))
                 .w(px(18.0))
@@ -3586,7 +3650,10 @@ fn render_toast_card(toast: &Toast) -> gpui::Div {
                         entity.update(cx, |view, cx| view.dismiss_toast(toast_id, cx));
                     }
                 }),
-        )
+            // Issue #53 — "Dismiss" matches the toast model: Esc
+            // also dismisses, per docs/gui.md's keyboard table.
+            "Dismiss notification",
+        ))
 }
 
 /// Render the invalid-config startup modal (issue #30).
