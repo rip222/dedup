@@ -42,12 +42,18 @@ const BUILT_IN_PATTERNS: &[&str] = &[
     "*.min.css",
     "*.bundle.js",
     "*.generated.*",
-    // Lock files.
+    // Lock files (named variants + generic glob).
     "Cargo.lock",
     "package-lock.json",
     "yarn.lock",
     "poetry.lock",
     "pnpm-lock.yaml",
+    "*.lock",
+    // Docs, plain-text notes, and log files. Users can opt back in via
+    // `.dedupignore` un-ignore syntax (e.g. `!*.md`).
+    "*.md",
+    "*.txt",
+    "*.log",
     // Vendored / third-party directories.
     "vendor/",
     "third_party/",
@@ -317,6 +323,39 @@ mod tests {
     }
 
     #[test]
+    fn layer3_docs_notes_logs_and_generic_lock_patterns() {
+        // Coverage for the default-ignore expansion: docs (`*.md`),
+        // notes (`*.txt`), logs (`*.log`), and the generic `*.lock`
+        // glob that subsumes the named lock files.
+        let dir = tempdir().unwrap();
+        let r = rules(dir.path());
+        assert!(r.is_path_ignored(Path::new("README.md"), false));
+        assert!(r.is_path_ignored(Path::new("docs/guide.md"), false));
+        assert!(r.is_path_ignored(Path::new("notes.txt"), false));
+        assert!(r.is_path_ignored(Path::new("app.log"), false));
+        assert!(r.is_path_ignored(Path::new("logs/server.log"), false));
+        assert!(r.is_path_ignored(Path::new("Gemfile.lock"), false));
+        assert!(r.is_path_ignored(Path::new("composer.lock"), false));
+        // Non-matches: real source files.
+        assert!(!r.is_path_ignored(Path::new("src/main.rs"), false));
+        assert!(!r.is_path_ignored(Path::new("README.rs"), false));
+    }
+
+    #[test]
+    fn layer4_whitelist_reincludes_docs() {
+        // Users can opt `*.md` back in via `.dedupignore` un-ignore
+        // syntax, per the issue's acceptance criteria.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".dedupignore"), "!*.md\n").unwrap();
+        let r = rules(dir.path());
+        assert!(!r.is_path_ignored(Path::new("README.md"), false));
+        assert!(!r.is_path_ignored(Path::new("docs/guide.md"), false));
+        // Other default-ignored classes still drop.
+        assert!(r.is_path_ignored(Path::new("notes.txt"), false));
+        assert!(r.is_path_ignored(Path::new("app.log"), false));
+    }
+
+    #[test]
     fn layer3_vendored_dirs_skip_children() {
         let dir = tempdir().unwrap();
         let r = rules(dir.path());
@@ -417,6 +456,10 @@ mod tests {
             "yarn.lock",
             "poetry.lock",
             "pnpm-lock.yaml",
+            "Gemfile.lock",
+            "README.md",
+            "notes.txt",
+            "app.log",
         ] {
             assert!(
                 r.is_path_ignored(Path::new(pat), false),

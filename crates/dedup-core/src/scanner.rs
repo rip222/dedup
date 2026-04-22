@@ -1519,7 +1519,7 @@ mod tests {
         let git = dir.path().join(".git");
         fs::create_dir_all(&git).unwrap();
         fs::write(git.join("config"), "some git config").unwrap();
-        fs::write(dir.path().join("visible.txt"), "hello").unwrap();
+        fs::write(dir.path().join("visible.data"), "hello").unwrap();
 
         let r = Scanner::default().scan(dir.path()).unwrap();
         assert_eq!(r.files_scanned, 1);
@@ -1529,7 +1529,7 @@ mod tests {
     fn binary_files_are_skipped() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("binary.bin"), b"\0\0\0\0data").unwrap();
-        fs::write(dir.path().join("text.txt"), "hello world").unwrap();
+        fs::write(dir.path().join("text.data"), "hello world").unwrap();
 
         let r = Scanner::default().scan(dir.path()).unwrap();
         assert_eq!(r.files_scanned, 1);
@@ -1538,8 +1538,8 @@ mod tests {
     #[test]
     fn tiny_file_under_threshold_is_not_reported() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "x y z").unwrap();
-        fs::write(dir.path().join("b.txt"), "x y z").unwrap();
+        fs::write(dir.path().join("a.data"), "x y z").unwrap();
+        fs::write(dir.path().join("b.data"), "x y z").unwrap();
 
         let r = Scanner::default().scan(dir.path()).unwrap();
         assert!(r.groups.is_empty());
@@ -1590,7 +1590,7 @@ mod tests {
     #[test]
     fn noop_sink_matches_scan_convenience() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "hello world").unwrap();
+        fs::write(dir.path().join("a.data"), "hello world").unwrap();
 
         let via_scan = Scanner::default().scan(dir.path()).unwrap();
         let via_progress = Scanner::default()
@@ -1680,9 +1680,9 @@ mod tests {
         let dir = tempdir().unwrap();
         // One readable file we expect to see processed, one with mode
         // 0o000 which `fs::read` will refuse.
-        let readable = dir.path().join("readable.txt");
+        let readable = dir.path().join("readable.data");
         fs::write(&readable, "hello world, this is readable content\n").unwrap();
-        let locked = dir.path().join("locked.txt");
+        let locked = dir.path().join("locked.data");
         fs::write(&locked, "secret").unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
@@ -1701,7 +1701,7 @@ mod tests {
                 .issues
                 .iter()
                 .any(|i| i.kind == FileIssueKind::ReadError
-                    && i.path.file_name().unwrap() == "locked.txt")
+                    && i.path.file_name().unwrap() == "locked.data")
         );
     }
 
@@ -1712,8 +1712,8 @@ mod tests {
         // continuation — the classic "invalid UTF-8" sentinel. Neither
         // byte is NUL, so the binary sniff (`any(|b| *b == 0)`) lets it
         // through to the UTF-8 decode.
-        fs::write(dir.path().join("bad.txt"), [0xC3, 0x28, 0xC3, 0x28]).unwrap();
-        fs::write(dir.path().join("good.txt"), "abcdefgh\n").unwrap();
+        fs::write(dir.path().join("bad.data"), [0xC3, 0x28, 0xC3, 0x28]).unwrap();
+        fs::write(dir.path().join("good.data"), "abcdefgh\n").unwrap();
 
         let result = Scanner::default().scan(dir.path()).unwrap();
         assert_eq!(result.files_scanned, 1);
@@ -1834,8 +1834,8 @@ mod tests {
             .map(|i| format!("let always_shared_{i} = {i};\n"))
             .collect::<Vec<_>>()
             .join("");
-        fs::write(dir.path().join("a.txt"), &body).unwrap();
-        fs::write(dir.path().join("b.txt"), &body).unwrap();
+        fs::write(dir.path().join("a.data"), &body).unwrap();
+        fs::write(dir.path().join("b.data"), &body).unwrap();
 
         let sink = AtomicProgressSink::new();
         assert_eq!(sink.files_scanned(), 0);
@@ -1934,8 +1934,8 @@ mod tests {
             .map(|i| format!("let always_shared_{i} = {i};\n"))
             .collect::<Vec<_>>()
             .join("");
-        fs::write(dir.path().join("a.txt"), &body).unwrap();
-        fs::write(dir.path().join("b.txt"), &body).unwrap();
+        fs::write(dir.path().join("a.data"), &body).unwrap();
+        fs::write(dir.path().join("b.data"), &body).unwrap();
 
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
         let calls_cb = calls.clone();

@@ -22,9 +22,9 @@ fn write_fixture(dir: &Path) {
     // Two plain UTF-8 files so Tier A has something to hash, plus one
     // file with invalid UTF-8 bytes that passes the binary sniff (no
     // NUL bytes) and therefore reaches the decode step.
-    std::fs::write(dir.join("a.txt"), "hello world, friend\n").unwrap();
-    std::fs::write(dir.join("b.txt"), "hello world, friend\n").unwrap();
-    std::fs::write(dir.join("bad.txt"), [0xC3, 0x28, 0xC3, 0x28]).unwrap();
+    std::fs::write(dir.join("a.data"), "hello world, friend\n").unwrap();
+    std::fs::write(dir.join("b.data"), "hello world, friend\n").unwrap();
+    std::fs::write(dir.join("bad.data"), [0xC3, 0x28, 0xC3, 0x28]).unwrap();
 }
 
 #[test]
@@ -57,8 +57,8 @@ fn utf8_failure_surfaces_in_cli_summary() {
 fn clean_scan_emits_no_issue_summary() {
     // Just the two good files — no bad inputs, so nothing to summarize.
     let tmp = tempdir().unwrap();
-    std::fs::write(tmp.path().join("a.txt"), "hello world").unwrap();
-    std::fs::write(tmp.path().join("b.txt"), "hello world").unwrap();
+    std::fs::write(tmp.path().join("a.data"), "hello world").unwrap();
+    std::fs::write(tmp.path().join("b.data"), "hello world").unwrap();
 
     let output = Command::cargo_bin("dedup")
         .expect("dedup binary")
