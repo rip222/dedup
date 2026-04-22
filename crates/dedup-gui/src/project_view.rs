@@ -1479,6 +1479,40 @@ impl Render for ProjectView {
     }
 }
 
+/// Build a small, flat action button that dispatches a menubar action
+/// on click. Collapses the 9 copy-paste blocks under the toast/banner/
+/// dialog renderers into one helper (surfaced by #32 dogfood scan,
+/// group 66).
+///
+/// `bg` varies per call site (warning red, accent, dim, etc.), so it's
+/// a parameter. `px_pad` / `py_pad` let the two existing sizes (banner
+/// 10×4, dialog 12×6) share the same helper without a new enum.
+fn toast_action_button<A>(
+    id: impl Into<gpui::ElementId>,
+    bg: u32,
+    px_pad: f32,
+    py_pad: f32,
+    label: impl Into<gpui::SharedString>,
+    action: A,
+) -> gpui::Stateful<gpui::Div>
+where
+    A: gpui::Action + Clone,
+{
+    div()
+        .id(id)
+        .px(px(px_pad))
+        .py(px(py_pad))
+        .bg(rgb(bg))
+        .text_color(white())
+        .text_size(px(12.0))
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            window.dispatch_action(Box::new(action.clone()), cx);
+        })
+        .child(label.into())
+}
+
 /// Render the inline "couldn't open this recent" banner.
 ///
 /// Styled like `render_error` (same warning palette) but appears above
@@ -1520,34 +1554,22 @@ fn render_stale_recent_banner(banner: &crate::app_state::RecentBanner) -> gpui::
                 .flex()
                 .flex_row()
                 .gap(px(8.0))
-                .child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(4.0))
-                        .bg(rgb(0xb91c1c))
-                        .text_color(white())
-                        .text_size(px(12.0))
-                        .rounded(px(4.0))
-                        .cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                            window.dispatch_action(Box::new(RemoveStaleRecent), cx);
-                        })
-                        .child("Remove from recents"),
-                )
-                .child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(4.0))
-                        .bg(rgb(0x450a0a))
-                        .text_color(white())
-                        .text_size(px(12.0))
-                        .rounded(px(4.0))
-                        .cursor_pointer()
-                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                            window.dispatch_action(Box::new(DismissRecentBanner), cx);
-                        })
-                        .child("Dismiss"),
-                ),
+                .child(toast_action_button(
+                    "stale-recent-remove",
+                    0xb91c1c,
+                    10.0,
+                    4.0,
+                    "Remove from recents",
+                    RemoveStaleRecent,
+                ))
+                .child(toast_action_button(
+                    "stale-recent-dismiss",
+                    0x450a0a,
+                    10.0,
+                    4.0,
+                    "Dismiss",
+                    DismissRecentBanner,
+                )),
         )
 }
 
@@ -1576,20 +1598,14 @@ fn render_editor_banner(banner: &crate::app_state::EditorBanner) -> gpui::Div {
                 .text_color(rgb(0xfee2e2))
                 .child(msg),
         )
-        .child(
-            div()
-                .px(px(10.0))
-                .py(px(4.0))
-                .bg(rgb(0x450a0a))
-                .text_color(white())
-                .text_size(px(12.0))
-                .rounded(px(4.0))
-                .cursor_pointer()
-                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                    window.dispatch_action(Box::new(DismissEditorBanner), cx);
-                })
-                .child("Dismiss"),
-        )
+        .child(toast_action_button(
+            "editor-banner-dismiss",
+            0x450a0a,
+            10.0,
+            4.0,
+            "Dismiss",
+            DismissEditorBanner,
+        ))
 }
 
 /// Render the Preferences dialog (issue #29).
@@ -1706,36 +1722,22 @@ fn render_preferences_dialog(state: &AppState) -> gpui::Div {
                         .flex_row()
                         .gap(px(8.0))
                         .justify_end()
-                        .child(
-                            div()
-                                .id("preferences-close")
-                                .px(px(12.0))
-                                .py(px(6.0))
-                                .bg(rgb(ACCENT_DIM))
-                                .text_color(white())
-                                .text_size(px(12.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    window.dispatch_action(Box::new(ClosePreferences), cx);
-                                })
-                                .child("Close"),
-                        )
-                        .child(
-                            div()
-                                .id("preferences-edit")
-                                .px(px(12.0))
-                                .py(px(6.0))
-                                .bg(rgb(ACCENT))
-                                .text_color(white())
-                                .text_size(px(12.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    window.dispatch_action(Box::new(OpenConfigInEditor), cx);
-                                })
-                                .child("Edit config file\u{2026}"),
-                        ),
+                        .child(toast_action_button(
+                            "preferences-close",
+                            ACCENT_DIM,
+                            12.0,
+                            6.0,
+                            "Close",
+                            ClosePreferences,
+                        ))
+                        .child(toast_action_button(
+                            "preferences-edit",
+                            ACCENT,
+                            12.0,
+                            6.0,
+                            "Edit config file\u{2026}",
+                            OpenConfigInEditor,
+                        )),
                 ),
         )
 }
@@ -3143,42 +3145,22 @@ fn render_startup_modal(err: &StartupError) -> gpui::Div {
                         .flex_row()
                         .gap(px(8.0))
                         .justify_end()
-                        .child(
-                            div()
-                                .id("startup-reset")
-                                .px(px(12.0))
-                                .py(px(6.0))
-                                .bg(rgb(ACCENT_DIM))
-                                .text_color(white())
-                                .text_size(px(12.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(crate::menubar::StartupResetConfig),
-                                        cx,
-                                    );
-                                })
-                                .child("Reset to defaults"),
-                        )
-                        .child(
-                            div()
-                                .id("startup-fix")
-                                .px(px(12.0))
-                                .py(px(6.0))
-                                .bg(rgb(ACCENT))
-                                .text_color(white())
-                                .text_size(px(12.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(crate::menubar::StartupFixConfig),
-                                        cx,
-                                    );
-                                })
-                                .child("Fix config"),
-                        ),
+                        .child(toast_action_button(
+                            "startup-reset",
+                            ACCENT_DIM,
+                            12.0,
+                            6.0,
+                            "Reset to defaults",
+                            crate::menubar::StartupResetConfig,
+                        ))
+                        .child(toast_action_button(
+                            "startup-fix",
+                            ACCENT,
+                            12.0,
+                            6.0,
+                            "Fix config",
+                            crate::menubar::StartupFixConfig,
+                        )),
                 ),
         )
 }
@@ -3268,42 +3250,22 @@ fn render_issues_dialog(issues: &[FileIssue]) -> gpui::Div {
                         .flex_row()
                         .gap(px(8.0))
                         .justify_end()
-                        .child(
-                            div()
-                                .id("issues-close")
-                                .px(px(12.0))
-                                .py(px(6.0))
-                                .bg(rgb(ACCENT_DIM))
-                                .text_color(white())
-                                .text_size(px(12.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(crate::menubar::CloseScanIssues),
-                                        cx,
-                                    );
-                                })
-                                .child("Close"),
-                        )
-                        .child(
-                            div()
-                                .id("issues-copy")
-                                .px(px(12.0))
-                                .py(px(6.0))
-                                .bg(rgb(ACCENT))
-                                .text_color(white())
-                                .text_size(px(12.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                    window.dispatch_action(
-                                        Box::new(crate::menubar::CopyScanIssues),
-                                        cx,
-                                    );
-                                })
-                                .child("Copy details"),
-                        ),
+                        .child(toast_action_button(
+                            "issues-close",
+                            ACCENT_DIM,
+                            12.0,
+                            6.0,
+                            "Close",
+                            crate::menubar::CloseScanIssues,
+                        ))
+                        .child(toast_action_button(
+                            "issues-copy",
+                            ACCENT,
+                            12.0,
+                            6.0,
+                            "Copy details",
+                            crate::menubar::CopyScanIssues,
+                        )),
                 ),
         )
 }
