@@ -1055,6 +1055,27 @@ impl Cache {
         Ok(out)
     }
 
+    /// Total "dup-LOC severity" for a given scan (issue #63). Defined as
+    /// `SUM(occurrence_count * total_lines)` over every
+    /// [`ScanGroupRow`] recorded for `scan_id`. Unknown scan ids yield
+    /// `Ok(0)` — the query is an aggregate, not a lookup, so a missing
+    /// row naturally returns `0`. Wraps in `i64` with `COALESCE` so
+    /// `SUM()` on an empty result set doesn't surface NULL.
+    ///
+    /// Used by the dedup-LOC sparkline header to plot severity over
+    /// the last N scans without pulling every `scan_groups` row into
+    /// userland.
+    pub fn total_severity(&self, scan_id: i64) -> Result<i64, CacheError> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(SUM(occurrence_count * total_lines), 0) \
+                 FROM scan_groups WHERE scan_id = ?1",
+                params![scan_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(CacheError::from)
+    }
+
     /// Classify every group hash that appears in either scan into NEW /
     /// GREW / SHRANK / GONE. Unchanged groups (same occurrence count)
     /// are omitted so `dedup diff` output stays signal-dense. Rows are
@@ -2461,6 +2482,29 @@ mod tests {
         );
         // Order is hash-ascending for grep-friendly determinism.
         assert!(rows.windows(2).all(|w| w[0].group_hash < w[1].group_hash));
+    }
+
+    #[test]
+    fn total_severity_sums_occurrence_count_times_total_lines() {
+        // Issue #63 — sparkline plots `sum(occurrence_count*total_lines)`
+        // per scan. `synthetic_scan` spans lines 1..=10, so per-occurrence
+        // lines = 10 and `group_totals` sums those to `n * 10` in
+        // `total_lines`. Group (1,2) → total_lines=20; group (2,3) →
+        // total_lines=30. Severity = 2*20 + 3*30 = 130.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let sid = cache
+            .write_scan_result(&synthetic_scan(&[(1, 2), (2, 3)]))
+            .unwrap();
+        assert_eq!(cache.total_severity(sid).unwrap(), 130);
+    }
+
+    #[test]
+    fn total_severity_unknown_scan_id_returns_zero() {
+        // Aggregate over empty rows yields 0 via COALESCE, not NULL.
+        let dir = tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        assert_eq!(cache.total_severity(9999).unwrap(), 0);
     }
 
     #[test]

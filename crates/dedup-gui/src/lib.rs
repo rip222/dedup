@@ -39,10 +39,10 @@ pub mod tooltip;
 
 pub use app_state::{
     AppState, AppStatus, EditorBanner, FolderLoadResult, GroupView, OccurrenceDismissal,
-    OccurrenceView, Pane, RecentBanner, ScanHandles, ScanState, SortKey, StartupError,
-    SummaryCounts, SuppressionView, filter_groups, format_completion_banner, format_elapsed,
-    group_label, group_view_from_match, impact_key, language_from_path, launch_editor,
-    load_folder, open_in_editor, sort_groups, summary, unix_now,
+    OccurrenceView, Pane, RecentBanner, SPARKLINE_MAX_SCANS, ScanHandles, ScanState, SortKey,
+    StartupError, SummaryCounts, SuppressionView, filter_groups, format_completion_banner,
+    format_elapsed, group_label, group_view_from_match, impact_key, language_from_path,
+    launch_editor, load_folder, open_in_editor, sort_groups, summary, unix_now,
 };
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};
@@ -124,6 +124,12 @@ pub fn run() {
                         if let Some(key) = initial_sidebar.sort_key {
                             view.state.sort_key = key;
                         }
+                        // Issue #63 — restore persisted per-folder
+                        // sparkline-collapsed map. Missing / legacy
+                        // files deserialize to an empty map, preserving
+                        // "collapsed by default for everyone".
+                        view.state.sparkline_collapsed =
+                            initial_sidebar.sparkline_collapsed.clone();
                         if let Some(err) = startup_err.clone() {
                             view.state.startup_error = Some(err);
                         }

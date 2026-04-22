@@ -382,6 +382,10 @@ pub struct FolderLoadResult {
     /// Empty vec when the cache has no scan rows yet (pre-#59 caches
     /// or never-scanned folders). Feeds the comparator dropdown.
     pub scans: Vec<dedup_core::ScanRow>,
+    /// Per-scan dup-LOC severity series for the sparkline header
+    /// (#63). Ordered oldest-first and limited to the most recent
+    /// [`SPARKLINE_MAX_SCANS`] entries. `(scan_id, severity)`.
+    pub sparkline_severities: Vec<(i64, i64)>,
 }
 
 /// History-diff baseline selector (#62). Which past scan the sidebar
@@ -689,6 +693,20 @@ pub struct AppState {
     /// `selected_group`: picking a GONE row clears the live selection
     /// and opens a read-only baseline snapshot in the detail pane.
     pub selected_gone_hash: Option<u64>,
+    /// Per-scan dup-LOC severity plotted by the sparkline header
+    /// (#63). `Vec<(scan_id, severity)>` — severity is
+    /// `SUM(occurrence_count*total_lines)` for that scan. Ordered
+    /// oldest-first (left → right in the rendered sparkline), limited
+    /// to the last [`SPARKLINE_MAX_SCANS`] scans. Populated at folder
+    /// open time alongside [`Self::history_scans`] so the render path
+    /// doesn't re-query the cache.
+    pub sparkline_severities: Vec<(i64, i64)>,
+    /// Per-folder collapsed map for the dup-LOC sparkline strip (#63).
+    /// Mirrors the on-disk
+    /// [`crate::sidebar_prefs::SidebarPrefs::sparkline_collapsed`]
+    /// field — kept here so the renderer can flip state without
+    /// round-tripping through disk on every chevron click.
+    pub sparkline_collapsed: std::collections::HashMap<String, bool>,
 }
 
 /// What to restore when the user clicks `[Undo]` on a dismiss toast
@@ -749,9 +767,15 @@ impl Default for AppState {
             history_filter: HistoryFilter::default(),
             history_scans: Vec::new(),
             selected_gone_hash: None,
+            sparkline_severities: Vec::new(),
+            sparkline_collapsed: std::collections::HashMap::new(),
         }
     }
 }
+
+/// Maximum number of scans the dup-LOC sparkline header plots (#63).
+/// Matches the acceptance criterion of "last 20 scans".
+pub const SPARKLINE_MAX_SCANS: usize = 20;
 
 /// Startup-error payload surfaced when `Config::load` fails at launch.
 ///
@@ -1483,15 +1507,19 @@ impl AppState {
     /// with a `debug!` line — persistence is a hint, not a requirement
     /// for the session.
     pub fn persist_sidebar_prefs(&self) {
-        let prefs = crate::sidebar_prefs::SidebarPrefs {
-            sidebar_width: self.sidebar_width,
-            sidebar_hidden: self.sidebar_hidden,
-            // Issue #56 — persist the chosen sort key alongside the
-            // width / visibility. Writing `Some(_)` means a later
-            // load sees the exact variant and skips the legacy
-            // "missing field → Impact" upgrade.
-            sort_key: Some(self.sort_key),
-        };
+        // Issue #63 — preserve the per-folder sparkline-collapsed map
+        // by reading the on-disk copy first and overwriting only the
+        // three fields we own in memory. Without this merge the save
+        // would clobber the sparkline map on every ⌘B toggle.
+        let mut prefs = crate::sidebar_prefs::SidebarPrefs::load_or_default();
+        prefs.sidebar_width = self.sidebar_width;
+        prefs.sidebar_hidden = self.sidebar_hidden;
+        // Issue #56 — persist the chosen sort key alongside the
+        // width / visibility. Writing `Some(_)` means a later
+        // load sees the exact variant and skips the legacy
+        // "missing field → Impact" upgrade.
+        prefs.sort_key = Some(self.sort_key);
+        prefs.sparkline_collapsed = self.sparkline_collapsed.clone();
         if let Err(e) = prefs.save_to_disk() {
             tracing::debug!(
                 error = %e,
@@ -1525,6 +1553,7 @@ impl AppState {
         // explicitly; badges + GONE rows are rebuilt on demand when
         // the user picks a baseline from the dropdown.
         self.history_scans = result.scans;
+        self.sparkline_severities = result.sparkline_severities;
         self.history_baseline = None;
         self.history_baseline_scan = None;
         self.history_comparator_open = false;
@@ -2687,12 +2716,26 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
     // schema doesn't break the whole load.
     let scans = cache.list_scans().unwrap_or_default();
 
+    // Issue #63 — dup-LOC sparkline header. Compute `total_severity`
+    // for the most-recent `SPARKLINE_MAX_SCANS` scan rows. `list_scans`
+    // returns newest-first; we want the last N in chronological
+    // (oldest-first) order so the rendered strip reads left-to-right.
+    // Failures per row fall back to `0` so one bad scan never blanks
+    // the whole sparkline.
+    let sparkline_severities: Vec<(i64, i64)> = scans
+        .iter()
+        .take(SPARKLINE_MAX_SCANS)
+        .rev()
+        .map(|s| (s.scan_id, cache.total_severity(s.scan_id).unwrap_or(0)))
+        .collect();
+
     FolderLoadResult {
         folder,
         groups,
         dismissed,
         status,
         scans,
+        sparkline_severities,
     }
 }
 
@@ -2798,6 +2841,49 @@ impl AppState {
                     .map(|s| s.scan_id)
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #63 — dup-LOC sparkline header.
+    // -----------------------------------------------------------------
+
+    /// Stable key identifying the active folder for sparkline-prefs
+    /// lookups (#63). Uses the folder's lossy display string so the
+    /// on-disk map stays human-readable. `None` when no folder is
+    /// open (strip is trivially hidden in that state).
+    fn sparkline_folder_key(&self) -> Option<String> {
+        self.current_folder
+            .as_ref()
+            .map(|p| p.display().to_string())
+    }
+
+    /// Whether the sparkline header is collapsed for the current
+    /// folder (#63). Defaults to `true` (collapsed) per the acceptance
+    /// criteria. Always `true` when no folder is open — the caller
+    /// just skips rendering the strip anyway.
+    pub fn sparkline_collapsed(&self) -> bool {
+        let Some(key) = self.sparkline_folder_key() else {
+            return true;
+        };
+        self.sparkline_collapsed.get(&key).copied().unwrap_or(true)
+    }
+
+    /// Flip the sparkline strip between collapsed and expanded for the
+    /// current folder (#63). Caller should follow up with
+    /// [`Self::persist_sidebar_prefs`] so the new state survives a
+    /// restart.
+    pub fn toggle_sparkline_collapsed(&mut self) {
+        let Some(key) = self.sparkline_folder_key() else {
+            return;
+        };
+        let current = self.sparkline_collapsed.get(&key).copied().unwrap_or(true);
+        self.sparkline_collapsed.insert(key, !current);
+    }
+
+    /// Whether the sparkline header has anything to plot (#63). The
+    /// strip is trivially hidden when no scans have been recorded.
+    pub fn sparkline_has_data(&self) -> bool {
+        !self.sparkline_severities.is_empty()
     }
 
     /// Clear history-diff state (#62). Public so the comparator's
@@ -3077,6 +3163,7 @@ mod tests {
             dismissed: vec![],
             status: AppStatus::Loaded,
             scans: vec![],
+            sparkline_severities: vec![],
         };
         s.set_folder_result(result);
         assert_eq!(s.selected_group, Some(7));
@@ -3097,6 +3184,7 @@ mod tests {
             dismissed: vec![],
             status: AppStatus::NoDuplicates,
             scans: vec![],
+            sparkline_severities: vec![],
         });
         assert_eq!(s.selected_group, None);
         assert_eq!(s.status, AppStatus::NoDuplicates);
@@ -3783,6 +3871,7 @@ mod tests {
             dismissed: vec![],
             status: AppStatus::Loaded,
             scans: vec![],
+            sparkline_severities: vec![],
         };
         s.set_folder_result(result);
         s
@@ -4862,6 +4951,47 @@ mod tests {
         assert!(s.history_gone_groups.is_empty());
         assert!(!s.history_gone_expanded);
         assert!(s.selected_gone_hash.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #63 — dup-LOC sparkline header.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sparkline_collapsed_defaults_to_true_for_current_folder() {
+        let mut s = AppState::new();
+        s.current_folder = Some(PathBuf::from("/tmp/abc"));
+        assert!(s.sparkline_collapsed());
+    }
+
+    #[test]
+    fn toggle_sparkline_flips_state_for_current_folder_only() {
+        let mut s = AppState::new();
+        s.current_folder = Some(PathBuf::from("/tmp/abc"));
+        s.toggle_sparkline_collapsed();
+        assert!(!s.sparkline_collapsed());
+        // Swap folder — new folder still defaults to collapsed.
+        s.current_folder = Some(PathBuf::from("/tmp/other"));
+        assert!(s.sparkline_collapsed());
+        // Flip back — original folder's state survived.
+        s.current_folder = Some(PathBuf::from("/tmp/abc"));
+        assert!(!s.sparkline_collapsed());
+    }
+
+    #[test]
+    fn toggle_sparkline_is_noop_when_no_folder_open() {
+        let mut s = AppState::new();
+        s.toggle_sparkline_collapsed();
+        // No folder → no key → nothing persisted.
+        assert!(s.sparkline_collapsed.is_empty());
+    }
+
+    #[test]
+    fn sparkline_has_data_follows_severities_vec() {
+        let mut s = AppState::new();
+        assert!(!s.sparkline_has_data());
+        s.sparkline_severities.push((1, 10));
+        assert!(s.sparkline_has_data());
     }
 
     #[test]

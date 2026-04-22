@@ -12,6 +12,7 @@
 //! (320 px), never a panic and never a launch-blocking error. The GUI
 //! treats the file as a pure hint.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,15 @@ pub struct SidebarPrefs {
     /// ([`SortKey::Severity`]) via [`Default::default`].
     #[serde(default)]
     pub sort_key: Option<SortKey>,
+    /// Per-folder collapsed state for the dup-LOC sparkline strip
+    /// (issue #63). Key = canonical folder path as a display string;
+    /// value = `true` when the strip is collapsed. Missing entry → the
+    /// strip is collapsed by default (the acceptance criterion). A
+    /// legacy file without this field deserializes to an empty map via
+    /// `#[serde(default)]`, preserving the collapsed-by-default
+    /// behavior.
+    #[serde(default)]
+    pub sparkline_collapsed: HashMap<String, bool>,
 }
 
 fn default_width() -> f32 {
@@ -83,11 +93,29 @@ impl Default for SidebarPrefs {
             // `Some(SortKey::Impact)` to preserve the legacy ordering
             // for users who already had a saved pref file.
             sort_key: Some(SortKey::Severity),
+            sparkline_collapsed: HashMap::new(),
         }
     }
 }
 
 impl SidebarPrefs {
+    /// Whether the sparkline strip is collapsed for `folder` (#63).
+    /// Returns `true` (collapsed) when there is no entry — the strip
+    /// defaults to collapsed per the acceptance criteria.
+    pub fn is_sparkline_collapsed(&self, folder: &str) -> bool {
+        self.sparkline_collapsed
+            .get(folder)
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Record the collapsed state for `folder` (#63). Caller persists
+    /// via [`Self::save_to_disk`].
+    pub fn set_sparkline_collapsed(&mut self, folder: &str, collapsed: bool) {
+        self.sparkline_collapsed
+            .insert(folder.to_string(), collapsed);
+    }
+
     /// Clamp `self.sidebar_width` into the acceptable range. Callers
     /// should invoke this after deserialization — the [`Self::load`] +
     /// [`Self::load_or_default`] entry points already do so.
@@ -261,6 +289,7 @@ mod tests {
             sidebar_width: 412.0,
             sidebar_hidden: false,
             sort_key: Some(SortKey::Severity),
+            sparkline_collapsed: HashMap::new(),
         };
         prefs.save_to_path(&path).unwrap();
         let loaded = SidebarPrefs::load_from_path(&path);
@@ -285,6 +314,7 @@ mod tests {
             sidebar_width: 500.0,
             sidebar_hidden: false,
             sort_key: Some(SortKey::Severity),
+            sparkline_collapsed: HashMap::new(),
         };
         prefs.save_to_path(&path).unwrap();
 
@@ -307,6 +337,7 @@ mod tests {
             sidebar_width: 320.0,
             sidebar_hidden: true,
             sort_key: Some(SortKey::Severity),
+            sparkline_collapsed: HashMap::new(),
         };
         prefs.save_to_path(&path).unwrap();
         let loaded = SidebarPrefs::load_from_path(&path);
@@ -376,10 +407,56 @@ mod tests {
             sidebar_width: 320.0,
             sidebar_hidden: false,
             sort_key: Some(SortKey::Alphabetical),
+            sparkline_collapsed: HashMap::new(),
         };
         prefs.save_to_path(&path).unwrap();
         let loaded = SidebarPrefs::load_from_path(&path);
         assert_eq!(loaded.sort_key, Some(SortKey::Alphabetical));
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #63 — per-folder sparkline collapsed state.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn sparkline_collapsed_defaults_to_true_for_unseen_folder() {
+        // Acceptance criterion: "Strip collapsed by default". A folder
+        // the user has never touched must therefore report collapsed.
+        let prefs = SidebarPrefs::default();
+        assert!(prefs.is_sparkline_collapsed("/repo/one"));
+    }
+
+    #[test]
+    fn sparkline_collapsed_is_per_folder_independent() {
+        let mut prefs = SidebarPrefs::default();
+        prefs.set_sparkline_collapsed("/repo/one", false);
+        assert!(!prefs.is_sparkline_collapsed("/repo/one"));
+        // An unrelated folder stays on the default (collapsed).
+        assert!(prefs.is_sparkline_collapsed("/repo/two"));
+    }
+
+    #[test]
+    fn sparkline_collapsed_roundtrips_through_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.json");
+        let mut prefs = SidebarPrefs::default();
+        prefs.set_sparkline_collapsed("/repo/one", false);
+        prefs.save_to_path(&path).unwrap();
+        let loaded = SidebarPrefs::load_from_path(&path);
+        assert!(!loaded.is_sparkline_collapsed("/repo/one"));
+        assert!(loaded.is_sparkline_collapsed("/repo/two"));
+    }
+
+    #[test]
+    fn legacy_file_without_sparkline_map_defaults_to_collapsed() {
+        // Pre-#63 sidebar.json does not have `sparkline_collapsed`.
+        // `#[serde(default)]` must deserialize an empty map so every
+        // folder starts out collapsed.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidebar.json");
+        fs::write(&path, r#"{"sidebar_width": 320.0}"#).unwrap();
+        let prefs = SidebarPrefs::load_from_path(&path);
+        assert!(prefs.is_sparkline_collapsed("/any"));
     }
 
     #[test]

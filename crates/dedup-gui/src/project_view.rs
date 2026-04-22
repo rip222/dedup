@@ -965,6 +965,15 @@ impl ProjectView {
         cx.notify();
     }
 
+    /// Flip the dup-LOC sparkline strip between collapsed / expanded
+    /// for the current folder (#63). Persists the new state so it
+    /// survives a restart.
+    pub fn toggle_sparkline_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.state.toggle_sparkline_collapsed();
+        self.state.persist_sidebar_prefs();
+        cx.notify();
+    }
+
     /// Swap the active filter chip (#62). Pure state + notify.
     pub fn set_history_filter(&mut self, filter: HistoryFilter, cx: &mut Context<Self>) {
         self.state.set_history_filter(filter);
@@ -2653,6 +2662,10 @@ fn render_sidebar(
                 )
                 .child(render_scan_button(state)),
         )
+        // Issue #63 — dup-LOC sparkline header. Collapsed-by-default
+        // thin strip; chevron toggles expand per folder. Hidden when
+        // the folder has no scan history to plot.
+        .children(render_sparkline_header(state))
         // Issue #62 — history comparator lives above the sort/search
         // row per the PRD. Hidden when fewer than 2 scans exist.
         .children(render_history_comparator(state))
@@ -2846,6 +2859,145 @@ fn render_search_box(
         })
         .on_key_down(key_down)
         .child(text)
+}
+
+/// Dup-LOC sparkline header (#63).
+///
+/// Thin strip above the comparator that plots total dup-LOC severity
+/// (`sum(occurrence_count*total_lines)` per scan) over the last 20
+/// scans for the active folder. Collapsed by default — a small chevron
+/// on the left flips the strip open; the collapsed state persists per
+/// folder in `sidebar.json`.
+///
+/// Rendering technique: no canvas / path primitive (GPUI's offering is
+/// awkward and overkill). Instead we lay out 20 flex columns of fixed
+/// width with a colored inner block whose height is proportional to
+/// that scan's severity. The current (newest) scan paints in
+/// [`ACCENT`]; earlier scans paint in a dimmed variant. Each column's
+/// `on_mouse_down` calls
+/// [`ProjectView::pick_history_baseline`] with `PickScan(scan_id)` so
+/// clicking a bar sets it as the comparator baseline — the same code
+/// path the #62 dropdown uses, so the badge + filter chip machinery
+/// just works.
+///
+/// Returns `Vec::new()` (nothing to render) when:
+///   * no folder is open,
+///   * the cache has zero scans (`sparkline_severities` empty).
+/// Otherwise always returns the chevron + (when expanded) the bars.
+fn render_sparkline_header(state: &AppState) -> Vec<gpui::AnyElement> {
+    if !state.sparkline_has_data() {
+        return Vec::new();
+    }
+    let collapsed = state.sparkline_collapsed();
+    let chevron = if collapsed { "\u{25B8}" } else { "\u{25BE}" }; // ▸ / ▾
+    let severities: &[(i64, i64)] = &state.sparkline_severities;
+    let max_severity = severities.iter().map(|(_, s)| *s).max().unwrap_or(0);
+
+    // Single-line chevron row; clicking toggles collapse.
+    let chev_row = div()
+        .id("sparkline-header-chevron")
+        .mx(px(12.0))
+        .mt(px(8.0))
+        .px(px(4.0))
+        .py(px(2.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .cursor_pointer()
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .child(chevron.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .child(format!("Dup-LOC history ({} scans)", severities.len())),
+        )
+        .on_mouse_down(MouseButton::Left, |_, _window, cx: &mut gpui::App| {
+            if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                entity.update(cx, |view, cx| view.toggle_sparkline_collapsed(cx));
+            }
+        });
+
+    let mut out: Vec<gpui::AnyElement> = vec![chev_row.into_any_element()];
+
+    if collapsed {
+        return out;
+    }
+
+    // Head scan = newest, highlighted. `sparkline_severities` is
+    // oldest-first, so the last entry wins.
+    let head_scan_id = severities.last().map(|(id, _)| *id);
+    // Total strip height reserved for bars.
+    let strip_h: f32 = 32.0;
+    // Per-bar column. Width is flexible (flex_1) so the row fills the
+    // sidebar regardless of how many scans we actually plot (1..=20).
+    let bars: Vec<gpui::AnyElement> = severities
+        .iter()
+        .map(|(scan_id, sev)| {
+            let sid = *scan_id;
+            let is_head = Some(sid) == head_scan_id;
+            // Map severity into [2.0, strip_h] so even a zero-severity
+            // scan paints a visible stub that can be clicked. One
+            // exception: when every scan is zero we fall back to the
+            // minimum height.
+            let ratio = if max_severity > 0 {
+                (*sev as f32) / (max_severity as f32)
+            } else {
+                0.0
+            };
+            let h = 2.0f32.max(ratio * strip_h);
+            let color = if is_head { ACCENT } else { SECTION_HEADER };
+            // Wrap the bar in a column so the inner block can sit at
+            // the bottom (height grows upward like a real sparkline).
+            let bar = div()
+                .w(px(4.0))
+                .h(px(h))
+                .bg(rgb(color))
+                .rounded(px(1.0));
+            div()
+                .id(("sparkline-bar", sid as usize))
+                .flex_1()
+                .h(px(strip_h))
+                .flex()
+                .flex_col()
+                .justify_end()
+                .items_center()
+                .cursor_pointer()
+                .child(bar)
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                    if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                        entity.update(cx, |view, cx| {
+                            view.pick_history_baseline(HistoryBaseline::PickScan(sid), cx);
+                        });
+                    }
+                })
+                .into_any_element()
+        })
+        .collect();
+
+    let strip = div()
+        .id("sparkline-header-strip")
+        .mx(px(12.0))
+        .mt(px(4.0))
+        .mb(px(4.0))
+        .px(px(4.0))
+        .py(px(4.0))
+        .h(px(strip_h + 8.0))
+        .bg(rgb(ACCENT_DIM))
+        .rounded(px(4.0))
+        .flex()
+        .flex_row()
+        .items_end()
+        .gap(px(2.0))
+        .children(bars);
+
+    out.push(with_tooltip(strip, "Click a bar to compare with that scan").into_any_element());
+    out
 }
 
 /// "Compare with…" comparator button + popup (#62).
