@@ -79,6 +79,31 @@ Per-occurrence suppressions have a separate
 `clear_occurrence_suppressions` API on `Cache` but no CLI entry
 point at MVP.
 
+## Reviewing & restoring in the GUI (#54)
+
+The sidebar's **Dismissed** section is interactive:
+
+- Clicking a row selects that dismissed group and opens its
+  occurrences in the detail pane. The pane renders a read-only
+  toolbar and a banner ("Dismissed on YYYY-MM-DD — [Restore]")
+  instead of the usual dismiss / copy / open actions so the user
+  can review the suppressed code without accidentally re-mutating
+  it.
+- The banner enumerates any per-occurrence dismissals still
+  attached to the group, each with its own `[Restore]` control.
+- Each sidebar row carries an inline `[Restore]` button that
+  undoes the group-level dismissal in one click — this is
+  equivalent to selecting the row and pressing the banner's
+  `[Restore]`.
+
+Restoring a group deletes its suppression row (and any
+per-occurrence rows still attached to the same hash), so the group
+re-appears in the active sidebar/CLI list on the next list /
+reload. The core-layer primitives are
+[`Cache::undismiss`](../crates/dedup-core/src/cache.rs) and
+[`Cache::undismiss_occurrence`]; the GUI routing lives in
+[`dedup-gui::suppressions_view`](../crates/dedup-gui/src/suppressions_view.rs).
+
 ## Persistence
 
 All suppressions live in `<repo>/.dedup/cache.sqlite`. Deleting the

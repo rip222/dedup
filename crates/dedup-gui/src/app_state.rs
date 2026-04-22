@@ -113,14 +113,55 @@ impl OccurrenceView {
 /// View-model for one dismissed-group row in the "Dismissed" section.
 ///
 /// The cache only stores the normalized-block-hash (plus a breadcrumb
-/// last-group-id); the original source content is not recoverable, so the
-/// sidebar label is just `Dismissed block (hash <12-hex>…)`. #30 /
-/// follow-ups can enrich this once dismissal rows grow first-class
-/// label storage.
+/// last-group-id); the original source content is not recoverable as
+/// of the dismissal, so the sidebar label falls back to
+/// `Dismissed block (hash <12-hex>…)` when we cannot resolve any live
+/// `match_groups` row for the `last_group_id`. When the group IS still
+/// in the cache (the common case — dismissals don't delete rows, only
+/// hide them), `occurrences` carries the materialized occurrence list
+/// so the detail pane can show the same code body it would show for a
+/// live group, with a read-only banner on top (#54).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuppressionView {
+    /// Normalized-block-hash — the stable key the cache uses. Kept as a
+    /// `u64` so GUI handlers can pass it straight back to
+    /// `Cache::undismiss` without reparsing a hex string.
+    pub hash: u64,
+    /// Pre-formatted 16-char hex rendering of `hash`. Cached so the
+    /// sidebar label is a cheap slice rather than a fresh format on
+    /// every frame.
     pub hash_hex: String,
+    /// The `match_groups.id` the user last saw this group as. Doubles
+    /// as the selection key when the user clicks the dismissed row —
+    /// [`AppState::selected_group`] always stores a group-id, and
+    /// dismissed rows plug the cache's live id in here so the selection
+    /// hops straight to the read-only detail view (#54).
     pub last_group_id: Option<i64>,
+    /// Unix-epoch seconds at which the group was dismissed. `0` when we
+    /// couldn't read the cache timestamp (legacy in-memory dismissals
+    /// recorded via [`AppState::dismiss_group`] fall through to
+    /// [`unix_now`] via the core `dismiss_hash` call — see the
+    /// doc-comment on that field).
+    pub dismissed_at: i64,
+    /// Materialized occurrence list (if the underlying `match_groups`
+    /// row is still in the cache). Empty for rows where the cache has
+    /// been rewritten since the dismissal and the hash no longer
+    /// resolves — the detail pane falls back to a short "(source no
+    /// longer in cache)" notice in that case.
+    pub occurrences: Vec<OccurrenceView>,
+    /// Per-occurrence dismissals still attached to this group (#54).
+    /// Each entry carries `(path, dismissed_at)` so the banner can
+    /// enumerate them with their own `[Restore]` controls. Only
+    /// populated at folder-load time; restores mutate this list
+    /// in place.
+    pub occurrence_dismissals: Vec<OccurrenceDismissal>,
+}
+
+/// One per-occurrence dismissal still tied to a dismissed group (#54).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceDismissal {
+    pub path: PathBuf,
+    pub dismissed_at: i64,
 }
 
 impl SuppressionView {
@@ -131,6 +172,17 @@ impl SuppressionView {
         let short: String = self.hash_hex.chars().take(12).collect();
         format!("Dismissed block (hash {short}\u{2026})")
     }
+}
+
+/// Unix-epoch seconds as `i64`, saturating on clock skew / pre-1970
+/// clocks. Used for in-memory dismissal timestamps — the on-disk
+/// value comes from the cache's own `now_unix_seconds` and is what
+/// the banner shows after a reload.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Top-level status the main window renders from.
@@ -1181,12 +1233,25 @@ impl AppState {
     /// requires a copy), callers hold the result for the render frame.
     pub fn selected_occurrences(&self) -> Vec<OccurrenceView> {
         match self.selected_group {
-            Some(id) => self
-                .groups
-                .iter()
-                .find(|g| g.id == id)
-                .map(|g| self.visible_occurrences_of(g))
-                .unwrap_or_default(),
+            Some(id) => {
+                if let Some(g) = self.groups.iter().find(|g| g.id == id) {
+                    return self.visible_occurrences_of(g);
+                }
+                // #54 — dismissed-group selection falls through here.
+                // We return the materialized occurrence list untouched
+                // by the per-occurrence session-dismiss filter: the
+                // banner already surfaces per-occurrence dismissals
+                // individually, and the detail pane is read-only
+                // anyway.
+                if let Some(s) = self
+                    .dismissed
+                    .iter()
+                    .find(|s| s.last_group_id == Some(id))
+                {
+                    return s.occurrences.clone();
+                }
+                Vec::new()
+            }
             None => Vec::new(),
         }
     }
@@ -1454,10 +1519,15 @@ impl AppState {
         let group = visible.get(idx)?.clone();
         let hash = group.group_hash?;
         self.session_dismissed.insert(hash);
+        let now = unix_now();
         // Append to dismissed so "recently dismissed" ends up last.
         self.dismissed.push(SuppressionView {
+            hash,
             hash_hex: format!("{hash:016x}"),
             last_group_id: Some(group.id),
+            dismissed_at: now,
+            occurrences: group.occurrences.clone(),
+            occurrence_dismissals: Vec::new(),
         });
         self.reclamp_selection();
         Some((hash, group.id))
@@ -1560,9 +1630,14 @@ impl AppState {
         let group = self.groups.iter().find(|g| g.id == group_id)?.clone();
         let hash = group.group_hash?;
         self.session_dismissed.insert(hash);
+        let now = unix_now();
         self.dismissed.push(SuppressionView {
+            hash,
             hash_hex: format!("{hash:016x}"),
             last_group_id: Some(group.id),
+            dismissed_at: now,
+            occurrences: group.occurrences.clone(),
+            occurrence_dismissals: Vec::new(),
         });
         self.selected_occurrence_indices.remove(&group_id);
         self.collapsed_occurrences
@@ -1672,6 +1747,102 @@ impl AppState {
         self.selected_group = None;
         self.selected_group_idx = None;
         self.focused_pane = Pane::Sidebar;
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #54 — dismissed-group click-to-review + restore helpers.
+    //
+    // Dismissed groups are not in `self.groups` (they're filtered out
+    // at materialization time). `selected_group` is still a plain
+    // group-id — dismissed rows plug `SuppressionView::last_group_id`
+    // in as that id, so both active and dismissed selection run
+    // through the same `select_group` path.
+    // -----------------------------------------------------------------
+
+    /// Select a dismissed group by its cache row id. No-op when no
+    /// dismissed row carries that id. Moves focus to the detail pane
+    /// so the banner + code body are immediately visible.
+    pub fn select_dismissed(&mut self, group_id: i64) {
+        if self
+            .dismissed
+            .iter()
+            .any(|s| s.last_group_id == Some(group_id))
+        {
+            self.selected_group = Some(group_id);
+            self.focused_pane = Pane::Detail;
+        }
+    }
+
+    /// Return the [`SuppressionView`] matching the currently selected
+    /// group id, if any. The banner + read-only detail pane key off
+    /// this.
+    pub fn selected_dismissed(&self) -> Option<&SuppressionView> {
+        let id = self.selected_group?;
+        self.dismissed
+            .iter()
+            .find(|s| s.last_group_id == Some(id))
+    }
+
+    /// Look up a dismissed row by its group-hash. Used by the restore
+    /// handlers — the GUI layer resolves `(hash, path)` from a
+    /// `SuppressionView` clone, then calls back here on the updated
+    /// state to locate the matching row.
+    pub fn find_dismissed_by_hash(&self, hash: u64) -> Option<&SuppressionView> {
+        self.dismissed.iter().find(|s| s.hash == hash)
+    }
+
+    /// Restore a previously-dismissed group (#54). Drops the matching
+    /// `SuppressionView` from `self.dismissed`, removes the hash from
+    /// `session_dismissed` (so `visible_groups()` no longer hides the
+    /// live row if it's still in the cache), and — if the live row is
+    /// still in `self.groups` via `last_group_id` — snaps the sidebar
+    /// selection to it.
+    ///
+    /// Returns the `(hash, last_group_id)` pair for the restored row
+    /// so the caller can round-trip the undismiss to the cache. Returns
+    /// `None` when no dismissed row carries `hash`.
+    pub fn restore_group(&mut self, hash: u64) -> Option<(u64, Option<i64>)> {
+        let pos = self.dismissed.iter().position(|s| s.hash == hash)?;
+        let row = self.dismissed.remove(pos);
+        self.session_dismissed.remove(&hash);
+        // If the active `groups` list has a row with the same hash
+        // (the common case — dismissals never delete rows), select it
+        // so the user lands on the now-restored detail view.
+        if let Some(gid) = row.last_group_id
+            && self.groups.iter().any(|g| g.id == gid)
+        {
+            self.selected_group = Some(gid);
+            self.focused_pane = Pane::Detail;
+            self.reclamp_selection();
+        } else {
+            // Row no longer in active cache (stale breadcrumb). Clear
+            // the selection so the detail pane falls back to the
+            // empty-state copy.
+            if self.selected_group == row.last_group_id {
+                self.selected_group = None;
+            }
+        }
+        Some((hash, row.last_group_id))
+    }
+
+    /// Restore a single per-occurrence dismissal (#54). Locates the
+    /// matching entry in `SuppressionView::occurrence_dismissals` and
+    /// drops it; also drops any matching session-level entry.
+    /// Returns `(hash, path)` on success.
+    pub fn restore_occurrence(&mut self, hash: u64, path: &Path) -> Option<(u64, PathBuf)> {
+        let row = self.dismissed.iter_mut().find(|s| s.hash == hash)?;
+        let before = row.occurrence_dismissals.len();
+        row.occurrence_dismissals.retain(|od| od.path != path);
+        let after = row.occurrence_dismissals.len();
+        self.session_occurrence_dismissed
+            .remove(&(hash, path.to_path_buf()));
+        if after == before {
+            // Even if no banner entry matched, scrubbing the session
+            // set is harmless; but report success only when we
+            // actually changed state the UI needs to see.
+            return None;
+        }
+        Some((hash, path.to_path_buf()))
     }
 
     /// Counts used by the group toolbar's
@@ -2036,12 +2207,99 @@ fn materialize_from_cache(folder: PathBuf, cache: &Cache) -> FolderLoadResult {
         });
     }
 
+    // Per-occurrence dismissals we already read above power the banner
+    // enumeration for each dismissed group (#54). Build a per-hash
+    // lookup now — `list_occurrence_suppressions` is the authoritative
+    // source (it also carries timestamps, which the banner shows).
+    let occurrence_dismissal_rows =
+        match cache.list_occurrence_suppressions() {
+            Ok(v) => v,
+            Err(e) => {
+                return FolderLoadResult {
+                    folder,
+                    groups: Vec::new(),
+                    dismissed: Vec::new(),
+                    status: AppStatus::Error(format!(
+                        "failed to read occurrence suppressions: {e}"
+                    )),
+                };
+            }
+        };
+    let mut occ_dismissals_by_hash: std::collections::HashMap<u64, Vec<OccurrenceDismissal>> =
+        std::collections::HashMap::new();
+    for (h, path, ts) in occurrence_dismissal_rows {
+        occ_dismissals_by_hash
+            .entry(h)
+            .or_default()
+            .push(OccurrenceDismissal {
+                path,
+                dismissed_at: ts,
+            });
+    }
+
+    // Build a hash → (group_id, occurrences) lookup by scanning
+    // `list_groups` once more. The cache still carries the rows (we
+    // only *hide* dismissed groups from the active list, we never
+    // delete them). This lets the detail pane render the dismissed
+    // group's actual code body rather than a stub.
+    let mut occurrences_by_hash: std::collections::HashMap<u64, (i64, Vec<OccurrenceView>)> =
+        std::collections::HashMap::new();
+    let all_summaries = cache.list_groups().unwrap_or_default();
+    for summary in all_summaries {
+        let Ok(Some(h)) = cache.group_hash(summary.id) else {
+            continue;
+        };
+        if !suppressed.contains(&h) {
+            continue;
+        }
+        let Ok(Some(detail)) = cache.get_group(summary.id) else {
+            continue;
+        };
+        let occs: Vec<OccurrenceView> = detail
+            .occurrences
+            .iter()
+            .map(|o| OccurrenceView {
+                path: o.path.clone(),
+                start_line: o.start_line,
+                end_line: o.end_line,
+                alpha_rename_spans: o
+                    .alpha_rename_spans
+                    .iter()
+                    .filter_map(|(s, e, idx)| {
+                        if *s < 0 || *e < 0 || *e < *s {
+                            None
+                        } else {
+                            Some((*s as usize, *e as usize, *idx))
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        occurrences_by_hash.insert(h, (detail.id, occs));
+    }
+
     let dismissed: Vec<SuppressionView> = match cache.list_suppressions() {
         Ok(s) => s
             .into_iter()
-            .map(|sup| SuppressionView {
-                hash_hex: format!("{:016x}", sup.hash),
-                last_group_id: sup.last_group_id,
+            .map(|sup| {
+                let (live_id, occurrences) = occurrences_by_hash
+                    .remove(&sup.hash)
+                    .map(|(id, occs)| (Some(id), occs))
+                    .unwrap_or((None, Vec::new()));
+                let occurrence_dismissals =
+                    occ_dismissals_by_hash.remove(&sup.hash).unwrap_or_default();
+                SuppressionView {
+                    hash: sup.hash,
+                    hash_hex: format!("{:016x}", sup.hash),
+                    // Prefer the *current* cache row id over the stored
+                    // breadcrumb — re-scans renumber rows and the UI
+                    // needs the id the active cache knows about so
+                    // `select_group` can round-trip to `match_groups`.
+                    last_group_id: live_id.or(sup.last_group_id),
+                    dismissed_at: sup.dismissed_at,
+                    occurrences,
+                    occurrence_dismissals,
+                }
             })
             .collect(),
         Err(e) => {
@@ -2211,10 +2469,82 @@ mod tests {
     }
 
     #[test]
+    fn restore_group_drops_row_and_clears_session_dismiss() {
+        // Dismiss then restore — the dismissed list should shrink, the
+        // session set should clear, and (because the live row is still
+        // in `self.groups`) the selection should snap to it.
+        let mut s = loaded_with_multi_occ();
+        let (hash, gid) = s.dismiss_group(1).unwrap();
+        assert!(s.session_dismissed.contains(&hash));
+        assert_eq!(s.dismissed.len(), 1);
+
+        let out = s.restore_group(hash);
+        assert_eq!(out, Some((hash, Some(gid))));
+        assert!(s.dismissed.is_empty());
+        assert!(!s.session_dismissed.contains(&hash));
+        // Group 1 was still present in `self.groups` (dismiss_group
+        // only appends to `dismissed`; it does not remove from
+        // `groups`) so selection should track it.
+        assert_eq!(s.selected_group, Some(1));
+    }
+
+    #[test]
+    fn restore_group_noop_on_unknown_hash() {
+        let mut s = loaded_with_multi_occ();
+        assert_eq!(s.restore_group(0xdead), None);
+    }
+
+    #[test]
+    fn select_dismissed_routes_focus_and_selection() {
+        let mut s = loaded_with_multi_occ();
+        let (_, gid) = s.dismiss_group(1).unwrap();
+        s.selected_group = None;
+        s.select_dismissed(gid);
+        assert_eq!(s.selected_group, Some(gid));
+        assert_eq!(s.focused_pane, Pane::Detail);
+    }
+
+    #[test]
+    fn selected_occurrences_returns_dismissed_rows() {
+        let mut s = loaded_with_multi_occ();
+        let (_, gid) = s.dismiss_group(1).unwrap();
+        s.selected_group = Some(gid);
+        // dismissed.occurrences were populated at dismiss time.
+        let occs = s.selected_occurrences();
+        assert_eq!(occs.len(), 3);
+    }
+
+    #[test]
+    fn restore_occurrence_drops_banner_entry_and_session_row() {
+        let mut s = loaded_with_multi_occ();
+        let (hash, _gid) = s.dismiss_group(1).unwrap();
+        // Simulate a per-occurrence dismissal landing in the banner.
+        let row = s.dismissed.iter_mut().find(|d| d.hash == hash).unwrap();
+        row.occurrence_dismissals.push(OccurrenceDismissal {
+            path: PathBuf::from("a.rs"),
+            dismissed_at: 123,
+        });
+        s.session_occurrence_dismissed
+            .insert((hash, PathBuf::from("a.rs")));
+
+        let out = s.restore_occurrence(hash, &PathBuf::from("a.rs"));
+        assert_eq!(out, Some((hash, PathBuf::from("a.rs"))));
+        let row = s.dismissed.iter().find(|d| d.hash == hash).unwrap();
+        assert!(row.occurrence_dismissals.is_empty());
+        assert!(!s
+            .session_occurrence_dismissed
+            .contains(&(hash, PathBuf::from("a.rs"))));
+    }
+
+    #[test]
     fn suppression_label_truncates_hash() {
         let s = SuppressionView {
+            hash: 0xabcdef0123456789,
             hash_hex: "abcdef0123456789".to_string(),
             last_group_id: Some(3),
+            dismissed_at: 0,
+            occurrences: Vec::new(),
+            occurrence_dismissals: Vec::new(),
         };
         assert_eq!(s.label(), "Dismissed block (hash abcdef012345\u{2026})");
     }

@@ -29,16 +29,17 @@ pub mod menubar;
 pub mod project_view;
 pub mod recent;
 pub mod sidebar_prefs;
+pub mod suppressions_view;
 pub mod tint;
 pub mod toast;
 pub mod tooltip;
 
 pub use app_state::{
-    AppState, AppStatus, EditorBanner, FolderLoadResult, GroupView, OccurrenceView, Pane,
-    RecentBanner, ScanHandles, ScanState, SortKey, StartupError, SummaryCounts, SuppressionView,
-    filter_groups, format_completion_banner, format_elapsed, group_label, group_view_from_match,
-    impact_key, language_from_path, launch_editor, load_folder, open_in_editor, sort_groups,
-    summary,
+    AppState, AppStatus, EditorBanner, FolderLoadResult, GroupView, OccurrenceDismissal,
+    OccurrenceView, Pane, RecentBanner, ScanHandles, ScanState, SortKey, StartupError,
+    SummaryCounts, SuppressionView, filter_groups, format_completion_banner, format_elapsed,
+    group_label, group_view_from_match, impact_key, language_from_path, launch_editor,
+    load_folder, open_in_editor, sort_groups, summary, unix_now,
 };
 pub use logging::{LogGuard, MAX_LOG_FILES, init_logging, log_dir, prune_old_logs};
 pub use project_view::{ProjectView, RootHandle, register_root};

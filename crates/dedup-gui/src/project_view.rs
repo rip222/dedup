@@ -30,7 +30,7 @@ use gpui::{
 
 use crate::app_state::{
     AppState, AppStatus, GroupView, Pane, ScanState, SortKey, StartupError,
-    SuppressionView, format_completion_banner, format_elapsed, group_view_from_match,
+    format_completion_banner, format_elapsed, group_view_from_match,
     launch_editor, load_folder,
 };
 use crate::detail_rows::{
@@ -537,8 +537,22 @@ impl ProjectView {
         cx.notify();
     }
 
-    fn select_group(&mut self, id: i64, cx: &mut Context<Self>) {
+    pub fn select_group(&mut self, id: i64, cx: &mut Context<Self>) {
+        // #54 — dismissed-group rows carry their cache-row id as
+        // `SuppressionView::last_group_id`. When that id is the click
+        // target we still update `selected_group` (so the detail pane
+        // renders the read-only banner + code body) but we also move
+        // focus to the detail pane so the user lands straight on the
+        // review surface.
+        let is_dismissed = self
+            .state
+            .dismissed
+            .iter()
+            .any(|s| s.last_group_id == Some(id));
         self.state.selected_group = Some(id);
+        if is_dismissed {
+            self.state.focused_pane = Pane::Detail;
+        }
         cx.notify();
     }
 
@@ -913,6 +927,86 @@ impl ProjectView {
                 Err(e) => {
                     log::warn!("dedup-gui: failed to open cache to persist group dismissal: {e}")
                 }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Restore a previously-dismissed group (#54). Drops the suppression
+    /// row from the cache, clears the in-memory dismissed entry, and
+    /// — when the underlying `match_groups` row is still live — snaps
+    /// the sidebar selection to the restored group so the user lands
+    /// on the active detail view immediately.
+    ///
+    /// Also deletes any per-occurrence dismissals still attached to
+    /// the group: restoring a group is a single-click "bring it back"
+    /// action, so leaving per-occurrence rows hiding individual files
+    /// would be surprising.
+    pub fn restore_group_click(&mut self, hash: u64, cx: &mut Context<Self>) {
+        let Some((h, _last_gid)) = self.state.restore_group(hash) else {
+            return;
+        };
+        if let Some(folder) = self.state.current_folder.clone() {
+            match Cache::open(&folder) {
+                Ok(mut cache) => {
+                    if let Err(e) = cache.undismiss(h) {
+                        log::warn!(
+                            "dedup-gui: failed to persist undismiss for hash {h:016x}: {e}"
+                        );
+                    }
+                    if let Err(e) = cache.undismiss_all_occurrences_for(h) {
+                        log::warn!(
+                            "dedup-gui: failed to clear per-occurrence dismissals for {h:016x}: {e}"
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "dedup-gui: failed to open cache to persist group restore: {e}"
+                ),
+            }
+        }
+        // Reload so the just-restored group shows up in the active
+        // list with its live `match_groups` id (the in-memory
+        // `restore_group` already selects it, but a refresh is
+        // cheaper than trying to re-derive the view-model state by
+        // hand and keeps the two sources in sync).
+        if let Some(folder) = self.state.current_folder.clone() {
+            let selected = self.state.selected_group;
+            let result = load_folder(&folder);
+            self.state.set_folder_result(result);
+            if let Some(gid) = selected
+                && self.state.groups.iter().any(|g| g.id == gid)
+            {
+                self.state.selected_group = Some(gid);
+                self.state.focused_pane = Pane::Detail;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Restore a single per-occurrence dismissal (#54).
+    pub fn restore_occurrence_click(
+        &mut self,
+        hash: u64,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((h, p)) = self.state.restore_occurrence(hash, &path) else {
+            return;
+        };
+        if let Some(folder) = self.state.current_folder.clone() {
+            match Cache::open(&folder) {
+                Ok(mut cache) => {
+                    if let Err(e) = cache.undismiss_occurrence(h, &p) {
+                        log::warn!(
+                            "dedup-gui: failed to persist undismiss for {}: {e}",
+                            p.display()
+                        );
+                    }
+                }
+                Err(e) => log::warn!(
+                    "dedup-gui: failed to open cache to persist occurrence restore: {e}"
+                ),
             }
         }
         cx.notify();
@@ -2636,19 +2730,14 @@ fn render_dismissed_section(state: &AppState) -> gpui::Div {
     let mut wrap = div().flex().flex_col().child(header);
     if expanded {
         for s in &state.dismissed {
-            wrap = wrap.child(render_dismissed_row(s));
+            let selected = state.selected_group == s.last_group_id && s.last_group_id.is_some();
+            // Issue #54 — the sidebar's dismissed rows delegate layout
+            // and click/restore routing to `suppressions_view` so the
+            // project view doesn't grow dismissed-specific branches.
+            wrap = wrap.child(crate::suppressions_view::render_dismissed_row(s, selected));
         }
     }
     wrap
-}
-
-fn render_dismissed_row(s: &SuppressionView) -> gpui::Div {
-    div()
-        .px(px(16.0))
-        .py(px(4.0))
-        .text_size(px(11.0))
-        .text_color(rgb(ROW_TEXT_DIM))
-        .child(s.label())
 }
 
 /// Scan-progress + completion banner overlay.
@@ -2819,6 +2908,7 @@ fn render_detail(state: &AppState) -> gpui::AnyElement {
     // Safe: `selected_occurrences()` is only non-empty when
     // `selected_group` is Some.
     let group_id = state.selected_group.unwrap_or(-1);
+    let is_dismissed = state.selected_dismissed().is_some();
 
     // #49 — pull the flattened row vec from the `AppState`-owned cache.
     // `build_detail_rows` runs only on cache miss (group change,
@@ -2841,15 +2931,86 @@ fn render_detail(state: &AppState) -> gpui::AnyElement {
     .h_full()
     .flex_1();
 
-    div()
+    let mut wrap = div()
         .size_full()
         .flex()
         .flex_col()
         .bg(rgb(BG))
-        .flex_1()
-        .child(render_group_toolbar(state, group_id))
-        .child(div().flex_1().px(px(16.0)).pb(px(16.0)).child(list))
+        .flex_1();
+    if is_dismissed {
+        // #54 — read-only surface. Toolbar collapses to "Restore
+        // group" + "Close"; `render_group_toolbar`'s full set of
+        // Dismiss/Collapse/Open actions is intentionally absent so
+        // the user can't further mutate a suppressed group.
+        wrap = wrap.child(render_dismissed_toolbar(group_id, state));
+        if let Some(banner) = crate::suppressions_view::render_dismissed_banner(state) {
+            wrap = wrap.child(banner);
+        }
+    } else {
+        wrap = wrap.child(render_group_toolbar(state, group_id));
+    }
+    wrap.child(div().flex_1().px(px(16.0)).pb(px(16.0)).child(list))
         .into_any_element()
+}
+
+/// Minimal toolbar rendered over a dismissed group (#54). Shows the
+/// headline hash + a `[Restore]` + `[Close]` pair. The full set of
+/// toolbar actions (`Dismiss`, `Open in editor`, `Copy paths`,
+/// `Collapse/Expand`) is suppressed: the dismissed detail view is
+/// read-only.
+fn render_dismissed_toolbar(group_id: i64, state: &AppState) -> gpui::Div {
+    let label = state
+        .selected_dismissed()
+        .map(|s| {
+            let short: String = s.hash_hex.chars().take(12).collect();
+            format!("Dismissed group (hash {short}\u{2026})")
+        })
+        .unwrap_or_else(|| "Dismissed group".to_string());
+    let hash = state.selected_dismissed().map(|s| s.hash).unwrap_or(0);
+
+    let restore = crate::suppressions_view::restore_button(hash);
+    let close_btn = with_tooltip(
+        div()
+            .id(("toolbar-close-dismissed", group_id as u64))
+            .w(px(22.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgb(TOOLBAR_BUTTON_BG))
+            .rounded(px(4.0))
+            .text_size(px(14.0))
+            .text_color(rgb(ROW_TEXT))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(TOOLBAR_BUTTON_HOVER_BG)))
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx: &mut gpui::App| {
+                if let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() {
+                    entity.update(cx, |view, cx| view.close_group_detail(cx));
+                }
+            })
+            .child("\u{00D7}"),
+        "Close detail pane",
+    );
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .px(px(16.0))
+        .py(px(10.0))
+        .bg(rgb(TOOLBAR_BG))
+        .border_b_1()
+        .border_color(black())
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(12.0))
+                .text_color(rgb(ROW_TEXT_DIM))
+                .child(label),
+        )
+        .child(restore)
+        .child(close_btn)
 }
 
 /// Colours specific to the issue #27 toolbar + per-occurrence cards.

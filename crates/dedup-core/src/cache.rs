@@ -793,6 +793,60 @@ impl Cache {
         Ok(n)
     }
 
+    /// Undo a group-level dismissal (#54). Deletes the `suppressions`
+    /// row keyed by `hash`; subsequent calls to [`Self::list_groups`] /
+    /// [`Self::suppressed_hashes`] no longer surface the hash, so the
+    /// group reappears in the active sidebar/CLI list.
+    ///
+    /// Returns `true` when a row was actually deleted, `false` when the
+    /// hash was not dismissed (idempotent no-op — callers that don't
+    /// care can `let _ =`).
+    pub fn undismiss(
+        &mut self,
+        hash: crate::rolling_hash::Hash,
+    ) -> Result<bool, CacheError> {
+        let bytes = hash.to_be_bytes();
+        let n = self.conn.execute(
+            "DELETE FROM suppressions WHERE group_hash = ?1",
+            params![&bytes[..]],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Undo a single per-occurrence dismissal (#54). Symmetric with
+    /// [`Self::undismiss`] but keyed on the full `(hash, path)` pair.
+    /// Returns `true` when a row was actually deleted.
+    pub fn undismiss_occurrence(
+        &mut self,
+        hash: crate::rolling_hash::Hash,
+        path: &Path,
+    ) -> Result<bool, CacheError> {
+        let bytes = hash.to_be_bytes();
+        let n = self.conn.execute(
+            "DELETE FROM occurrence_suppressions \
+             WHERE group_hash = ?1 AND file_path = ?2",
+            params![&bytes[..], path_to_posix_str(path)],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Delete every per-occurrence dismissal for a single group-hash
+    /// (#54). Convenience helper for the GUI's "Restore group" flow —
+    /// restoring a group should clear any per-occurrence dismissals
+    /// still attached to it so the regrouped list is fully visible.
+    /// Returns the number of rows removed.
+    pub fn undismiss_all_occurrences_for(
+        &mut self,
+        hash: crate::rolling_hash::Hash,
+    ) -> Result<usize, CacheError> {
+        let bytes = hash.to_be_bytes();
+        let n = self.conn.execute(
+            "DELETE FROM occurrence_suppressions WHERE group_hash = ?1",
+            params![&bytes[..]],
+        )?;
+        Ok(n)
+    }
+
     /// The current database schema version, as reported by
     /// `PRAGMA user_version`. Public so tests can assert on it directly;
     /// callers shouldn't normally need it.
@@ -1498,6 +1552,87 @@ mod tests {
             .dismiss_occurrence(0x2222, &PathBuf::from("a.rs"))
             .unwrap();
         assert_eq!(cache.suppressed_occurrences().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn undismiss_roundtrip_restores_to_list_groups() {
+        // Scan result in cache, dismiss the group, undismiss it. After
+        // the undismiss, `suppressed_hashes` must no longer include the
+        // hash and the group re-appears in `list_groups`.
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        cache.write_scan_result(&synthetic_result()).unwrap();
+
+        let groups = cache.list_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        let gid = groups[0].id;
+        let hash = cache.group_hash(gid).unwrap().expect("hash present");
+
+        cache.dismiss_hash(hash, Some(gid)).unwrap();
+        assert!(cache.suppressed_hashes().unwrap().contains(&hash));
+
+        let removed = cache.undismiss(hash).unwrap();
+        assert!(removed, "undismiss should report a real deletion");
+        // list_suppressions empty, suppressed_hashes empty, group still
+        // in list_groups (it was never removed from match_groups).
+        assert!(cache.list_suppressions().unwrap().is_empty());
+        assert!(!cache.suppressed_hashes().unwrap().contains(&hash));
+        assert_eq!(cache.list_groups().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn undismiss_is_idempotent_when_unknown() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let removed = cache.undismiss(0xdead_beef).unwrap();
+        assert!(!removed, "undismiss on unknown hash should return false");
+    }
+
+    #[test]
+    fn undismiss_occurrence_removes_only_the_target_row() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let hash = 0xabcd_u64;
+        let a = PathBuf::from("a.rs");
+        let b = PathBuf::from("b.rs");
+        cache.dismiss_occurrence(hash, &a).unwrap();
+        cache.dismiss_occurrence(hash, &b).unwrap();
+        assert_eq!(cache.suppressed_occurrences().unwrap().len(), 2);
+
+        let removed = cache.undismiss_occurrence(hash, &a).unwrap();
+        assert!(removed);
+        let set = cache.suppressed_occurrences().unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&(hash, b)));
+        assert!(!set.contains(&(hash, a)));
+
+        let missed = cache
+            .undismiss_occurrence(hash, &PathBuf::from("c.rs"))
+            .unwrap();
+        assert!(!missed);
+    }
+
+    #[test]
+    fn undismiss_all_occurrences_for_clears_the_group_only() {
+        let dir = tempdir().unwrap();
+        let mut cache = Cache::open(dir.path()).unwrap();
+        let h1 = 0x1111_u64;
+        let h2 = 0x2222_u64;
+        cache
+            .dismiss_occurrence(h1, &PathBuf::from("a.rs"))
+            .unwrap();
+        cache
+            .dismiss_occurrence(h1, &PathBuf::from("b.rs"))
+            .unwrap();
+        cache
+            .dismiss_occurrence(h2, &PathBuf::from("c.rs"))
+            .unwrap();
+
+        let removed = cache.undismiss_all_occurrences_for(h1).unwrap();
+        assert_eq!(removed, 2);
+        let set = cache.suppressed_occurrences().unwrap();
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&(h2, PathBuf::from("c.rs"))));
     }
 
     #[test]
