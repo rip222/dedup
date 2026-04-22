@@ -5,40 +5,10 @@
 //! real `~/.config/dedup/`. Repo-scoped project configs live in a
 //! `tempdir` and go away at test exit.
 
-use std::path::{Path, PathBuf};
-
-use assert_cmd::Command;
 use tempfile::tempdir;
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop();
-    p.pop();
-    p
-}
-
-fn copy_tree(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let ty = entry.file_type().unwrap();
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
-
-/// Build an `assert_cmd::Command` wired to a sandboxed HOME and empty
-/// XDG_CONFIG_HOME so `Config::global_path()` resolves to
-/// `<home>/.config/dedup/config.toml`.
-fn dedup_with_home(home: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("dedup").unwrap();
-    cmd.env("HOME", home).env_remove("XDG_CONFIG_HOME");
-    cmd
-}
+mod common;
+use common::*;
 
 #[test]
 fn config_path_prints_both_layers_with_presence() {

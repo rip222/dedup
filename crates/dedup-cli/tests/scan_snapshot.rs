@@ -7,33 +7,11 @@
 //! or the fixture drifts, the snapshot test loudly fails and a human has
 //! to `cargo insta review` the change.
 
-use std::path::{Path, PathBuf};
-
 use assert_cmd::Command;
 use tempfile::tempdir;
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // dedup-cli → crates
-    p.pop(); // crates    → workspace root
-    p
-}
-
-/// Recursively copy `src` into `dst`, creating `dst` if needed. Only
-/// files and directories (no symlinks, no special modes).
-fn copy_tree(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let file_type = entry.file_type().unwrap();
-        let target = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
+mod common;
+use common::*;
 
 #[test]
 fn scan_fixture_snapshot() {

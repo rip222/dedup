@@ -9,32 +9,14 @@
 //! self-referencing any external registry we cannot resolve, so the
 //! validator needs no network access.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::tempdir;
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop();
-    p.pop();
-    p
-}
-
-fn copy_tree(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let ty = entry.file_type().unwrap();
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
+mod common;
+use common::*;
 
 /// Populate a temp dir with the `tier_a_basic` fixture and run a scan so
 /// a cache exists for `list` / `show`.

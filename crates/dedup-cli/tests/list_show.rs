@@ -5,31 +5,11 @@
 //! persistence across separate process invocations (the warm-start
 //! acceptance criterion from issue #4).
 
-use std::path::{Path, PathBuf};
-
 use assert_cmd::Command;
 use tempfile::tempdir;
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // dedup-cli → crates
-    p.pop(); // crates    → workspace root
-    p
-}
-
-fn copy_tree(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let ty = entry.file_type().unwrap();
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
+mod common;
+use common::*;
 
 /// Run `dedup scan` on a fresh copy of the tier_a_basic fixture and
 /// return the temp dir so the caller can run follow-up commands.

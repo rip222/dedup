@@ -7,31 +7,11 @@
 //! least one `DEBUG` line (the fixture has ≥ 1 text file) and at the
 //! default `warn` level we see none.
 
-use std::path::{Path, PathBuf};
-
 use assert_cmd::Command;
 use tempfile::tempdir;
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // dedup-cli → crates
-    p.pop(); // crates    → workspace root
-    p
-}
-
-fn copy_tree(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let file_type = entry.file_type().unwrap();
-        let target = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else if file_type.is_file() {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
+mod common;
+use common::*;
 
 fn copy_fixture() -> tempfile::TempDir {
     let fixture = workspace_root().join("fixtures").join("tier_a_basic");

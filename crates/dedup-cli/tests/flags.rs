@@ -9,32 +9,11 @@
 //! fixture is changed and no longer yields duplicates, these tests will
 //! surface it.
 
-use std::path::{Path, PathBuf};
-
 use assert_cmd::Command;
 use tempfile::tempdir;
 
-fn workspace_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.pop(); // crates/dedup-cli -> crates
-    p.pop(); // crates           -> workspace root
-    p
-}
-
-/// Recursively copy `src` to `dst`.
-fn copy_tree(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let ty = entry.file_type().unwrap();
-        let target = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
+mod common;
+use common::*;
 
 /// Prepare a temp dir populated with `tier_a_basic`, so the cache can be
 /// written into it without touching the checked-in fixture.
