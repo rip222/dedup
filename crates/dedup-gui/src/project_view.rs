@@ -160,6 +160,14 @@ pub struct ProjectView {
     /// keys to short-circuit back into text entry instead of triggering
     /// list navigation.
     pub search_focus_handle: FocusHandle,
+    /// Focus handle for the sidebar "Include" regex input — the second
+    /// text field rendered directly beneath the search box. Behaves
+    /// identically to [`Self::search_focus_handle`]: printable keys
+    /// append to [`AppState::include_query`], `escape` clears and blurs,
+    /// and the `!SearchInput` context predicate shared with the search
+    /// box keeps sidebar keyboard shortcuts from firing while this input
+    /// owns focus.
+    pub include_focus_handle: FocusHandle,
 }
 
 impl ProjectView {
@@ -176,6 +184,7 @@ impl ProjectView {
             scan_rx: Arc::new(Mutex::new(None)),
             focus_handle: cx.focus_handle(),
             search_focus_handle: cx.focus_handle(),
+            include_focus_handle: cx.focus_handle(),
         }
     }
 
@@ -836,6 +845,34 @@ impl ProjectView {
         let mut q = self.state.search_query.clone();
         if q.pop().is_some() {
             self.state.set_search_query(q);
+            cx.notify();
+        }
+    }
+
+    /// Clear the "Include" regex input and return focus to the root
+    /// handle. Mirrors [`Self::blur_search`] — invoked when the include
+    /// input receives `escape`.
+    pub fn blur_include(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.set_include_query(String::new());
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Append a single character to the live "Include" regex query. Used
+    /// by the include input's `on_key_down` handler for printable keys.
+    pub fn include_input_push(&mut self, ch: char, cx: &mut Context<Self>) {
+        let mut q = self.state.include_query.clone();
+        q.push(ch);
+        self.state.set_include_query(q);
+        cx.notify();
+    }
+
+    /// Remove the last character from the live "Include" regex query on
+    /// `backspace`. No-op when the query is empty.
+    pub fn include_input_backspace(&mut self, cx: &mut Context<Self>) {
+        let mut q = self.state.include_query.clone();
+        if q.pop().is_some() {
+            self.state.set_include_query(q);
             cx.notify();
         }
     }
@@ -2100,10 +2137,13 @@ impl Render for ProjectView {
                 render_newer_cache(*found, *supported).into_any_element()
             }
             AppStatus::Error(msg) => render_error(msg).into_any_element(),
-            AppStatus::Loaded => {
-                render_loaded(&self.state, window, &self.search_focus_handle)
-                    .into_any_element()
-            }
+            AppStatus::Loaded => render_loaded(
+                &self.state,
+                window,
+                &self.search_focus_handle,
+                &self.include_focus_handle,
+            )
+            .into_any_element(),
         };
 
         // Scan progress + completion banners float above the body so
@@ -2694,6 +2734,7 @@ fn render_loaded(
     state: &AppState,
     window: &Window,
     search_focus_handle: &FocusHandle,
+    include_focus_handle: &FocusHandle,
 ) -> gpui::Div {
     // Issue #52 — when the sidebar is hidden (⌘B), drop both the
     // sidebar list and the drag splitter from the tree so the detail
@@ -2704,7 +2745,12 @@ fn render_loaded(
     let mut row = div().size_full().flex().flex_row();
     if !state.sidebar_hidden {
         row = row
-            .child(render_sidebar(state, window, search_focus_handle))
+            .child(render_sidebar(
+                state,
+                window,
+                search_focus_handle,
+                include_focus_handle,
+            ))
             .child(render_sidebar_splitter());
     }
     row.child(render_detail(state))
@@ -2810,6 +2856,7 @@ fn render_sidebar(
     state: &AppState,
     window: &Window,
     search_focus_handle: &FocusHandle,
+    include_focus_handle: &FocusHandle,
 ) -> gpui::Div {
     // Issue #23 — the sidebar renders the filtered + sorted list from
     // `AppState::visible_groups`. While a scan is running we still fall
@@ -2871,6 +2918,7 @@ fn render_sidebar(
         .children(render_history_filter_chips(state))
         // Issue #23 — search / sort / summary row.
         .child(render_search_box(state, window, search_focus_handle))
+        .child(render_include_box(state, window, include_focus_handle))
         .child(render_sort_dropdown(state))
         .child(render_summary_header(&summary.format()))
         // Tier B (functions / classes) — header outside, rows virtualized.
@@ -3078,6 +3126,112 @@ fn render_search_box(
         .text_color(text_color)
         .on_mouse_down(MouseButton::Left, {
             let handle = search_focus_handle.clone();
+            move |_, window, cx: &mut gpui::App| {
+                window.focus(&handle, cx);
+            }
+        })
+        .on_key_down(key_down)
+        .child(text)
+}
+
+/// Live sidebar "Include" regex input — rendered directly beneath
+/// [`render_search_box`]. Filters occurrences-within-groups by file path
+/// against the compiled regex (case-insensitive by default; `(?-i)`
+/// opts out). Groups whose occurrences are all rejected disappear from
+/// the sidebar.
+///
+/// Keystroke handling mirrors the search box: printable keys append,
+/// backspace / delete pops, escape clears + blurs. `key_context` is
+/// `"SearchInput"` so the sidebar's `!SearchInput` keybinding predicate
+/// already prevents j/k/x/o/enter from firing while this input owns
+/// focus — no menubar change required.
+///
+/// Border paints in [`ACCENT`] while focused, [`ACCENT_DIM`] otherwise;
+/// switches to a red accent (`0xe04c4c`) when the current query fails
+/// to compile so the user sees the error without losing their partial
+/// text. Placeholder reads "Include (regex)\u{2026}".
+fn render_include_box(
+    state: &AppState,
+    window: &Window,
+    include_focus_handle: &FocusHandle,
+) -> gpui::Div {
+    const INVALID_BORDER: u32 = 0xe04c4c;
+    let empty = state.include_query.is_empty();
+    let text = if empty {
+        "Include (regex)\u{2026}".to_string()
+    } else {
+        state.include_query.clone()
+    };
+    let is_focused = include_focus_handle.is_focused(window);
+    let border_color = if state.include_query_invalid {
+        rgb(INVALID_BORDER)
+    } else if is_focused {
+        rgb(ACCENT)
+    } else {
+        rgb(ACCENT_DIM)
+    };
+    let text_color = if empty {
+        rgb(ROW_TEXT_DIM)
+    } else {
+        rgb(ROW_TEXT)
+    };
+
+    let key_down = |event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut gpui::App| {
+        let Some(RootHandle(entity)) = cx.try_global::<RootHandle>().cloned() else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        let modifiers = &event.keystroke.modifiers;
+        let has_command_mod = modifiers.control
+            || modifiers.platform
+            || modifiers.function
+            || modifiers.alt;
+
+        if key == "escape" {
+            entity.update(cx, |view, cx| view.blur_include(window, cx));
+            return;
+        }
+
+        if has_command_mod {
+            return;
+        }
+
+        if key == "backspace" || key == "delete" {
+            entity.update(cx, |view, cx| view.include_input_backspace(cx));
+            return;
+        }
+
+        let typed = event
+            .keystroke
+            .key_char
+            .clone()
+            .unwrap_or_else(|| key.to_string());
+        let mut it = typed.chars();
+        let Some(ch) = it.next() else { return };
+        if it.next().is_some() {
+            return;
+        }
+        if ch.is_control() {
+            return;
+        }
+        entity.update(cx, |view, cx| view.include_input_push(ch, cx));
+    };
+
+    div()
+        .track_focus(include_focus_handle)
+        .key_context("SearchInput")
+        .mx(px(12.0))
+        .mt(px(4.0))
+        .px(px(8.0))
+        .py(px(6.0))
+        .bg(rgb(ACCENT_DIM))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(border_color)
+        .text_size(px(12.0))
+        .text_color(text_color)
+        .on_mouse_down(MouseButton::Left, {
+            let handle = include_focus_handle.clone();
             move |_, window, cx: &mut gpui::App| {
                 window.focus(&handle, cx);
             }

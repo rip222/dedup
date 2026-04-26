@@ -554,6 +554,25 @@ pub struct AppState {
     /// filtering. Matched case-insensitively against each group's
     /// `label`, every `occurrence.path`, and its `language`.
     pub search_query: String,
+    /// Sidebar "Include" regex filter — raw text the user typed. Rendered
+    /// in its own input directly beneath the search box. Applied *after*
+    /// [`Self::search_query`] and the history filter (AND composition)
+    /// and narrows occurrences-within-groups by file path. Groups whose
+    /// occurrences all fail the regex are dropped from the visible list.
+    /// Empty string disables the filter entirely.
+    pub include_query: String,
+    /// Last *valid* compilation of [`Self::include_query`] — `None` when
+    /// the query is empty or has never been set. On a compile failure
+    /// this field keeps the previously-successful regex so the sidebar
+    /// doesn't flicker back to unfiltered while the user is mid-edit;
+    /// the input paints red via [`Self::include_query_invalid`] to
+    /// surface the error.
+    pub include_regex: Option<regex::Regex>,
+    /// `true` when the *current* [`Self::include_query`] text fails to
+    /// compile as a regex. Drives the red-border state on the include
+    /// input. Always `false` for an empty query (an empty filter is
+    /// valid, not an error).
+    pub include_query_invalid: bool,
     /// Sidebar sort key (issue #23, #56). Defaults to [`SortKey::Severity`]
     /// for fresh installs; a loaded pref file can override to any persisted
     /// variant (see [`crate::sidebar_prefs::SidebarPrefs::sort_key`]).
@@ -811,6 +830,9 @@ impl Default for AppState {
             scan_state: ScanState::default(),
             groups_streaming: Vec::new(),
             search_query: String::new(),
+            include_query: String::new(),
+            include_regex: None,
+            include_query_invalid: false,
             sort_key: SortKey::default(),
             focused_pane: Pane::default(),
             selected_group_idx: None,
@@ -1658,6 +1680,9 @@ impl AppState {
             Some(0)
         };
         self.search_query.clear();
+        self.include_query.clear();
+        self.include_regex = None;
+        self.include_query_invalid = false;
         // Keep `sort_key` — it's a user preference that should persist.
         self.focused_pane = Pane::Sidebar;
     }
@@ -1698,9 +1723,24 @@ impl AppState {
     /// dismiss filter. Isolates the filter so both [`Self::selected_occurrences`]
     /// and the detail-toolbar helpers share one definition.
     pub fn visible_occurrences_of(&self, group: &GroupView) -> Vec<OccurrenceView> {
+        let include_ok = |o: &OccurrenceView| match &self.include_regex {
+            None => true,
+            Some(re) => re.is_match(&o.path.display().to_string()),
+        };
+        self.occurrences_after_session_dismiss(group)
+            .into_iter()
+            .filter(include_ok)
+            .collect()
+    }
+
+    /// Occurrences of `group` after the per-occurrence session-dismiss
+    /// filter but **before** the "Include" regex narrowing. Used by
+    /// [`Self::source_groups`] to compute the "drops below 2 visible ⇒
+    /// hide group" floor strictly against dismissals — the include
+    /// filter is a user-driven display filter and shouldn't trip that
+    /// floor (the user may well be inspecting a specific singleton).
+    pub fn occurrences_after_session_dismiss(&self, group: &GroupView) -> Vec<OccurrenceView> {
         let Some(hash) = group.group_hash else {
-            // Streaming rows have no hash — can't be per-occurrence
-            // dismissed. Return all occurrences untouched.
             return group.occurrences.clone();
         };
         group
@@ -1848,7 +1888,10 @@ impl AppState {
                 None => true,
             })
             .filter(|g| {
-                let visible = self.visible_occurrences_of(g).len();
+                // Floor is against session-dismiss only — the "Include"
+                // regex is a user-driven display filter and shouldn't
+                // hide groups that fall below 2 because of it.
+                let visible = self.occurrences_after_session_dismiss(g).len();
                 // Only enforce the floor when the original had >= 2 AND
                 // the session dismiss reduced that number below 2.
                 visible == g.occurrences.len() || visible >= 2
@@ -1870,7 +1913,31 @@ impl AppState {
     pub fn visible_groups(&self) -> Vec<GroupView> {
         let sorted = sort_groups(&self.source_groups(), self.sort_key);
         let filtered = filter_groups(&sorted, &self.search_query);
-        self.apply_history_filter(filtered)
+        let after_history = self.apply_history_filter(filtered);
+        self.apply_include_filter(after_history)
+    }
+
+    /// Narrow `groups` by the compiled "Include" regex. Each group's
+    /// `occurrences` list is filtered to paths matching the regex; groups
+    /// whose occurrences are all rejected are dropped from the result.
+    /// No-op when no valid regex is compiled (empty input or unchanged
+    /// invalid text — see [`Self::set_include_query`]).
+    pub fn apply_include_filter(&self, groups: Vec<GroupView>) -> Vec<GroupView> {
+        let Some(re) = &self.include_regex else {
+            return groups;
+        };
+        groups
+            .into_iter()
+            .filter_map(|mut g| {
+                g.occurrences
+                    .retain(|o| re.is_match(&o.path.display().to_string()));
+                if g.occurrences.is_empty() {
+                    None
+                } else {
+                    Some(g)
+                }
+            })
+            .collect()
     }
 
     /// Narrow `groups` by the active [`HistoryFilter`] chip (#62). Pure
@@ -1915,6 +1982,42 @@ impl AppState {
     /// cursor so it stays in range of the filtered list.
     pub fn set_search_query(&mut self, query: String) {
         self.search_query = query;
+        self.reclamp_selection();
+    }
+
+    /// Update the sidebar "Include" regex filter. Attempts to compile the
+    /// new query case-insensitively (an inline `(?-i)` flag still opts
+    /// out). On success the compiled regex replaces [`Self::include_regex`]
+    /// and the sidebar re-narrows. On failure the *previous* compiled
+    /// regex is kept (so the visible list doesn't thrash while the user
+    /// is mid-typing a partial regex) and [`Self::include_query_invalid`]
+    /// is set so the input can paint red.
+    ///
+    /// An empty / whitespace-only query always clears the filter and
+    /// leaves `include_query_invalid == false` (an empty filter is the
+    /// valid "everything passes" case, not an error).
+    pub fn set_include_query(&mut self, query: String) {
+        self.include_query = query;
+        let trimmed = self.include_query.trim();
+        if trimmed.is_empty() {
+            self.include_regex = None;
+            self.include_query_invalid = false;
+        } else {
+            match regex::RegexBuilder::new(trimmed)
+                .case_insensitive(true)
+                .build()
+            {
+                Ok(re) => {
+                    self.include_regex = Some(re);
+                    self.include_query_invalid = false;
+                }
+                Err(_) => {
+                    // Keep previous compiled regex so the sidebar stays
+                    // stable; the input paints red via the flag.
+                    self.include_query_invalid = true;
+                }
+            }
+        }
         self.reclamp_selection();
     }
 
@@ -3999,6 +4102,125 @@ mod tests {
         let g = mkgroup(1, Tier::A, "x", vec![occ("a.rs", 1, 2)], Some(0));
         assert_eq!(filter_groups(std::slice::from_ref(&g), "rust").len(), 1);
         assert_eq!(filter_groups(std::slice::from_ref(&g), "RUST").len(), 1);
+    }
+
+    #[test]
+    fn include_filter_empty_query_is_noop() {
+        let mut s = AppState::new();
+        s.groups = vec![mkgroup(
+            1,
+            Tier::A,
+            "x",
+            vec![occ("src/a.rs", 1, 2), occ("tests/b.rs", 1, 2)],
+            Some(0x1),
+        )];
+        s.set_include_query(String::new());
+        let v = s.visible_groups();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].occurrences.len(), 2);
+        assert!(!s.include_query_invalid);
+        assert!(s.include_regex.is_none());
+    }
+
+    #[test]
+    fn include_filter_narrows_occurrences_and_drops_empty_groups() {
+        let mut s = AppState::new();
+        s.groups = vec![
+            mkgroup(
+                1,
+                Tier::A,
+                "x",
+                vec![occ("src/a.rs", 1, 2), occ("tests/b.rs", 1, 2)],
+                Some(0x1),
+            ),
+            mkgroup(
+                2,
+                Tier::A,
+                "y",
+                vec![occ("tests/c.rs", 1, 2), occ("tests/d.rs", 1, 2)],
+                Some(0x2),
+            ),
+        ];
+        s.set_include_query("^src/".into());
+        let v = s.visible_groups();
+        // Group 1 keeps only `src/a.rs`; group 2 has no src/ paths so drops.
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, 1);
+        assert_eq!(v[0].occurrences.len(), 1);
+        assert_eq!(v[0].occurrences[0].path, PathBuf::from("src/a.rs"));
+    }
+
+    #[test]
+    fn include_filter_is_case_insensitive_by_default() {
+        let mut s = AppState::new();
+        s.groups = vec![mkgroup(
+            1,
+            Tier::A,
+            "x",
+            vec![occ("SRC/A.rs", 1, 2)],
+            Some(0x1),
+        )];
+        s.set_include_query("src".into());
+        assert_eq!(s.visible_groups().len(), 1);
+    }
+
+    #[test]
+    fn include_filter_invalid_regex_sets_flag_and_keeps_last_valid() {
+        let mut s = AppState::new();
+        s.groups = vec![
+            mkgroup(1, Tier::A, "x", vec![occ("src/a.rs", 1, 2)], Some(0x1)),
+            mkgroup(2, Tier::A, "y", vec![occ("tests/b.rs", 1, 2)], Some(0x2)),
+        ];
+        s.set_include_query("^src/".into());
+        assert!(!s.include_query_invalid);
+        assert_eq!(s.visible_groups().len(), 1);
+        // Partial/invalid regex mid-typing ("[" is an unclosed class).
+        s.set_include_query("[".into());
+        assert!(s.include_query_invalid);
+        // Last-valid regex still narrows the list — no flicker.
+        let v = s.visible_groups();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, 1);
+    }
+
+    #[test]
+    fn include_filter_empty_clears_invalid_flag() {
+        let mut s = AppState::new();
+        s.set_include_query("[".into());
+        assert!(s.include_query_invalid);
+        s.set_include_query(String::new());
+        assert!(!s.include_query_invalid);
+        assert!(s.include_regex.is_none());
+    }
+
+    #[test]
+    fn include_filter_composes_with_search_query() {
+        let mut s = AppState::new();
+        s.groups = vec![
+            mkgroup(
+                1,
+                Tier::A,
+                "validate",
+                vec![occ("src/auth.rs", 1, 2), occ("tests/auth.rs", 1, 2)],
+                Some(0x1),
+            ),
+            mkgroup(
+                2,
+                Tier::A,
+                "validate",
+                vec![occ("tests/other.rs", 1, 2)],
+                Some(0x2),
+            ),
+        ];
+        // `search_query` keeps both groups (both label "validate"); the
+        // include regex narrows to src/ only. Group 2 has no src/ paths
+        // so drops entirely.
+        s.set_search_query("validate".into());
+        s.set_include_query("^src/".into());
+        let v = s.visible_groups();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].id, 1);
+        assert_eq!(v[0].occurrences.len(), 1);
     }
 
     #[test]

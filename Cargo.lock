@@ -1489,6 +1489,7 @@ dependencies = [
  "gpui_platform",
  "human-panic",
  "log",
+ "regex",
  "rfd",
  "serde",
  "serde_json",
